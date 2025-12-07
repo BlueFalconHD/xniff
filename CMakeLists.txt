@@ -1,9 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(xniff VERSION 0.1.0 LANGUAGES C)
+project(xniff VERSION 0.1.0 LANGUAGES C ASM)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# Require Capstone via pkg-config
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(CAPSTONE REQUIRED IMPORTED_TARGET capstone)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -11,25 +15,63 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
-add_library(xniff SHARED
-    Sources/libxniff/xniff.c
+file(GLOB XNIFF_LIB_SOURCES CONFIGURE_DEPENDS
+    "${PROJECT_SOURCE_DIR}/Sources/libxniff/*.c"
+    "${PROJECT_SOURCE_DIR}/Sources/libxniff/*.s"
+    "${PROJECT_SOURCE_DIR}/Sources/libxniff/*.S"
 )
+
+add_library(xniff SHARED ${XNIFF_LIB_SOURCES})
 target_include_directories(xniff
     PUBLIC
         ${PROJECT_SOURCE_DIR}/Sources/shared
+        ${PROJECT_SOURCE_DIR}/Sources/libxniff
 )
+
+target_link_libraries(xniff PRIVATE PkgConfig::CAPSTONE)
+
 set_target_properties(xniff PROPERTIES
     OUTPUT_NAME xniff
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}
 )
 
-add_executable(xniff-cli
-    Sources/xniff-cli/main.c
+file(GLOB XNIFF_CLI_SOURCES CONFIGURE_DEPENDS
+    "${PROJECT_SOURCE_DIR}/Sources/xniff-cli/*.c"
+    "${PROJECT_SOURCE_DIR}/Sources/xniff-cli/*.s"
+    "${PROJECT_SOURCE_DIR}/Sources/xniff-cli/*.S"
 )
-target_link_libraries(xniff-cli PRIVATE xniff)
 
-add_executable(xniff-test
-    Sources/xniff-tests/main.c
+add_executable(xniff-cli ${XNIFF_CLI_SOURCES})
+target_link_libraries(xniff-cli PRIVATE xniff PkgConfig::CAPSTONE)
+target_include_directories(xniff-cli PRIVATE ${PROJECT_SOURCE_DIR}/Sources/libxniff)
+
+file(GLOB XNIFF_TEST_SOURCES CONFIGURE_DEPENDS
+    "${PROJECT_SOURCE_DIR}/Sources/xniff-tests/*.c"
+    "${PROJECT_SOURCE_DIR}/Sources/xniff-tests/*.s"
+    "${PROJECT_SOURCE_DIR}/Sources/xniff-tests/*.S"
 )
-target_link_libraries(xniff-test PRIVATE xniff)
+
+add_executable(xniff-test ${XNIFF_TEST_SOURCES})
+target_link_libraries(xniff-test PRIVATE xniff PkgConfig::CAPSTONE)
+target_include_directories(xniff-test PRIVATE ${PROJECT_SOURCE_DIR}/Sources/libxniff)
+
+# macOS codesigning with JIT entitlements (for testing self-modifying code)
+if(APPLE)
+    set(XNIFF_ENTITLEMENTS "${PROJECT_SOURCE_DIR}/macos.entitlements.plist")
+    if(EXISTS "${XNIFF_ENTITLEMENTS}")
+        add_custom_command(TARGET xniff POST_BUILD
+            COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xniff>"
+            COMMENT "Codesigning libxniff with JIT entitlements")
+
+        add_custom_command(TARGET xniff-test POST_BUILD
+            COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xniff-test>"
+            COMMENT "Codesigning xniff-test with JIT entitlements")
+
+        add_custom_command(TARGET xniff-cli POST_BUILD
+            COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xniff-cli>"
+            COMMENT "Codesigning xniff-cli with JIT entitlements")
+    else()
+        message(WARNING "macos.entitlements.plist not found; binaries will not be codesigned.")
+    endif()
+endif()

@@ -1,14 +1,8 @@
 #ifndef XNIFF_H
 #define XNIFF_H
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-const char *xniff_version(void);
-
-#ifdef __cplusplus
+static inline const char *xniff_version(void) {
+    return "0.9.0";
 }
-#endif
 
 #endif /* XNIFF_H */

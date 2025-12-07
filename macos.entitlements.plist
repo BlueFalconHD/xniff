@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Allow JIT write toggle on MAP_JIT pages -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+
+    <!-- Permit executing memory not covered by a code signature (COW text, JIT) -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- Development convenience: allow debugger attach -->
+    <key>com.apple.security.get-task-allow</key>
+    <true/>
+</dict>
+</plist>
+
