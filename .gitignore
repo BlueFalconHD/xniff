@@ -1,0 +1,10 @@
+# Build artifacts
+build/
+
+# Compiled objects
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
