@@ -53,8 +53,7 @@ file(GLOB XNIFF_TEST_SOURCES CONFIGURE_DEPENDS
 )
 
 add_executable(xniff-test ${XNIFF_TEST_SOURCES})
-target_link_libraries(xniff-test PRIVATE xniff PkgConfig::CAPSTONE)
-target_include_directories(xniff-test PRIVATE ${PROJECT_SOURCE_DIR}/Sources/libxniff)
+target_link_libraries(xniff-test PRIVATE)
 
 # macOS codesigning with JIT entitlements (for testing self-modifying code)
 if(APPLE)

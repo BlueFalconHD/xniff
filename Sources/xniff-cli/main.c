@@ -181,7 +181,7 @@ static int detach_process(pid_t pid) {
     return 0;
 }
 
-static int patch_mach_msg_overwrite(pid_t pid) {
+static int patch_symbol_in_task(pid_t pid, const char *symbol_name) {
     mach_port_t task;
     if (attach_and_get_task(pid, &task) != 0) return -1;
 
@@ -248,23 +248,23 @@ static int patch_mach_msg_overwrite(pid_t pid) {
         free(localArray); if (did_suspend) task_resume(task); detach_process(pid); return -1;
     }
 
-    // Find mach_msg_overwrite in any image
-    mach_vm_address_t mmov_addr = 0;
-    for (uint32_t i = 0; i < imageCount && mmov_addr == 0; i++) {
+    // Find target symbol in any image
+    mach_vm_address_t target_addr = 0;
+    for (uint32_t i = 0; i < imageCount && target_addr == 0; i++) {
         parsed_image_t img = {0};
         mach_vm_address_t header_addr = (mach_vm_address_t)(uintptr_t)localArray[i].imageLoadAddress;
         if (!load_image_info(task, header_addr, &img.info)) continue;
         if (!parse_load_commands(task, &img)) continue;
-        if (find_symbol_in_image(task, &img, "_mach_msg_overwrite", &mmov_addr)) break;
+        if (find_symbol_in_image(task, &img, symbol_name, &target_addr)) break;
     }
 
-    if (mmov_addr == 0) {
-        fprintf(stderr, "could not locate _mach_msg_overwrite in target\n");
+    if (target_addr == 0) {
+        fprintf(stderr, "could not locate %s in target\n", symbol_name);
         free(localArray); if (did_suspend) task_resume(task); detach_process(pid); return -1;
     }
 
-    printf("found hook at 0x%llx, mach_msg_overwrite at 0x%llx\n",
-           (unsigned long long)hook_addr, (unsigned long long)mmov_addr);
+    printf("found hook at 0x%llx, target %s at 0x%llx\n",
+           (unsigned long long)hook_addr, symbol_name, (unsigned long long)target_addr);
 
     trampoline_bank_t bank;
     if (trampoline_bank_init_task(&bank, task, 8, 0) != 0) {
@@ -273,7 +273,7 @@ static int patch_mach_msg_overwrite(pid_t pid) {
     }
 
     size_t idx = 0;
-    if (trampoline_bank_install_task(&bank, mmov_addr, hook_addr, &idx) != 0) {
+    if (trampoline_bank_install_task(&bank, target_addr, hook_addr, &idx) != 0) {
         fprintf(stderr, "failed to install remote trampoline\n");
         trampoline_bank_deinit(&bank);
         free(localArray); if (did_suspend) task_resume(task); detach_process(pid); return -1;
@@ -290,13 +290,29 @@ static int patch_mach_msg_overwrite(pid_t pid) {
 }
 
 static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s <pid>\n", prog);
+    fprintf(stderr, "Usage: %s <pid> [symbol]\n", prog);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "- If [symbol] is omitted, defaults to _mach_msg_overwrite.\n");
+    fprintf(stderr, "- Provide Mach-O symbol (with or without leading underscore).\n");
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) { usage(argv[0]); return 2; }
+    if (argc < 2 || argc > 3) { usage(argv[0]); return 2; }
     pid_t pid = (pid_t)strtol(argv[1], NULL, 10);
     if (pid <= 0) { usage(argv[0]); return 2; }
-    int rc = patch_mach_msg_overwrite(pid);
+
+    // Determine the target symbol. Default to _mach_msg_overwrite for backward compatibility.
+    char symbuf[256] = {0};
+    const char *user_sym = (argc == 3) ? argv[2] : "_mach_msg_overwrite";
+    // Accept names with or without leading underscore; Mach-O externs typically have one.
+    if (user_sym[0] == '_') {
+        strncpy(symbuf, user_sym, sizeof(symbuf) - 1);
+    } else {
+        // Prefix underscore if missing
+        symbuf[0] = '_';
+        strncat(symbuf, user_sym, sizeof(symbuf) - 2);
+    }
+
+    int rc = patch_symbol_in_task(pid, symbuf);
     return (rc == 0) ? 0 : 1;
 }
