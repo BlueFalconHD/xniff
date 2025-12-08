@@ -241,9 +241,22 @@ static int patch_symbol_in_task(pid_t pid, const char *symbol_name) {
         free(localArray); if (did_suspend) task_resume(task); detach_process(pid); return -1;
     }
 
-    // Find our hook symbol in the main image
+    // Find our hook symbol. Prefer main image, but fall back to all images.
     mach_vm_address_t hook_addr = 0;
     if (!find_symbol_in_image(task, &main_img, "_xniff_remote_hook", &hook_addr)) {
+        // Try without underscore just in case, then scan all images
+        if (!find_symbol_in_image(task, &main_img, "xniff_remote_hook", &hook_addr)) {
+            for (uint32_t i = 0; i < imageCount && hook_addr == 0; i++) {
+                parsed_image_t img = (parsed_image_t){0};
+                mach_vm_address_t header_addr = (mach_vm_address_t)(uintptr_t)localArray[i].imageLoadAddress;
+                if (!load_image_info(task, header_addr, &img.info)) continue;
+                if (!parse_load_commands(task, &img)) continue;
+                if (find_symbol_in_image(task, &img, "_xniff_remote_hook", &hook_addr)) break;
+                (void)find_symbol_in_image(task, &img, "xniff_remote_hook", &hook_addr);
+            }
+        }
+    }
+    if (hook_addr == 0) {
         fprintf(stderr, "hook symbol _xniff_remote_hook not found in target\n");
         free(localArray); if (did_suspend) task_resume(task); detach_process(pid); return -1;
     }

@@ -228,14 +228,14 @@ int patch_function_with_trampoline(void *target_function, void *trampoline_buffe
 /*
  * Internal helper to modify protections with control over set_maximum (task or self).
  */
-static kern_return_t vm_protect_pages_task(mach_port_t task, mach_vm_address_t addr, size_t size, boolean_t set_max, vm_prot_t new_prot) {
+kern_return_t vm_protect_pages_task(mach_port_t task, mach_vm_address_t addr, size_t size, boolean_t set_max, vm_prot_t new_prot) {
     mach_vm_size_t sz = (mach_vm_size_t)size;
     mach_vm_address_t page_start = PAGE_RANGE_START(addr);
     mach_vm_size_t page_size = PAGE_RANGE_SIZE(addr, sz);
     return vm_protect(task, page_start, page_size, set_max, new_prot);
 }
 
-static kern_return_t vm_protect_pages(void *address, size_t size, boolean_t set_max, vm_prot_t new_prot) {
+kern_return_t vm_protect_pages(void *address, size_t size, boolean_t set_max, vm_prot_t new_prot) {
     mach_port_t task = mach_task_self();
     mach_vm_address_t addr = (mach_vm_address_t)(uintptr_t)address;
     return vm_protect_pages_task(task, addr, size, set_max, new_prot);
