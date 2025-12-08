@@ -2,6 +2,13 @@ cmake_minimum_required(VERSION 3.20)
 
 project(xniff VERSION 0.1.0 LANGUAGES C ASM)
 
+# Force arm64 build on macOS to assemble AArch64 trampolines
+if(APPLE)
+    if(NOT CMAKE_OSX_ARCHITECTURES)
+        set(CMAKE_OSX_ARCHITECTURES "arm64" CACHE STRING "" FORCE)
+    endif()
+endif()
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
@@ -37,6 +44,14 @@ set_target_properties(xniff PROPERTIES
     SOVERSION ${PROJECT_VERSION_MAJOR}
 )
 
+# Runtime dylib to inject into target processes
+file(GLOB XNIFF_RT_SOURCES CONFIGURE_DEPENDS
+    "${PROJECT_SOURCE_DIR}/Sources/xniff-rt/*.c"
+)
+add_library(xniff-rt SHARED ${XNIFF_RT_SOURCES})
+target_include_directories(xniff-rt PUBLIC ${PROJECT_SOURCE_DIR}/Sources/xniff-rt)
+set_target_properties(xniff-rt PROPERTIES OUTPUT_NAME xniff-rt)
+
 file(GLOB XNIFF_CLI_SOURCES CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/Sources/xniff-cli/*.c"
     "${PROJECT_SOURCE_DIR}/Sources/xniff-cli/*.s"
@@ -63,6 +78,10 @@ if(APPLE)
         add_custom_command(TARGET xniff POST_BUILD
             COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xniff>"
             COMMENT "Codesigning libxniff with JIT entitlements")
+
+        add_custom_command(TARGET xniff-rt POST_BUILD
+            COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xniff-rt>"
+            COMMENT "Codesigning xniff-rt with JIT entitlements")
 
         add_custom_command(TARGET xniff-test POST_BUILD
             COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xniff-test>"

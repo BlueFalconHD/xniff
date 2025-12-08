@@ -3,6 +3,13 @@
 #include <pthread.h>
 
 
+// Forward declarations for helpers used before their definitions
+static int remote_copy_prologue_bytes(mach_port_t task, mach_vm_address_t target_function, uint8_t *out_buf, size_t max_bytes);
+kern_return_t vm_protect_pages_task(mach_port_t task, mach_vm_address_t addr, size_t size, boolean_t set_max, vm_prot_t new_prot);
+int prepare_protections_for_patching_task(mach_port_t task, mach_vm_address_t address, size_t size);
+int restore_protections_after_patching_task(mach_port_t task, mach_vm_address_t address, size_t size);
+
+
 /*
  * Determines whether an instruction contains PC-relative
  * or other non-copyable elements which will break if we
@@ -94,7 +101,16 @@ int copy_instructions(uint8_t *dst, const uint8_t *src_fun, size_t limit, csh ha
         cs_insn *insn;
         size_t count = cs_disasm(local_handle, current_ptr, limit - total_copied, (uint64_t)(uintptr_t)current_ptr, 1, &insn);
         if (count == 0) {
-            break; // Failed to disassemble
+            // Capstone may not recognize some arm64e PAC instructions (e.g., PACIBSP/AUTIBSP).
+            // Fallback: conservatively copy 4 bytes and continue, up to the requested limit.
+            // This keeps us progressing through typical prologues that start with PAC + stack frame.
+            if ((limit - total_copied) >= 4) {
+                memcpy(dst + total_copied, current_ptr, 4);
+                total_copied += 4;
+                current_ptr += 4;
+                continue;
+            }
+            break; // not enough bytes left to safely copy
         }
 
         if (!is_instruction_copyable(insn)) {
@@ -259,6 +275,191 @@ static void assemble_trampoline_at_with_remote_pc(uint8_t *tramp_local_base,
 
     // Ensure the CPU sees the newly written instructions (for local buffer too)
     __builtin___clear_cache((char *)tramp_local_base, (char *)tramp_local_base + tmpl_size);
+}
+
+static size_t xtrampoline_template_size(void) {
+    const uint8_t *tmpl_start = XTRAMP_START_AFTER_PROLOGUE;
+    const uint8_t *tmpl_end   = XTRAMP_END;
+    return (size_t)(tmpl_end - tmpl_start);
+}
+
+static void assemble_xtrampoline_at_with_remote_pc(uint8_t *tramp_local_base,
+                                                   uint64_t tramp_remote_base,
+                                                   uint64_t entry_hook,
+                                                   uint64_t return_address,
+                                                   uint64_t exit_hook,
+                                                   uint64_t ctx_base_remote) {
+    const uint8_t *tmpl_start = XTRAMP_START_AFTER_PROLOGUE;
+    const uint8_t *tmpl_end   = XTRAMP_END;
+    size_t tmpl_size = (size_t)(tmpl_end - tmpl_start);
+
+    memcpy(tramp_local_base, tmpl_start, tmpl_size);
+
+    // Offsets to patch points
+    size_t off_hook_adrp   = (size_t)(XTRAMP_HOOK_ADRP   - tmpl_start);
+    size_t off_hook_add    = (size_t)(XTRAMP_HOOK_ADD    - tmpl_start);
+    size_t off_ctx_adrp    = (size_t)(XTRAMP_CTX_ADRP    - tmpl_start);
+    size_t off_ctx_add     = (size_t)(XTRAMP_CTX_ADD     - tmpl_start);
+    size_t off_res_adrp    = (size_t)(XTRAMP_RESUME_ADRP - tmpl_start);
+    size_t off_res_add     = (size_t)(XTRAMP_RESUME_ADD  - tmpl_start);
+    size_t off_exitlr_adrp = (size_t)(XTRAMP_EXITLR_ADRP - tmpl_start);
+    size_t off_exitlr_add  = (size_t)(XTRAMP_EXITLR_ADD  - tmpl_start);
+    size_t off_ret_adrp    = (size_t)(XTRAMP_RETURN_ADRP - tmpl_start);
+    size_t off_ret_add     = (size_t)(XTRAMP_RETURN_ADD  - tmpl_start);
+    size_t off_exit_ctx_adrp = (size_t)(XTRAMP_EXIT_CTX_ADRP - tmpl_start);
+    size_t off_exit_ctx_add  = (size_t)(XTRAMP_EXIT_CTX_ADD  - tmpl_start);
+    size_t off_exhook_adrp = (size_t)(XTRAMP_EXIT_HOOK_ADRP - tmpl_start);
+    size_t off_exhook_add  = (size_t)(XTRAMP_EXIT_HOOK_ADD  - tmpl_start);
+
+    // Compute remote PCs for ADRP calculation
+    uint64_t pc_hook_adrp   = tramp_remote_base + off_hook_adrp;
+    uint64_t pc_ctx_adrp    = tramp_remote_base + off_ctx_adrp;
+    uint64_t pc_res_adrp    = tramp_remote_base + off_res_adrp;
+    uint64_t pc_exitlr_adrp = tramp_remote_base + off_exitlr_adrp;
+    uint64_t pc_ret_adrp    = tramp_remote_base + off_ret_adrp;
+    uint64_t pc_exit_ctx_adrp = tramp_remote_base + off_exit_ctx_adrp;
+    uint64_t pc_exhook_adrp = tramp_remote_base + off_exhook_adrp;
+
+    // Patch entry hook
+    uint32_t insn_hook_adrp = assemble_adrp_x16_page(pc_hook_adrp, entry_hook);
+    uint32_t insn_hook_add  = assemble_add_x16_pageoff(entry_hook);
+    *(uint32_t *)(tramp_local_base + off_hook_adrp) = insn_hook_adrp;
+    *(uint32_t *)(tramp_local_base + off_hook_add)  = insn_hook_add;
+
+    // Patch context base (both entry and exit sides)
+    // Context base uses X9 in the template
+    uint32_t insn_ctx_adrp = assemble_adrp_reg_page(9u, pc_ctx_adrp, ctx_base_remote);
+    uint32_t insn_ctx_add  = assemble_add_reg_pageoff(9u, ctx_base_remote);
+    *(uint32_t *)(tramp_local_base + off_ctx_adrp) = insn_ctx_adrp;
+    *(uint32_t *)(tramp_local_base + off_ctx_add)  = insn_ctx_add;
+    // Exit side also recomputes context base into X9
+    uint32_t insn_exit_ctx_adrp = assemble_adrp_reg_page(9u, pc_exit_ctx_adrp, ctx_base_remote);
+    uint32_t insn_exit_ctx_add  = assemble_add_reg_pageoff(9u, ctx_base_remote);
+    *(uint32_t *)(tramp_local_base + off_exit_ctx_adrp) = insn_exit_ctx_adrp;
+    *(uint32_t *)(tramp_local_base + off_exit_ctx_add)  = insn_exit_ctx_add;
+
+    // Patch resume PC (entry side store) and branch-return pair
+    // Resume PC is stored from X15 in the template
+    uint32_t insn_res_adrp = assemble_adrp_reg_page(15u, pc_res_adrp, return_address);
+    uint32_t insn_res_add  = assemble_add_reg_pageoff(15u, return_address);
+    *(uint32_t *)(tramp_local_base + off_res_adrp) = insn_res_adrp;
+    *(uint32_t *)(tramp_local_base + off_res_add)  = insn_res_add;
+
+    uint32_t insn_ret_adrp = assemble_adrp_x16_page(pc_ret_adrp, return_address);
+    uint32_t insn_ret_add  = assemble_add_x16_pageoff(return_address);
+    *(uint32_t *)(tramp_local_base + off_ret_adrp) = insn_ret_adrp;
+    *(uint32_t *)(tramp_local_base + off_ret_add)  = insn_ret_add;
+
+    // Patch exit stub address into the code path that writes LR
+    uint64_t exit_stub_addr = tramp_remote_base + (uint64_t)(XTRAMP_EXIT_STUB - XTRAMP_START_AFTER_PROLOGUE);
+    uint32_t insn_exitlr_adrp = assemble_adrp_x16_page(pc_exitlr_adrp, exit_stub_addr);
+    uint32_t insn_exitlr_add  = assemble_add_x16_pageoff(exit_stub_addr);
+    *(uint32_t *)(tramp_local_base + off_exitlr_adrp) = insn_exitlr_adrp;
+    *(uint32_t *)(tramp_local_base + off_exitlr_add)  = insn_exitlr_add;
+
+    // Patch exit hook
+    // Allow exit_hook==0 to mean "no-op"; patch to an internal RET stub.
+    if (exit_hook == 0) {
+        exit_hook = tramp_remote_base + (uint64_t)(XTRAMP_NOOP - XTRAMP_START_AFTER_PROLOGUE);
+    }
+    uint32_t insn_exhook_adrp = assemble_adrp_x16_page(pc_exhook_adrp, exit_hook);
+    uint32_t insn_exhook_add  = assemble_add_x16_pageoff(exit_hook);
+    *(uint32_t *)(tramp_local_base + off_exhook_adrp) = insn_exhook_adrp;
+    *(uint32_t *)(tramp_local_base + off_exhook_add)  = insn_exhook_add;
+
+    __builtin___clear_cache((char *)tramp_local_base, (char *)tramp_local_base + tmpl_size);
+}
+
+int patch_function_with_exit_trampoline_task(mach_port_t task,
+                                             mach_vm_address_t target_function,
+                                             mach_vm_address_t trampoline_buffer,
+                                             mach_vm_address_t entry_hook_function,
+                                             mach_vm_address_t exit_hook_function,
+                                             mach_vm_address_t ctx_slot_base) {
+    const size_t max_prologue = 32;
+    uint8_t local_prologue[64];
+    if (sizeof(local_prologue) < max_prologue) return -1;
+    int prologue_bytes = remote_copy_prologue_bytes(task, target_function, local_prologue, max_prologue);
+    if (prologue_bytes <= 0) {
+        fprintf(stderr, "[xniff] exit-tramp: failed to analyze prologue for 0x%llx\n",
+                (unsigned long long)target_function);
+        return -1;
+    }
+    if ((size_t)prologue_bytes < 12) {
+        fprintf(stderr, "[xniff] exit-tramp: prologue too short/non-copyable (%d) at 0x%llx\n",
+                prologue_bytes, (unsigned long long)target_function);
+        return -1;
+    }
+
+    size_t need = (size_t)prologue_bytes + xtrampoline_template_size();
+
+    kern_return_t krp = vm_protect_pages_task(task, trampoline_buffer, need, TRUE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (krp != KERN_SUCCESS) {
+        fprintf(stderr, "[xniff] exit-tramp: vm_protect set_max RWX failed for slot 0x%llx len %zu (kr=%d)\n",
+                (unsigned long long)trampoline_buffer, need, krp);
+    }
+    krp = vm_protect_pages_task(task, trampoline_buffer, need, FALSE, VM_PROT_READ | VM_PROT_WRITE);
+    if (krp != KERN_SUCCESS) {
+        fprintf(stderr, "[xniff] exit-tramp: vm_protect RW failed for slot 0x%llx len %zu (kr=%d)\n",
+                (unsigned long long)trampoline_buffer, need, krp);
+        return -1;
+    }
+    if (prepare_protections_for_patching_task(task, target_function, 12) != 0) {
+        fprintf(stderr, "[xniff] exit-tramp: prepare_protections_for_patching_task failed for target 0x%llx\n",
+                (unsigned long long)target_function);
+        (void)vm_protect_pages_task(task, trampoline_buffer, need, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        return -1;
+    }
+
+    if ((size_t)prologue_bytes > sizeof(local_prologue)) return -1;
+    kern_return_t kr = vm_write(task, trampoline_buffer,
+                                (vm_offset_t)(uintptr_t)local_prologue,
+                                (mach_msg_type_number_t)prologue_bytes);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "[xniff] exit-tramp: vm_write prologue to 0x%llx failed (kr=%d)\n",
+                (unsigned long long)trampoline_buffer, kr);
+        return -1;
+    }
+
+    size_t tmpl_size = xtrampoline_template_size();
+    uint8_t *tail = (uint8_t *)malloc(tmpl_size);
+    if (!tail) return -1;
+
+    uint64_t remote_tail_pc = (uint64_t)trampoline_buffer + (uint64_t)prologue_bytes;
+    assemble_xtrampoline_at_with_remote_pc(tail, remote_tail_pc,
+                                           (uint64_t)entry_hook_function,
+                                           (uint64_t)target_function + (uint64_t)prologue_bytes,
+                                           (uint64_t)exit_hook_function,
+                                           (uint64_t)ctx_slot_base);
+
+    kr = vm_write(task, trampoline_buffer + (mach_vm_address_t)prologue_bytes,
+                  (vm_offset_t)(uintptr_t)tail, (mach_msg_type_number_t)tmpl_size);
+    free(tail);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "[xniff] exit-tramp: vm_write tail to 0x%llx failed (kr=%d)\n",
+                (unsigned long long)(trampoline_buffer + (mach_vm_address_t)prologue_bytes), kr);
+        return -1;
+    }
+
+    // Patch original entry with branch to trampoline
+    uint64_t target_address = (uint64_t)target_function;
+    uint64_t tramp_address = (uint64_t)trampoline_buffer;
+    uint32_t adrp_insn = assemble_adrp_x16_page(target_address, tramp_address);
+    uint32_t add_insn  = assemble_add_x16_pageoff(tramp_address);
+    uint32_t br_insn   = 0xD61F0200u | (16u << 5);
+    uint8_t patch_bytes[12];
+    memcpy(patch_bytes + 0, &adrp_insn, 4);
+    memcpy(patch_bytes + 4, &add_insn, 4);
+    memcpy(patch_bytes + 8, &br_insn, 4);
+    kr = vm_write(task, target_function, (vm_offset_t)(uintptr_t)patch_bytes, (mach_msg_type_number_t)sizeof(patch_bytes));
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "[xniff] exit-tramp: vm_write patch to target 0x%llx failed (kr=%d)\n",
+                (unsigned long long)target_function, kr);
+        return -1;
+    }
+
+    (void)vm_protect_pages_task(task, trampoline_buffer, need, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    return prologue_bytes;
 }
 
 /*
@@ -537,6 +738,17 @@ void trampoline_bank_deinit(trampoline_bank_t *bank) {
             munmap(bank->region, bank->region_size);
         }
     }
+    // Attempt to free any per-slot context regions for exit mode
+    if (bank->infos && bank->is_remote) {
+        for (size_t i = 0; i < bank->capacity; i++) {
+            if (bank->infos[i].active && bank->infos[i].ctx_base && bank->infos[i].ctx_size) {
+                vm_deallocate(bank->task, (mach_vm_address_t)(uintptr_t)bank->infos[i].ctx_base,
+                              (mach_vm_size_t)bank->infos[i].ctx_size);
+                bank->infos[i].ctx_base = NULL;
+                bank->infos[i].ctx_size = 0;
+            }
+        }
+    }
     if (bank->infos) {
         free(bank->infos);
     }
@@ -799,6 +1011,91 @@ int trampoline_bank_install_task(trampoline_bank_t *bank,
     info->trampoline = (void *)(uintptr_t)slot;
     info->prologue_bytes = (size_t)copied;
     info->active = true;
+    bank->count = idx + 1;
+    if (out_index) *out_index = idx;
+    return rc;
+}
+
+int trampoline_bank_install_task_with_exit(trampoline_bank_t *bank,
+                                           mach_vm_address_t target_function,
+                                           mach_vm_address_t entry_hook_function,
+                                           mach_vm_address_t exit_hook_function,
+                                           size_t *out_index) {
+    if (!bank || !bank->region || bank->count >= bank->capacity) {
+        return -1;
+    }
+    if (!bank->is_remote) {
+        // Not supported in local mode for now.
+        return -1;
+    }
+
+    const size_t max_prologue = 32;
+    uint8_t scratch[max_prologue];
+    int prologue_bytes = remote_copy_prologue_bytes(bank->task, target_function, scratch, max_prologue);
+    if (prologue_bytes <= 0) {
+        fprintf(stderr, "Failed to analyze remote target prologue\n");
+        return -1;
+    }
+    if ((size_t)prologue_bytes < 12) {
+        fprintf(stderr, "Refusing to patch remote target: non-copyable within first 12 bytes (copied=%d)\n", prologue_bytes);
+        return -1;
+    }
+
+    size_t need = (size_t)prologue_bytes + xtrampoline_template_size();
+    fprintf(stderr, "[xniff] bank-install exit: prologue=%d xtramp=%zu need=%zu slot_size=%zu\n",
+            prologue_bytes, xtrampoline_template_size(), need, bank->per_trampoline_size);
+    size_t idx = 0;
+    uint8_t *slot_ptr = (uint8_t *)trampoline_bank_alloc_slot(bank, need, &idx);
+    if (!slot_ptr) {
+        fprintf(stderr, "Remote trampoline slot too small (need=%zu, slot=%zu)\n", need, bank->per_trampoline_size);
+        return -1;
+    }
+    mach_vm_address_t slot = (mach_vm_address_t)(uintptr_t)slot_ptr;
+
+    // Allocate per-slot context region (RW). Use 4KB per thread slot * 1 page for simplicity.
+    const size_t ctx_per_slot = 4096; // one page per trampoline slot (contains N thread frames)
+    vm_address_t ctx_addr = 0;
+    if (vm_allocate(bank->task, &ctx_addr, (vm_size_t)ctx_per_slot, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
+        fprintf(stderr, "Failed to allocate remote context slot\n");
+        return -1;
+    }
+
+    // Make slot RW and target patchable
+    (void)vm_protect_pages_task(bank->task, slot, need, TRUE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (vm_protect_pages_task(bank->task, slot, need, FALSE, VM_PROT_READ | VM_PROT_WRITE) != KERN_SUCCESS) {
+        fprintf(stderr, "Error: could not make remote trampoline slot RW\n");
+        vm_deallocate(bank->task, ctx_addr, (vm_size_t)ctx_per_slot);
+        return -1;
+    }
+    if (prepare_protections_for_patching_task(bank->task, target_function, 12) != 0) {
+        (void)vm_protect_pages_task(bank->task, slot, need, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        vm_deallocate(bank->task, ctx_addr, (vm_size_t)ctx_per_slot);
+        return -1;
+    }
+
+    int copied = patch_function_with_exit_trampoline_task(bank->task, target_function, slot,
+                                                          entry_hook_function, exit_hook_function,
+                                                          (mach_vm_address_t)ctx_addr);
+
+    int rc = 0;
+    if (restore_protections_after_patching_task(bank->task, target_function, 12) != 0) {
+        rc = -1;
+    }
+    (void)vm_protect_pages_task(bank->task, slot, need, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+
+    if (copied <= 0) {
+        vm_deallocate(bank->task, ctx_addr, (vm_size_t)ctx_per_slot);
+        return -1;
+    }
+
+    trampoline_info_t *info = &bank->infos[idx];
+    info->target_function = (void *)(uintptr_t)target_function;
+    info->hook_function = (void *)(uintptr_t)entry_hook_function;
+    info->trampoline = (void *)(uintptr_t)slot;
+    info->prologue_bytes = (size_t)copied;
+    info->active = true;
+    info->ctx_base = (void *)(uintptr_t)ctx_addr;
+    info->ctx_size = ctx_per_slot;
     bank->count = idx + 1;
     if (out_index) *out_index = idx;
     return rc;

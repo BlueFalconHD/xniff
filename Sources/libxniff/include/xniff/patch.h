@@ -24,6 +24,26 @@ extern const uint8_t TRAMPOLINE_RELOAD_ADD[];
 extern const uint8_t TRAMPOLINE_RETURN_ADRP[];
 extern const uint8_t TRAMPOLINE_RETURN_ADD[];
 
+// Extended trampoline (entry+exit) labels
+extern const uint8_t XTRAMP_START_AFTER_PROLOGUE[];
+extern const uint8_t XTRAMP_HOOK_ADRP[];
+extern const uint8_t XTRAMP_HOOK_ADD[];
+extern const uint8_t XTRAMP_CTX_ADRP[];
+extern const uint8_t XTRAMP_CTX_ADD[];
+extern const uint8_t XTRAMP_RESUME_ADRP[];
+extern const uint8_t XTRAMP_RESUME_ADD[];
+extern const uint8_t XTRAMP_EXITLR_ADRP[];
+extern const uint8_t XTRAMP_EXITLR_ADD[];
+extern const uint8_t XTRAMP_RETURN_ADRP[];
+extern const uint8_t XTRAMP_RETURN_ADD[];
+extern const uint8_t XTRAMP_EXIT_STUB[];
+extern const uint8_t XTRAMP_EXIT_CTX_ADRP[];
+extern const uint8_t XTRAMP_EXIT_CTX_ADD[];
+extern const uint8_t XTRAMP_EXIT_HOOK_ADRP[];
+extern const uint8_t XTRAMP_EXIT_HOOK_ADD[];
+extern const uint8_t XTRAMP_END[];
+extern const uint8_t XTRAMP_NOOP[];
+
 /* Page size in bytes at runtime. */
 #define PAGE_SIZE_BYTES ((size_t)getpagesize())
 
@@ -117,6 +137,16 @@ int restore_protections_after_patching(void *address, size_t size);
  */
 int patch_function_with_trampoline(void *target_function, void *trampoline_buffer, void *hook_function);
 
+// Extended: entry + exit (position-independent helper code embedded in trampoline).
+// Assembles and installs a trampoline that saves args, redirects LR to an exit stub,
+// and calls an exit hook on return. Context memory base is provided per trampoline slot.
+int patch_function_with_exit_trampoline_task(mach_port_t task,
+                                             mach_vm_address_t target_function,
+                                             mach_vm_address_t trampoline_buffer,
+                                             mach_vm_address_t entry_hook_function,
+                                             mach_vm_address_t exit_hook_function,
+                                             mach_vm_address_t ctx_slot_base);
+
 /*
  * Trampoline Bank
  *
@@ -131,6 +161,8 @@ typedef struct trampoline_info {
     void   *trampoline;          // base address of this trampoline slot
     size_t  prologue_bytes;      // number of bytes copied from target
     bool    active;              // whether this entry is in use
+    void   *ctx_base;            // optional per-trampoline context base (RW) for exit mode
+    size_t  ctx_size;            // size of the context region for this trampoline
 } trampoline_info_t;
 
 typedef struct trampoline_bank {
@@ -172,6 +204,13 @@ int trampoline_bank_install_task(trampoline_bank_t *bank,
                                  mach_vm_address_t hook_function,
                                  size_t *out_index);
 
+// Install entry+exit trampoline, allocating a per-slot context region (RW) in the target.
+int trampoline_bank_install_task_with_exit(trampoline_bank_t *bank,
+                                           mach_vm_address_t target_function,
+                                           mach_vm_address_t entry_hook_function,
+                                           mach_vm_address_t exit_hook_function,
+                                           size_t *out_index);
+
 // Task-space variants for working on a remote task
 kern_return_t modify_page_protections_task(mach_port_t task, mach_vm_address_t address, size_t size,
                                            vm_prot_t new_prot);
@@ -183,4 +222,3 @@ int patch_function_with_trampoline_task(mach_port_t task,
                                         mach_vm_address_t hook_function);
 
 #endif /* PATCH_H */
-
