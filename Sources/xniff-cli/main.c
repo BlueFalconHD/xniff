@@ -288,12 +288,34 @@ static int patch_symbol_in_task(pid_t pid, const char *symbol_name) {
     size_t idx = 0;
     if (trampoline_bank_install_task(&bank, target_addr, hook_addr, &idx) != 0) {
         fprintf(stderr, "failed to install remote trampoline\n");
+    // Keep remote trampoline memory alive after installation so the patched
+    // function can continue to branch to it without crashing.
+    if (bank.is_remote) {
+        if (bank.infos) free(bank.infos);
+        memset(&bank, 0, sizeof(bank));
+    } else {
         trampoline_bank_deinit(&bank);
+    }
         free(localArray); if (did_suspend) task_resume(task); detach_process(pid); return -1;
     }
     printf("installed remote trampoline at slot %zu\n", idx);
+    // Provide helpful addresses for debugging in LLDB
+    if (idx < bank.capacity) {
+        trampoline_info_t *info = &bank.infos[idx];
+        uint64_t resume_addr = (uint64_t)target_addr + (uint64_t)info->prologue_bytes;
+        printf("  trampoline slot @ 0x%llx, resume @ 0x%llx, hook @ 0x%llx\n",
+               (unsigned long long)(uintptr_t)info->trampoline,
+               (unsigned long long)resume_addr,
+               (unsigned long long)hook_addr);
+    }
 
-    trampoline_bank_deinit(&bank);
+    // Keep remote trampoline mapping alive; free local bookkeeping only.
+    if (bank.is_remote) {
+        if (bank.infos) free(bank.infos);
+        memset(&bank, 0, sizeof(bank));
+    } else {
+        trampoline_bank_deinit(&bank);
+    }
     free(localArray);
 
     // Detach and let process run

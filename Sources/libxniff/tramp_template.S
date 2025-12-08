@@ -2,6 +2,8 @@
 .globl _TRAMPOLINE_START_AFTER_PROLOGUE
 .globl _TRAMPOLINE_INTERMEDIATE_ADRP
 .globl _TRAMPOLINE_INTERMEDIATE_ADD
+.globl _TRAMPOLINE_RELOAD_ADRP
+.globl _TRAMPOLINE_RELOAD_ADD
 .globl _TRAMPOLINE_RETURN_ADRP
 .globl _TRAMPOLINE_RETURN_ADD
 _TRAMPOLINE_START_AFTER_PROLOGUE:
@@ -27,6 +29,13 @@ _TRAMPOLINE_INTERMEDIATE_ADD:
     LDP     X29, X30, [SP, #0x50]
 
     ADD     SP, SP, #0xA0
+
+_TRAMPOLINE_RELOAD_ADRP:
+    // Patched at runtime to re-materialize a relocated ADRP for a needed register (e.g., X0)
+    ADRP    X16, _dummy_patch_hook@PAGE
+_TRAMPOLINE_RELOAD_ADD:
+    // Follow-up ADD for the same register as above
+    ADD     X16, X16, _dummy_patch_hook@PAGEOFF
 
 _TRAMPOLINE_RETURN_ADRP:
     ADRP    X16, _dummy_trampoline_return@page

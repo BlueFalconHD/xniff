@@ -152,7 +152,8 @@ __attribute__((used, noinline, noreturn)) void dummy_trampoline_return(void) {
  * then patches its ADRP/ADD pairs to target the provided hook and return
  * addresses.
  */
-void assemble_trampoline_at(uint8_t *tramp_base, uint64_t hook_address, uint64_t return_address) {
+void assemble_trampoline_at(uint8_t *tramp_base, uint64_t hook_address, uint64_t return_address,
+                            int reload_reg, uint64_t reload_target) {
 
     const uint8_t *tmpl_start = TRAMPOLINE_START_AFTER_PROLOGUE;
     const uint8_t *tmpl_end = TRAMPOLINE_RETURN_ADD + 8; // add followed by 2 instructions of 4 bytes each
@@ -166,6 +167,8 @@ void assemble_trampoline_at(uint8_t *tramp_base, uint64_t hook_address, uint64_t
     size_t off_hook_add  = (size_t)(TRAMPOLINE_INTERMEDIATE_ADD  - tmpl_start);
     size_t off_ret_adrp  = (size_t)(TRAMPOLINE_RETURN_ADRP       - tmpl_start);
     size_t off_ret_add   = (size_t)(TRAMPOLINE_RETURN_ADD        - tmpl_start);
+    size_t off_reload_adrp = (size_t)(TRAMPOLINE_RELOAD_ADRP     - tmpl_start);
+    size_t off_reload_add  = (size_t)(TRAMPOLINE_RELOAD_ADD      - tmpl_start);
 
     // Patch hook ADRP/ADD
     uint64_t pc_hook_adrp = (uint64_t)(uintptr_t)(tramp_base + off_hook_adrp);
@@ -181,8 +184,81 @@ void assemble_trampoline_at(uint8_t *tramp_base, uint64_t hook_address, uint64_t
     *(uint32_t *)(tramp_base + off_ret_adrp) = insn_ret_adrp;
     *(uint32_t *)(tramp_base + off_ret_add)  = insn_ret_add;
 
+    // Optionally re-materialize a relocated ADRP/ADD pair for a general register
+    if (reload_reg >= 0 && reload_reg <= 30) {
+        uint64_t pc_reload_adrp = (uint64_t)(uintptr_t)(tramp_base + off_reload_adrp);
+        uint32_t insn_reload_adrp = assemble_adrp_reg_page((uint32_t)reload_reg, pc_reload_adrp, reload_target);
+        uint32_t insn_reload_add  = assemble_add_reg_pageoff((uint32_t)reload_reg, reload_target);
+        *(uint32_t *)(tramp_base + off_reload_adrp) = insn_reload_adrp;
+        *(uint32_t *)(tramp_base + off_reload_add)  = insn_reload_add;
+    }
+
     // Ensure the CPU sees the newly written instructions
     __builtin___clear_cache((char *)tramp_base, (char *)tramp_base + tmpl_size);
+}
+
+/*
+ * Assembles the trampoline into a local buffer, but computes ADRP immediates
+ * relative to the remote PC where it will execute.
+ *
+ * This is required for remote patching: ADRP encodes the page delta relative
+ * to the instruction's PC. If we assemble using a local buffer address as the
+ * PC, the encoded immediates will be wrong when executed in the target process.
+ *
+ * Parameters:
+ *  - tramp_local_base: start of the local buffer where the trampoline bytes are written
+ *  - tramp_remote_base: remote address where tramp_local_base[0] will reside in the target
+ *  - hook_address: absolute address of the hook function in the target
+ *  - return_address: absolute address in the target where we resume execution
+ */
+static void assemble_trampoline_at_with_remote_pc(uint8_t *tramp_local_base,
+                                                  uint64_t tramp_remote_base,
+                                                  uint64_t hook_address,
+                                                  uint64_t return_address,
+                                                  int reload_reg,
+                                                  uint64_t reload_target) {
+    const uint8_t *tmpl_start = TRAMPOLINE_START_AFTER_PROLOGUE;
+    const uint8_t *tmpl_end   = TRAMPOLINE_RETURN_ADD + 8; // add followed by 2 instructions of 4 bytes each
+    size_t tmpl_size = (size_t)(tmpl_end - tmpl_start);
+
+    // Copy template into local destination buffer
+    memcpy(tramp_local_base, tmpl_start, tmpl_size);
+
+    // Calculate offsets of patch points within the template
+    size_t off_hook_adrp = (size_t)(TRAMPOLINE_INTERMEDIATE_ADRP - tmpl_start);
+    size_t off_hook_add  = (size_t)(TRAMPOLINE_INTERMEDIATE_ADD  - tmpl_start);
+    size_t off_ret_adrp  = (size_t)(TRAMPOLINE_RETURN_ADRP       - tmpl_start);
+    size_t off_ret_add   = (size_t)(TRAMPOLINE_RETURN_ADD        - tmpl_start);
+    size_t off_reload_adrp = (size_t)(TRAMPOLINE_RELOAD_ADRP     - tmpl_start);
+    size_t off_reload_add  = (size_t)(TRAMPOLINE_RELOAD_ADD      - tmpl_start);
+
+    // Compute PCs as they will be in the remote process
+    uint64_t pc_hook_adrp = (uint64_t)(tramp_remote_base + off_hook_adrp);
+    uint64_t pc_ret_adrp  = (uint64_t)(tramp_remote_base + off_ret_adrp);
+
+    // Patch hook ADRP/ADD using remote PCs
+    uint32_t insn_hook_adrp = assemble_adrp_x16_page(pc_hook_adrp, hook_address);
+    uint32_t insn_hook_add  = assemble_add_x16_pageoff(hook_address);
+    *(uint32_t *)(tramp_local_base + off_hook_adrp) = insn_hook_adrp;
+    *(uint32_t *)(tramp_local_base + off_hook_add)  = insn_hook_add;
+
+    // Patch return ADRP/ADD using remote PCs
+    uint32_t insn_ret_adrp = assemble_adrp_x16_page(pc_ret_adrp, return_address);
+    uint32_t insn_ret_add  = assemble_add_x16_pageoff(return_address);
+    *(uint32_t *)(tramp_local_base + off_ret_adrp) = insn_ret_adrp;
+    *(uint32_t *)(tramp_local_base + off_ret_add)  = insn_ret_add;
+
+    // Optionally re-materialize ADRP/ADD for a general-purpose register
+    if (reload_reg >= 0 && reload_reg <= 30) {
+        uint64_t pc_reload_adrp = tramp_remote_base + off_reload_adrp;
+        uint32_t insn_reload_adrp = assemble_adrp_reg_page((uint32_t)reload_reg, pc_reload_adrp, reload_target);
+        uint32_t insn_reload_add  = assemble_add_reg_pageoff((uint32_t)reload_reg, reload_target);
+        *(uint32_t *)(tramp_local_base + off_reload_adrp) = insn_reload_adrp;
+        *(uint32_t *)(tramp_local_base + off_reload_add)  = insn_reload_add;
+    }
+
+    // Ensure the CPU sees the newly written instructions (for local buffer too)
+    __builtin___clear_cache((char *)tramp_local_base, (char *)tramp_local_base + tmpl_size);
 }
 
 /*
@@ -202,10 +278,17 @@ int patch_function_with_trampoline(void *target_function, void *trampoline_buffe
     }
 
     // calculate the "return" address for the trampoline
-    uint64_t return_address = (uint64_t)(uintptr_t)target_function + (uint64_t)copied_bytes;
+    // We overwrite 12 bytes at the target (ADRP+ADD+BR). Ensure we resume after the patch window
+    // at minimum.
+    size_t patch_len = 12;
+    size_t resume_off = copied_bytes < patch_len ? patch_len : (size_t)copied_bytes;
+    uint64_t return_address = (uint64_t)(uintptr_t)target_function + (uint64_t)resume_off;
 
     // assemble the trampoline
-    assemble_trampoline_at((uint8_t *)trampoline_buffer + copied_bytes, (uint64_t)(uintptr_t)hook_function, return_address);
+    assemble_trampoline_at((uint8_t *)trampoline_buffer + copied_bytes,
+                           (uint64_t)(uintptr_t)hook_function,
+                           return_address,
+                           -1, 0);
 
     // now patch the original function to jump to the trampoline
     uint64_t target_address = (uint64_t)(uintptr_t)target_function;
@@ -568,11 +651,54 @@ int patch_function_with_trampoline_task(mach_port_t task,
         return -1;
     }
 
-    uint64_t return_address = (uint64_t)target_function + (uint64_t)copied_bytes;
+    // Ensure we resume at least after the 12-byte patch window to avoid loops.
+    size_t patch_len2 = 12;
+    size_t resume_off2 = (size_t)copied_bytes < patch_len2 ? patch_len2 : (size_t)copied_bytes;
+    uint64_t return_address = (uint64_t)target_function + (uint64_t)resume_off2;
     size_t tmpl_size = trampoline_template_size();
     uint8_t *tail = (uint8_t *)malloc(tmpl_size);
     if (!tail) return -1;
-    assemble_trampoline_at(tail, (uint64_t)hook_function, return_address);
+
+    // Detect a leading ADRP/ADD pair so we can re-materialize it before returning.
+    int reload_reg = -1;
+    uint64_t reload_target = 0;
+    do {
+        uint8_t head[8] = {0};
+        vm_size_t out_sz = 0;
+        if (vm_read_overwrite(task, target_function, sizeof(head), (mach_vm_address_t)(uintptr_t)head, &out_sz) != KERN_SUCCESS || out_sz < sizeof(head)) {
+            break;
+        }
+        uint32_t insn0 = *(const uint32_t *)(head + 0);
+        uint32_t insn1 = *(const uint32_t *)(head + 4);
+        // Detect ADRP (0b10000 opcode in top bits)
+        if ( (insn0 & 0x9F000000u) != 0x90000000u ) break;
+        uint32_t rd = (insn0 & 0x1Fu);
+        uint32_t immlo = (insn0 >> 29) & 0x3u;
+        uint32_t immhi = (insn0 >> 5) & 0x7FFFFu;
+        int64_t imm21 = (int64_t)((immhi << 2) | immlo);
+        // sign-extend 21-bit immediate
+        if (imm21 & (1ll << 20)) {
+            imm21 |= ~((1ll << 21) - 1);
+        }
+        uint64_t pc0 = (uint64_t)target_function; // PC of ADRP
+        uint64_t base = (pc0 & ~0xFFFULL) + ((uint64_t)imm21 << 12);
+        // Detect ADD (64-bit, immediate)
+        if ( (insn1 & 0xFF000000u) != 0x91000000u ) break;
+        uint32_t rd1 = (insn1 & 0x1Fu);
+        uint32_t rn1 = (insn1 >> 5) & 0x1Fu;
+        uint32_t imm12 = (insn1 >> 10) & 0xFFFu;
+        uint32_t shift = (insn1 >> 22) & 0x3u; // 0 or 1 for LSL12
+        if (rd1 != rn1 || rd1 != rd) break;
+        if (shift > 1) break; // unexpected variant
+        uint64_t add_off = (uint64_t)imm12 << (shift ? 12 : 0);
+        reload_reg = (int)rd;
+        reload_target = base + add_off;
+    } while (0);
+
+    // Assemble trampoline using the remote PC base where it will execute
+    uint64_t remote_tail_pc = (uint64_t)trampoline_buffer + (uint64_t)copied_bytes;
+    assemble_trampoline_at_with_remote_pc(tail, remote_tail_pc, (uint64_t)hook_function, return_address,
+                                          reload_reg, reload_target);
     kr = vm_write(task, trampoline_buffer + (mach_vm_address_t)copied_bytes,
                        (vm_offset_t)(uintptr_t)tail, (mach_msg_type_number_t)tmpl_size);
     free(tail);

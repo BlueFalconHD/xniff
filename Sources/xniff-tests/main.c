@@ -5,6 +5,14 @@
 // Exported, noinline function we can patch remotely.
 __attribute__((used, noinline, visibility("default")))
 void do_something_useful(void) {
+    // Force a few instructions before the ADRP/ADD used for the printf string,
+    // so the entry patch can safely resume after 12 bytes without skipping it.
+#if defined(__aarch64__) || defined(__arm64__)
+    __asm__ volatile("nop\n\t"
+                     "nop\n\t"
+                     "nop\n\t"
+                     "nop\n\t");
+#endif
     printf("do_something_useful: doing some work...\n");
 }
 

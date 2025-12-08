@@ -19,6 +19,8 @@
 extern const uint8_t TRAMPOLINE_START_AFTER_PROLOGUE[];
 extern const uint8_t TRAMPOLINE_INTERMEDIATE_ADRP[];
 extern const uint8_t TRAMPOLINE_INTERMEDIATE_ADD[];
+extern const uint8_t TRAMPOLINE_RELOAD_ADRP[];
+extern const uint8_t TRAMPOLINE_RELOAD_ADD[];
 extern const uint8_t TRAMPOLINE_RETURN_ADRP[];
 extern const uint8_t TRAMPOLINE_RETURN_ADD[];
 
@@ -85,7 +87,8 @@ void dummy_trampoline_return(void);
  * addresses.
  */
 void assemble_trampoline_at(uint8_t *tramp_base, uint64_t hook_address,
-                            uint64_t return_address);
+                            uint64_t return_address,
+                            int reload_reg, uint64_t reload_target);
 
 /*
  * Modifies the page protections for a memory region.
