@@ -131,7 +131,11 @@ typedef struct trampoline_info {
 } trampoline_info_t;
 
 typedef struct trampoline_bank {
-    uint8_t           *region;                // base of mmap'd region
+    // When patching a remote task, this is the Mach task port; otherwise mach_task_self.
+    mach_port_t        task;
+    bool               is_remote;
+
+    uint8_t           *region;                // base of region (numeric address; do not deref if remote)
     size_t             region_size;           // size of mapping
     size_t             per_trampoline_size;   // bytes reserved per trampoline
     size_t             capacity;              // max number of trampolines
@@ -147,6 +151,7 @@ size_t trampoline_recommended_slot_size(void);
 
 /* Initialize a trampoline bank with given capacity and slot size. */
 int trampoline_bank_init(trampoline_bank_t *bank, size_t capacity, size_t per_trampoline_size);
+int trampoline_bank_init_task(trampoline_bank_t *bank, mach_port_t task, size_t capacity, size_t per_trampoline_size);
 
 /* Tear down the bank and free resources. */
 void trampoline_bank_deinit(trampoline_bank_t *bank);
@@ -159,5 +164,19 @@ void *trampoline_bank_alloc_slot(trampoline_bank_t *bank, size_t required_size, 
  * On success returns 0 and optionally sets out_index.
  */
 int trampoline_bank_install(trampoline_bank_t *bank, void *target_function, void *hook_function, size_t *out_index);
+int trampoline_bank_install_task(trampoline_bank_t *bank,
+                                 mach_vm_address_t target_function,
+                                 mach_vm_address_t hook_function,
+                                 size_t *out_index);
+
+// Task-space variants for working on a remote task
+kern_return_t modify_page_protections_task(mach_port_t task, mach_vm_address_t address, size_t size,
+                                           vm_prot_t new_prot);
+int prepare_protections_for_patching_task(mach_port_t task, mach_vm_address_t address, size_t size);
+int restore_protections_after_patching_task(mach_port_t task, mach_vm_address_t address, size_t size);
+int patch_function_with_trampoline_task(mach_port_t task,
+                                        mach_vm_address_t target_function,
+                                        mach_vm_address_t trampoline_buffer,
+                                        mach_vm_address_t hook_function);
 
 #endif /* PATCH_H */

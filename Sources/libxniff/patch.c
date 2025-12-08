@@ -226,17 +226,19 @@ int patch_function_with_trampoline(void *target_function, void *trampoline_buffe
 }
 
 /*
- * Internal helper to modify protections with control over set_maximum.
+ * Internal helper to modify protections with control over set_maximum (task or self).
  */
+static kern_return_t vm_protect_pages_task(mach_port_t task, mach_vm_address_t addr, size_t size, boolean_t set_max, vm_prot_t new_prot) {
+    mach_vm_size_t sz = (mach_vm_size_t)size;
+    mach_vm_address_t page_start = PAGE_RANGE_START(addr);
+    mach_vm_size_t page_size = PAGE_RANGE_SIZE(addr, sz);
+    return vm_protect(task, page_start, page_size, set_max, new_prot);
+}
+
 static kern_return_t vm_protect_pages(void *address, size_t size, boolean_t set_max, vm_prot_t new_prot) {
     mach_port_t task = mach_task_self();
     mach_vm_address_t addr = (mach_vm_address_t)(uintptr_t)address;
-    mach_vm_size_t sz = (mach_vm_size_t)size;
-
-    mach_vm_address_t page_start = PAGE_RANGE_START(addr);
-    mach_vm_size_t page_size = PAGE_RANGE_SIZE(addr, sz);
-
-    return vm_protect(task, page_start, page_size, set_max, new_prot);
+    return vm_protect_pages_task(task, addr, size, set_max, new_prot);
 }
 
 /*
@@ -245,6 +247,10 @@ static kern_return_t vm_protect_pages(void *address, size_t size, boolean_t set_
  */
 kern_return_t modify_page_protections(void *address, size_t size, vm_prot_t new_prot) {
     return vm_protect_pages(address, size, FALSE, new_prot);
+}
+
+kern_return_t modify_page_protections_task(mach_port_t task, mach_vm_address_t address, size_t size, vm_prot_t new_prot) {
+    return vm_protect_pages_task(task, address, size, FALSE, new_prot);
 }
 
 /*
@@ -270,6 +276,20 @@ int prepare_protections_for_patching(void *address, size_t size) {
     return 0;
 }
 
+int prepare_protections_for_patching_task(mach_port_t task, mach_vm_address_t address, size_t size) {
+    // Widen maximum protections so WRITE is allowed, then set RW (+COPY for COW text pages).
+    kern_return_t kr = vm_protect_pages_task(task, address, size, TRUE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS && kr != KERN_INVALID_ARGUMENT) {
+        // ignore and try current anyway
+    }
+    kr = vm_protect_pages_task(task, address, size, FALSE, (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY));
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "Error: remote make_page_rw failed with %d\n", kr);
+        return -1;
+    }
+    return 0;
+}
+
 /*
  * Restores page protections after patching.
  * Given a starting address and a number of bytes, makes
@@ -279,6 +299,15 @@ int restore_protections_after_patching(void *address, size_t size) {
     kern_return_t kr = modify_page_protections(address, size, VM_PROT_READ | VM_PROT_EXECUTE);
     if (kr != KERN_SUCCESS) {
         fprintf(stderr, "Error: make_page_rx failed with %d\n", kr);
+        return -1;
+    }
+    return 0;
+}
+
+int restore_protections_after_patching_task(mach_port_t task, mach_vm_address_t address, size_t size) {
+    kern_return_t kr = modify_page_protections_task(task, address, size, VM_PROT_READ | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "Error: remote make_page_rx failed with %d\n", kr);
         return -1;
     }
     return 0;
@@ -358,7 +387,50 @@ int trampoline_bank_init(trampoline_bank_t *bank, size_t capacity, size_t per_tr
         return -1;
     }
 
+    bank->task = mach_task_self();
+    bank->is_remote = false;
     bank->region = (uint8_t *)region;
+    bank->region_size = region_size;
+    bank->per_trampoline_size = per_trampoline_size;
+    bank->capacity = capacity;
+    bank->count = 0;
+    bank->infos = infos;
+    return 0;
+}
+
+int trampoline_bank_init_task(trampoline_bank_t *bank, mach_port_t task, size_t capacity, size_t per_trampoline_size) {
+    if (!bank || capacity == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (per_trampoline_size == 0) {
+        per_trampoline_size = trampoline_recommended_slot_size();
+    }
+    if (per_trampoline_size < trampoline_template_size() + 32) {
+        per_trampoline_size = trampoline_template_size() + 32;
+    }
+    per_trampoline_size = (per_trampoline_size + 3) & ~((size_t)3);
+
+    size_t region_size = page_align_up(per_trampoline_size * capacity);
+    vm_address_t addr = 0;
+    kern_return_t kr = vm_allocate(task, &addr, region_size, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "mach_vm_allocate for trampoline bank failed: %d\n", kr);
+        return -1;
+    }
+    // set maximum to R/W/X and current to RX
+    (void)vm_protect_pages_task(task, addr, region_size, TRUE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    (void)vm_protect_pages_task(task, addr, region_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+
+    trampoline_info_t *infos = (trampoline_info_t *)calloc(capacity, sizeof(trampoline_info_t));
+    if (!infos) {
+        vm_deallocate(task, addr, region_size);
+        return -1;
+    }
+
+    bank->task = task;
+    bank->is_remote = true;
+    bank->region = (uint8_t *)(uintptr_t)addr;
     bank->region_size = region_size;
     bank->per_trampoline_size = per_trampoline_size;
     bank->capacity = capacity;
@@ -370,7 +442,11 @@ int trampoline_bank_init(trampoline_bank_t *bank, size_t capacity, size_t per_tr
 void trampoline_bank_deinit(trampoline_bank_t *bank) {
     if (!bank) return;
     if (bank->region) {
-        munmap(bank->region, bank->region_size);
+        if (bank->is_remote) {
+            vm_deallocate(bank->task, (mach_vm_address_t)(uintptr_t)bank->region, bank->region_size);
+        } else {
+            munmap(bank->region, bank->region_size);
+        }
     }
     if (bank->infos) {
         free(bank->infos);
@@ -460,6 +536,126 @@ int trampoline_bank_install(trampoline_bank_t *bank, void *target_function, void
     info->active = true;
     bank->count = idx + 1;
 
+    if (out_index) *out_index = idx;
+    return rc;
+}
+
+static int remote_copy_prologue_bytes(mach_port_t task, mach_vm_address_t target_function, uint8_t *out_buf, size_t max_bytes) {
+    vm_size_t out_sz = 0;
+    kern_return_t kr = vm_read_overwrite(task, target_function, max_bytes,
+                                              (mach_vm_address_t)(uintptr_t)out_buf, &out_sz);
+    if (kr != KERN_SUCCESS || out_sz == 0) {
+        return -1;
+    }
+    int copied = copy_instructions(out_buf, out_buf, (size_t)out_sz, 0);
+    return copied;
+}
+
+int patch_function_with_trampoline_task(mach_port_t task,
+                                        mach_vm_address_t target_function,
+                                        mach_vm_address_t trampoline_buffer,
+                                        mach_vm_address_t hook_function) {
+    const size_t max_prologue_size = 32;
+    uint8_t prologue[max_prologue_size];
+    int copied_bytes = remote_copy_prologue_bytes(task, target_function, prologue, max_prologue_size);
+    if (copied_bytes <= 0) {
+        return -1;
+    }
+
+    // write prologue copy into trampoline slot
+    kern_return_t kr = vm_write(task, trampoline_buffer, (vm_offset_t)(uintptr_t)prologue, (mach_msg_type_number_t)copied_bytes);
+    if (kr != KERN_SUCCESS) {
+        return -1;
+    }
+
+    uint64_t return_address = (uint64_t)target_function + (uint64_t)copied_bytes;
+    size_t tmpl_size = trampoline_template_size();
+    uint8_t *tail = (uint8_t *)malloc(tmpl_size);
+    if (!tail) return -1;
+    assemble_trampoline_at(tail, (uint64_t)hook_function, return_address);
+    kr = vm_write(task, trampoline_buffer + (mach_vm_address_t)copied_bytes,
+                       (vm_offset_t)(uintptr_t)tail, (mach_msg_type_number_t)tmpl_size);
+    free(tail);
+    if (kr != KERN_SUCCESS) {
+        return -1;
+    }
+
+    // patch original: ADRP, ADD, BR
+    uint64_t target_address = (uint64_t)target_function;
+    uint64_t tramp_address = (uint64_t)trampoline_buffer;
+    uint32_t adrp_insn = assemble_adrp_x16_page(target_address, tramp_address);
+    uint32_t add_insn  = assemble_add_x16_pageoff(tramp_address);
+    uint32_t br_insn   = 0xD61F0200u | (16u << 5);
+    uint8_t patch_bytes[12];
+    memcpy(patch_bytes + 0, &adrp_insn, 4);
+    memcpy(patch_bytes + 4, &add_insn, 4);
+    memcpy(patch_bytes + 8, &br_insn, 4);
+    kr = vm_write(task, target_function, (vm_offset_t)(uintptr_t)patch_bytes, (mach_msg_type_number_t)sizeof(patch_bytes));
+    if (kr != KERN_SUCCESS) {
+        return -1;
+    }
+    return copied_bytes;
+}
+
+int trampoline_bank_install_task(trampoline_bank_t *bank,
+                                 mach_vm_address_t target_function,
+                                 mach_vm_address_t hook_function,
+                                 size_t *out_index) {
+    if (!bank || !bank->region || bank->count >= bank->capacity) {
+        return -1;
+    }
+    if (!bank->is_remote) {
+        // fall back to local install if not initialized for remote
+        return trampoline_bank_install(bank, (void *)(uintptr_t)target_function, (void *)(uintptr_t)hook_function, out_index);
+    }
+
+    const size_t max_prologue = 32;
+    uint8_t scratch[max_prologue];
+    int prologue_bytes = remote_copy_prologue_bytes(bank->task, target_function, scratch, max_prologue);
+    if (prologue_bytes <= 0) {
+        fprintf(stderr, "Failed to analyze remote target prologue\n");
+        return -1;
+    }
+
+    size_t need = (size_t)prologue_bytes + trampoline_template_size();
+    size_t idx = 0;
+    uint8_t *slot_ptr = (uint8_t *)trampoline_bank_alloc_slot(bank, need, &idx);
+    if (!slot_ptr) {
+        fprintf(stderr, "Remote trampoline slot too small (need=%zu, slot=%zu)\n", need, bank->per_trampoline_size);
+        return -1;
+    }
+    mach_vm_address_t slot = (mach_vm_address_t)(uintptr_t)slot_ptr;
+
+    // Make slot RW and target patchable
+    (void)vm_protect_pages_task(bank->task, slot, need, TRUE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (vm_protect_pages_task(bank->task, slot, need, FALSE, VM_PROT_READ | VM_PROT_WRITE) != KERN_SUCCESS) {
+        fprintf(stderr, "Error: could not make remote trampoline slot RW\n");
+        return -1;
+    }
+    if (prepare_protections_for_patching_task(bank->task, target_function, 12) != 0) {
+        (void)vm_protect_pages_task(bank->task, slot, need, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+        return -1;
+    }
+
+    int copied = patch_function_with_trampoline_task(bank->task, target_function, slot, hook_function);
+
+    int rc = 0;
+    if (restore_protections_after_patching_task(bank->task, target_function, 12) != 0) {
+        rc = -1;
+    }
+    (void)vm_protect_pages_task(bank->task, slot, need, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+
+    if (copied <= 0) {
+        return -1;
+    }
+
+    trampoline_info_t *info = &bank->infos[idx];
+    info->target_function = (void *)(uintptr_t)target_function;
+    info->hook_function = (void *)(uintptr_t)hook_function;
+    info->trampoline = (void *)(uintptr_t)slot;
+    info->prologue_bytes = (size_t)copied;
+    info->active = true;
+    bank->count = idx + 1;
     if (out_index) *out_index = idx;
     return rc;
 }
