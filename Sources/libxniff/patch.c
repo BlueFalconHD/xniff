@@ -276,6 +276,12 @@ int patch_function_with_trampoline(void *target_function, void *trampoline_buffe
     if (copied_bytes <= 0) {
         return -1; // Error copying prologue
     }
+    // Require relocating at least the 12-byte patch window to ensure we don't skip
+    // non-copyable instructions when returning past the entry patch.
+    if ((size_t)copied_bytes < 12) {
+        fprintf(stderr, "Refusing to patch: non-copyable within first 12 bytes (copied=%d)\n", copied_bytes);
+        return -1;
+    }
 
     // calculate the "return" address for the trampoline
     // We overwrite 12 bytes at the target (ADRP+ADD+BR). Ensure we resume after the patch window
@@ -568,6 +574,10 @@ int trampoline_bank_install(trampoline_bank_t *bank, void *target_function, void
         fprintf(stderr, "Failed to analyze target prologue\n");
         return -1;
     }
+    if ((size_t)prologue_bytes < 12) {
+        fprintf(stderr, "Refusing to patch: non-copyable within first 12 bytes (copied=%d)\n", prologue_bytes);
+        return -1;
+    }
 
     size_t need = (size_t)prologue_bytes + trampoline_template_size();
     size_t idx = 0;
@@ -642,6 +652,10 @@ int patch_function_with_trampoline_task(mach_port_t task,
     uint8_t prologue[max_prologue_size];
     int copied_bytes = remote_copy_prologue_bytes(task, target_function, prologue, max_prologue_size);
     if (copied_bytes <= 0) {
+        return -1;
+    }
+    if ((size_t)copied_bytes < 12) {
+        fprintf(stderr, "Refusing to patch remote target: non-copyable within first 12 bytes (copied=%d)\n", copied_bytes);
         return -1;
     }
 
@@ -740,6 +754,10 @@ int trampoline_bank_install_task(trampoline_bank_t *bank,
     int prologue_bytes = remote_copy_prologue_bytes(bank->task, target_function, scratch, max_prologue);
     if (prologue_bytes <= 0) {
         fprintf(stderr, "Failed to analyze remote target prologue\n");
+        return -1;
+    }
+    if ((size_t)prologue_bytes < 12) {
+        fprintf(stderr, "Refusing to patch remote target: non-copyable within first 12 bytes (copied=%d)\n", prologue_bytes);
         return -1;
     }
 
