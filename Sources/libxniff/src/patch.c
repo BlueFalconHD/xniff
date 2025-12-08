@@ -1,4 +1,4 @@
-#include "patch.h"
+#include <xniff/patch.h>
 #include "assembler.h"
 #include <pthread.h>
 

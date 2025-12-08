@@ -16,16 +16,17 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 file(GLOB XNIFF_LIB_SOURCES CONFIGURE_DEPENDS
-    "${PROJECT_SOURCE_DIR}/Sources/libxniff/*.c"
-    "${PROJECT_SOURCE_DIR}/Sources/libxniff/*.s"
-    "${PROJECT_SOURCE_DIR}/Sources/libxniff/*.S"
+    "${PROJECT_SOURCE_DIR}/Sources/libxniff/src/*.c"
+    "${PROJECT_SOURCE_DIR}/Sources/libxniff/src/*.s"
+    "${PROJECT_SOURCE_DIR}/Sources/libxniff/src/*.S"
 )
 
 add_library(xniff SHARED ${XNIFF_LIB_SOURCES})
 target_include_directories(xniff
     PUBLIC
-        ${PROJECT_SOURCE_DIR}/Sources/shared
-        ${PROJECT_SOURCE_DIR}/Sources/libxniff
+        ${PROJECT_SOURCE_DIR}/Sources/libxniff/include
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/Sources/libxniff/src
 )
 
 target_link_libraries(xniff PRIVATE PkgConfig::CAPSTONE)
@@ -44,7 +45,7 @@ file(GLOB XNIFF_CLI_SOURCES CONFIGURE_DEPENDS
 
 add_executable(xniff-cli ${XNIFF_CLI_SOURCES})
 target_link_libraries(xniff-cli PRIVATE xniff PkgConfig::CAPSTONE)
-target_include_directories(xniff-cli PRIVATE ${PROJECT_SOURCE_DIR}/Sources/libxniff)
+target_include_directories(xniff-cli PRIVATE ${PROJECT_SOURCE_DIR}/Sources/libxniff/include)
 
 file(GLOB XNIFF_TEST_SOURCES CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/Sources/xniff-tests/*.c"

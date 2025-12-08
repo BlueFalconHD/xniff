@@ -6,3 +6,4 @@ static inline const char *xniff_version(void) {
 }
 
 #endif /* XNIFF_H */
+

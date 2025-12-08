@@ -183,3 +183,4 @@ int patch_function_with_trampoline_task(mach_port_t task,
                                         mach_vm_address_t hook_function);
 
 #endif /* PATCH_H */
+
