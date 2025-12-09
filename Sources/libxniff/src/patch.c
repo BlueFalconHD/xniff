@@ -1053,7 +1053,11 @@ int trampoline_bank_install_task_with_exit(trampoline_bank_t *bank,
     mach_vm_address_t slot = (mach_vm_address_t)(uintptr_t)slot_ptr;
 
     // Allocate per-slot context region (RW). Use 4KB per thread slot * 1 page for simplicity.
-    const size_t ctx_per_slot = 4096; // one page per trampoline slot (contains N thread frames)
+    // Context region layout per trampoline slot:
+    // - 64 thread slots (indexed by low 6 bits of TPIDRRO_EL0)
+    // - 256 bytes per thread slot (2 frames × 128B)
+    // Total = 64 * 256 = 16384 bytes
+    const size_t ctx_per_slot = (64u * 256u);
     vm_address_t ctx_addr = 0;
     if (vm_allocate(bank->task, &ctx_addr, (vm_size_t)ctx_per_slot, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
         fprintf(stderr, "Failed to allocate remote context slot\n");

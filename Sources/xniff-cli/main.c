@@ -295,9 +295,13 @@ static int cmd_hook_exit(pid_t pid, const char *symbol_name, const char *entry_s
     if (idx < bank.capacity) {
         trampoline_info_t *info = &bank.infos[idx];
         uint64_t resume_addr = (uint64_t)target_addr + (uint64_t)info->prologue_bytes;
-        printf("  trampoline slot @ 0x%llx, resume @ 0x%llx\n",
+        // Compute exit stub address to help set LLDB breakpoints
+        size_t ex_off = (size_t)(XTRAMP_EXIT_STUB - XTRAMP_START_AFTER_PROLOGUE);
+        uint64_t exit_stub_addr = (uint64_t)(uintptr_t)info->trampoline + (uint64_t)info->prologue_bytes + (uint64_t)ex_off;
+        printf("  trampoline slot @ 0x%llx, resume @ 0x%llx, exit_stub @ 0x%llx\n",
                (unsigned long long)(uintptr_t)info->trampoline,
-               (unsigned long long)resume_addr);
+               (unsigned long long)resume_addr,
+               (unsigned long long)exit_stub_addr);
         if (info->ctx_base) {
             printf("  ctx_base @ 0x%llx size %zu bytes\n",
                    (unsigned long long)(uintptr_t)info->ctx_base, info->ctx_size);
