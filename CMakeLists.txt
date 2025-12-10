@@ -52,6 +52,8 @@ add_library(xniff-rt SHARED ${XNIFF_RT_SOURCES})
 target_include_directories(xniff-rt PUBLIC ${PROJECT_SOURCE_DIR}/Sources/xniff-rt)
 set_target_properties(xniff-rt PROPERTIES OUTPUT_NAME xniff-rt)
 
+# (Removed) hooks dylib: previous Mach message hooks have been retired
+
 file(GLOB XNIFF_CLI_SOURCES CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/Sources/xniff-cli/*.c"
     "${PROJECT_SOURCE_DIR}/Sources/xniff-cli/*.s"
@@ -95,6 +97,8 @@ if(APPLE)
         add_custom_command(TARGET xniff-rt POST_BUILD
             COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xniff-rt>"
             COMMENT "Codesigning xniff-rt with JIT entitlements")
+
+        # xniff-hooks codesigning removed (hooks dylib no longer built)
 
         add_custom_command(TARGET xniff-test POST_BUILD
             COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xniff-test>"

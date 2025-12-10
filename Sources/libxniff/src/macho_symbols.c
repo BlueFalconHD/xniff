@@ -12,7 +12,6 @@
 
 // Debug logging (enable via XNIFF_DEBUG=1)
 static int xniff_debug_enabled(void) {
-    return 1;
     const char *e = getenv("XNIFF_DEBUG");
     return (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
 }
@@ -38,6 +37,286 @@ typedef struct parsed_image {
     bool have_text, have_linkedit, have_symtab, have_dysymtab;
     bool have_dyldinfo, have_exports_trie;
 } parsed_image_t;
+
+// Forward declarations for helpers used by caching fast-path
+static bool remote_read(mach_port_t task, mach_vm_address_t addr, void *buf, size_t size);
+static bool remote_read_alloc(mach_port_t task, mach_vm_address_t addr, size_t size, void **out_buf);
+static bool compute_linkedit_base(parsed_image_t *img, mach_vm_address_t *out);
+
+// ----------------------------
+// Symbol cache (per image)
+// ----------------------------
+
+typedef struct sym_entry {
+    uint32_t name_off;               // offset into strtab
+    mach_vm_address_t runtime;       // resolved runtime address (with slide)
+} sym_entry_t;
+
+typedef struct image_cache {
+    mach_port_t task;
+    mach_vm_address_t header;        // image header address (runtime)
+    mach_vm_address_t slide;
+    mach_vm_address_t text_start;
+    mach_vm_address_t text_end;
+
+    // Classic LC_SYMTAB cache
+    char       *strtab;              // local copy of string table
+    size_t      strsize;
+    sym_entry_t *syms;               // filtered, sorted by name (strcmp)
+    size_t      nsyms;
+
+    // Exports trie cache (optional, for stripped images)
+    uint8_t    *exports;             // raw trie data
+    size_t      exports_size;
+    uint32_t    exports_off;         // file offset (for reference)
+    int         have_exports;
+
+    // Bookkeeping
+    int         initialized;         // set when cache is fully built
+} image_cache_t;
+
+typedef struct task_cache {
+    mach_port_t task;
+    uint64_t    fingerprint;         // simple fingerprint of images list for invalidation
+    image_cache_t *images;           // dynamic array
+    size_t      count;
+    size_t      cap;
+} task_cache_t;
+
+static task_cache_t *g_tasks = NULL;
+static size_t g_tasks_count = 0, g_tasks_cap = 0;
+
+static void free_image_cache(image_cache_t *ic) {
+    if (!ic) return;
+    free(ic->strtab); ic->strtab = NULL; ic->strsize = 0;
+    free(ic->syms);   ic->syms = NULL;   ic->nsyms = 0;
+    ic->initialized = 0;
+}
+
+static void free_task_cache(task_cache_t *tc) {
+    if (!tc) return;
+    for (size_t i = 0; i < tc->count; i++) free_image_cache(&tc->images[i]);
+    free(tc->images); tc->images = NULL; tc->count = tc->cap = 0; tc->fingerprint = 0;
+}
+
+static task_cache_t* ensure_task_cache(mach_port_t task) {
+    for (size_t i = 0; i < g_tasks_count; i++) if (g_tasks[i].task == task) return &g_tasks[i];
+    if (g_tasks_count == g_tasks_cap) {
+        size_t nc = g_tasks_cap ? g_tasks_cap * 2 : 4;
+        task_cache_t *nt = (task_cache_t*)realloc(g_tasks, nc * sizeof(*nt));
+        if (!nt) return NULL;
+        memset(nt + g_tasks_cap, 0, (nc - g_tasks_cap) * sizeof(*nt));
+        g_tasks = nt; g_tasks_cap = nc;
+    }
+    task_cache_t *tc = &g_tasks[g_tasks_count++];
+    memset(tc, 0, sizeof(*tc));
+    tc->task = task;
+    return tc;
+}
+
+static image_cache_t* find_image_cache(task_cache_t *tc, mach_vm_address_t header) {
+    for (size_t i = 0; i < tc->count; i++) if (tc->images[i].header == header) return &tc->images[i];
+    return NULL;
+}
+
+static image_cache_t* add_image_cache(task_cache_t *tc, mach_vm_address_t header) {
+    if (tc->count == tc->cap) {
+        size_t nc = tc->cap ? tc->cap * 2 : 8;
+        image_cache_t *ni = (image_cache_t*)realloc(tc->images, nc * sizeof(*ni));
+        if (!ni) return NULL;
+        memset(ni + tc->cap, 0, (nc - tc->cap) * sizeof(*ni));
+        tc->images = ni; tc->cap = nc;
+    }
+    image_cache_t *ic = &tc->images[tc->count++];
+    memset(ic, 0, sizeof(*ic));
+    ic->task = tc->task; ic->header = header;
+    return ic;
+}
+
+static const char *g_sort_strtab = NULL; // only used during qsort comparator
+static int sym_entry_cmp_by_name(const void *a, const void *b) {
+    const sym_entry_t *ea = (const sym_entry_t*)a;
+    const sym_entry_t *eb = (const sym_entry_t*)b;
+    const char *sa = g_sort_strtab + ea->name_off;
+    const char *sb = g_sort_strtab + eb->name_off;
+    return strcmp(sa, sb);
+}
+
+static int build_image_symtab_cache(mach_port_t task, const parsed_image_t *img, image_cache_t *ic) {
+    if (!img->have_symtab) return -1;
+    mach_vm_address_t linkedit_base = 0;
+    if (!img || !ic) return -1;
+    if (!compute_linkedit_base((parsed_image_t*)img, &linkedit_base)) return -1;
+
+    // Load string table
+    ic->strsize = img->symtab.strsize;
+    ic->strtab = (char*)malloc(ic->strsize);
+    if (!ic->strtab) return -1;
+    if (!remote_read(task, linkedit_base + img->symtab.stroff, ic->strtab, ic->strsize)) {
+        free(ic->strtab); ic->strtab = NULL; ic->strsize = 0; return -1;
+    }
+
+    // Load nlist and filter entries to defined extern functions in __TEXT
+    size_t nsyms = img->symtab.nsyms;
+    struct nlist_64 *nls = (struct nlist_64 *)malloc(nsyms * sizeof(struct nlist_64));
+    if (!nls) { free(ic->strtab); ic->strtab = NULL; ic->strsize = 0; return -1; }
+    if (!remote_read(task, linkedit_base + img->symtab.symoff, nls, nsyms * sizeof(struct nlist_64))) {
+        free(nls); free(ic->strtab); ic->strtab = NULL; ic->strsize = 0; return -1;
+    }
+
+    ic->text_start = img->text.vmaddr + img->info.slide;
+    ic->text_end   = ic->text_start + img->text.vmsize;
+    ic->slide      = img->info.slide;
+
+    // First pass: count
+    size_t keep = 0;
+    for (size_t i = 0; i < nsyms; i++) {
+        const struct nlist_64 *nl = &nls[i];
+        if (!(nl->n_type & N_EXT)) continue;
+        if ((nl->n_type & N_TYPE) != N_SECT) continue;
+        if (nl->n_sect == NO_SECT || nl->n_value == 0) continue;
+        if ((size_t)nl->n_un.n_strx >= ic->strsize) continue;
+        mach_vm_address_t runtime = (mach_vm_address_t)nl->n_value + ic->slide;
+        if (runtime < ic->text_start || runtime >= ic->text_end) continue; // keep only text
+        keep++;
+    }
+
+    ic->syms = (sym_entry_t*)malloc(keep * sizeof(sym_entry_t));
+    if (!ic->syms) { free(nls); free(ic->strtab); ic->strtab = NULL; ic->strsize = 0; return -1; }
+
+    // Second pass: fill
+    size_t j = 0;
+    for (size_t i = 0; i < nsyms; i++) {
+        const struct nlist_64 *nl = &nls[i];
+        if (!(nl->n_type & N_EXT)) continue;
+        if ((nl->n_type & N_TYPE) != N_SECT) continue;
+        if (nl->n_sect == NO_SECT || nl->n_value == 0) continue;
+        if ((size_t)nl->n_un.n_strx >= ic->strsize) continue;
+        mach_vm_address_t runtime = (mach_vm_address_t)nl->n_value + ic->slide;
+        if (runtime < ic->text_start || runtime >= ic->text_end) continue;
+        ic->syms[j].name_off = nl->n_un.n_strx;
+        ic->syms[j].runtime  = runtime;
+        j++;
+    }
+    ic->nsyms = j;
+
+    // Sort entries by name for fast binary search
+    g_sort_strtab = ic->strtab;
+    qsort(ic->syms, ic->nsyms, sizeof(sym_entry_t), sym_entry_cmp_by_name);
+    g_sort_strtab = NULL;
+
+    free(nls);
+    ic->initialized = 1;
+    return 0;
+}
+
+static int ensure_exports_cache(mach_port_t task, const parsed_image_t *img, image_cache_t *ic) {
+    if (ic->exports || !img) return 0; // already cached or nothing to do
+    mach_vm_address_t linkedit_base = 0;
+    if (!compute_linkedit_base((parsed_image_t*)img, &linkedit_base)) return -1;
+    uint32_t exp_off = 0, exp_size = 0;
+    if (img->have_exports_trie) { exp_off = img->exports_off; exp_size = img->exports_size; }
+    else if (img->have_dyldinfo) { exp_off = img->dyldinfo.export_off; exp_size = img->dyldinfo.export_size; }
+    if (exp_off == 0 || exp_size == 0) return -1;
+    void *buf = NULL;
+    if (!remote_read_alloc(task, linkedit_base + exp_off, exp_size, &buf)) return -1;
+    ic->exports = (uint8_t*)buf;
+    ic->exports_size = exp_size;
+    ic->exports_off = exp_off;
+    ic->have_exports = 1;
+    return 0;
+}
+
+static bool read_uleb128_local(const uint8_t **pp, const uint8_t *end, uint64_t *out) {
+    const uint8_t *p = *pp; uint64_t v = 0; int shift = 0;
+    while (p < end) {
+        uint8_t b = *p++;
+        v |= ((uint64_t)(b & 0x7F)) << shift;
+        if ((b & 0x80) == 0) { *pp = p; *out = v; return true; }
+        shift += 7; if (shift > 63) return false;
+    }
+    return false;
+}
+
+// Fast targeted traversal of the export trie for a single symbol name.
+static bool lookup_export_trie_by_name(const image_cache_t *ic, const char *symbol, mach_vm_address_t slide, mach_vm_address_t text_start, mach_vm_address_t text_end, mach_vm_address_t *out_addr) {
+    if (!ic || !ic->exports || ic->exports_size == 0 || !symbol) return false;
+    const uint8_t *base = ic->exports;
+    const uint8_t *end  = ic->exports + ic->exports_size;
+    const uint8_t *node = base; // start at offset 0
+    size_t idx = 0; size_t name_len = strlen(symbol);
+
+    while (node && node < end) {
+        const uint8_t *p = node;
+        // terminal size and info
+        uint64_t term = 0; if (!read_uleb128_local(&p, end, &term)) return false;
+        const uint8_t *term_info = p; p += term; if (p > end) return false;
+
+        // If we've consumed the whole name, check terminal for an address
+        if (idx == name_len && term > 0) {
+            const uint8_t *tp = term_info; const uint8_t *tend = term_info + term;
+            uint64_t flags = 0; (void)read_uleb128_local(&tp, tend, &flags);
+            bool is_reexport = (flags & 0x08) != 0;
+            bool is_stub_or_resolver = (flags & 0x10) != 0 || (flags & 0x20) != 0;
+            if (!is_reexport && !is_stub_or_resolver) {
+                uint64_t addr = 0; if (read_uleb128_local(&tp, tend, &addr)) {
+                    mach_vm_address_t runtime = (mach_vm_address_t)addr + slide;
+                    if (runtime >= text_start && runtime < text_end) { *out_addr = runtime; return true; }
+                }
+            }
+            return false; // reached terminal but not usable
+        }
+
+        if (p >= end) return false;
+        uint8_t childCount = *p++;
+
+        // Try to match one child edge whose label matches symbol[idx..]
+        const uint8_t *match_child_after_off = NULL;
+        uint64_t match_child_off = 0;
+        size_t match_advance = 0;
+
+        for (uint8_t i = 0; i < childCount; i++) {
+            // read label (c-string) and child off
+            const uint8_t *s = p; while (s < end && *s) s++;
+            if (s >= end) return false;
+            size_t edge_len = (size_t)(s - p);
+            const char *edge = (const char *)p;
+            const uint8_t *after_name = s + 1;
+            const uint8_t *q = after_name;
+            uint64_t childOff = 0; if (!read_uleb128_local(&q, end, &childOff)) return false;
+
+            // Compare symbol substring with edge
+            if (idx + edge_len <= name_len && memcmp(symbol + idx, edge, edge_len) == 0) {
+                match_child_after_off = q; match_child_off = childOff; match_advance = edge_len;
+                // Prefer exact match of longest edge; but edges are unique, so take first match
+                break;
+            }
+            p = q; // advance to next child
+        }
+
+        if (!match_child_after_off) {
+            return false; // no matching edge at this depth
+        }
+
+        // Descend
+        idx += match_advance;
+        node = base + match_child_off;
+    }
+    return false;
+}
+
+static int cached_lookup_in_image(image_cache_t *ic, const char *symbol, mach_vm_address_t *out_addr) {
+    if (!ic || !ic->initialized || !symbol) return -1;
+    size_t lo = 0, hi = ic->nsyms;
+    while (lo < hi) {
+        size_t mid = lo + ((hi - lo) >> 1);
+        const char *name = ic->strtab + ic->syms[mid].name_off;
+        int c = strcmp(name, symbol);
+        if (c == 0) { *out_addr = ic->syms[mid].runtime; return 0; }
+        if (c < 0) lo = mid + 1; else hi = mid;
+    }
+    return -1;
+}
 
 static bool remote_read(mach_port_t task, mach_vm_address_t addr, void *buf, size_t size) {
     mach_vm_size_t out = 0;
@@ -146,154 +425,39 @@ static bool read_uleb128(const uint8_t **pp, const uint8_t *end, uint64_t *out) 
 }
 
 static bool find_symbol_in_image(mach_port_t task, parsed_image_t *img, const char *symbol, mach_vm_address_t *out_addr) {
-    // 1) Try classic symtab
-    if (img->have_symtab) {
-        mach_vm_address_t linkedit_base = 0;
-        if (!compute_linkedit_base(img, &linkedit_base)) return false;
-
-        size_t strsize = img->symtab.strsize;
-        void *strtab = NULL;
-        if (!remote_read_alloc(task, linkedit_base + img->symtab.stroff, strsize, &strtab)) return false;
-
-        size_t nsyms = img->symtab.nsyms;
-        struct nlist_64 *nls = (struct nlist_64 *)malloc(nsyms * sizeof(struct nlist_64));
-        if (!nls) { free(strtab); return false; }
-        if (!remote_read(task, linkedit_base + img->symtab.symoff, nls, nsyms * sizeof(struct nlist_64))) {
-            free(strtab); free(nls); return false;
-        }
-        for (size_t i = 0; i < nsyms; i++) {
-            const struct nlist_64 *nl = &nls[i];
-            if (!(nl->n_type & N_EXT)) continue;
-            const char *name = (nl->n_un.n_strx < strsize) ? ((const char *)strtab + nl->n_un.n_strx) : NULL;
-            if (!name) continue;
-            if (strcmp(name, symbol) == 0) {
-                uint8_t type = (uint8_t)(nl->n_type & N_TYPE);
-                // Only accept defined-in-section symbols (not undefined/re-exports)
-                if (type != N_SECT || nl->n_sect == NO_SECT || nl->n_value == 0) {
-                    DLOG("skip SYMTAB match for %s in image 0x%llx: type=0x%x sect=%u n_value=0x%llx",
-                         symbol,
-                         (unsigned long long)img->info.header,
-                         (unsigned int)type, (unsigned int)nl->n_sect,
-                         (unsigned long long)nl->n_value);
-                    continue;
-                }
-                mach_vm_address_t runtime = (mach_vm_address_t)nl->n_value + img->info.slide;
-                // Validate within __TEXT range
-                mach_vm_address_t text_start = img->text.vmaddr + img->info.slide;
-                mach_vm_address_t text_end   = text_start + img->text.vmsize;
-                if (runtime < text_start || runtime >= text_end) {
-                    DLOG("reject SYMTAB candidate for %s in image 0x%llx: runtime=0x%llx not in __TEXT [0x%llx,0x%llx)",
-                         symbol,
-                         (unsigned long long)img->info.header,
-                         (unsigned long long)runtime,
-                         (unsigned long long)text_start,
-                         (unsigned long long)text_end);
-                    continue;
-                }
-                DLOG("found %s via SYMTAB in image 0x%llx: n_value=0x%llx runtime=0x%llx",
-                     symbol,
-                     (unsigned long long)img->info.header,
-                     (unsigned long long)nl->n_value,
-                     (unsigned long long)runtime);
-                *out_addr = runtime;
-                free(strtab); free(nls); return true;
-            }
-        }
-        free(strtab); free(nls);
-    }
-
-    // 2) Try export trie via dyld info or LC_DYLD_EXPORTS_TRIE
-    mach_vm_address_t linkedit_base = 0;
-    if (!compute_linkedit_base(img, &linkedit_base)) return false;
-    uint32_t exp_off = 0, exp_size = 0;
-    if (img->have_exports_trie) { exp_off = img->exports_off; exp_size = img->exports_size; }
-    else if (img->have_dyldinfo) { exp_off = img->dyldinfo.export_off; exp_size = img->dyldinfo.export_size; }
-    if (exp_off == 0 || exp_size == 0) return false;
-
-    uint8_t *trie = NULL;
-    if (!remote_read_alloc(task, linkedit_base + exp_off, exp_size, (void **)&trie)) return false;
-
-    // DFS stack nodes: pair of (offset, name_len)
-    typedef struct { uint32_t off; size_t name_len; } stack_item_t;
-    stack_item_t stack[512]; size_t sp = 0;
-    char namebuf[1024]; namebuf[0] = '\0';
-    stack[sp++] = (stack_item_t){ .off = 0, .name_len = 0 };
-    bool found = false;
-    mach_vm_address_t found_addr = 0;
-
-    while (sp && !found) {
-        stack_item_t it = stack[--sp];
-        const uint8_t *node = trie + it.off; const uint8_t *end = trie + exp_size;
-        const uint8_t *p = node; if (p >= end) continue;
-        // terminal size
-        uint64_t term = 0; if (!read_uleb128(&p, end, &term)) continue;
-        const uint8_t *term_info = p; p += term; if (p > end) continue;
-        // children count
-        if (p >= end) continue;
-        uint8_t childCount = *p++;
-        // terminal match
-        if (term > 0) {
-            const uint8_t *tp = term_info; const uint8_t *tend = term_info + term;
-            uint64_t flags = 0; (void)read_uleb128(&tp, tend, &flags);
-            // export flags of interest:
-            //  - 0x08: re-export (no address in this image)
-            //  - 0x10: stub and resolver (not a concrete function body to patch)
-            //  - 0x20: resolver (legacy; treat as not patchable)
-            bool is_reexport = (flags & 0x08) != 0;
-            bool is_stub_or_resolver = (flags & 0x10) != 0 || (flags & 0x20) != 0;
-            if (!is_reexport && !is_stub_or_resolver) {
-                uint64_t addr = 0;
-                if (read_uleb128(&tp, tend, &addr)) {
-                    namebuf[it.name_len] = '\0';
-                    if (strcmp(namebuf, symbol) == 0) {
-                        // Validate that the address is in the __TEXT segment to avoid bogus 0 addrs
-                        mach_vm_address_t runtime_addr = (mach_vm_address_t)addr + img->info.slide;
-                        mach_vm_address_t text_start = img->text.vmaddr + img->info.slide;
-                        mach_vm_address_t text_end   = text_start + img->text.vmsize;
-                        if (runtime_addr >= text_start && runtime_addr < text_end) {
-                            DLOG("found %s via EXPORTS in image 0x%llx: addr=0x%llx runtime=0x%llx flags=0x%llx",
-                                 symbol,
-                                 (unsigned long long)img->info.header,
-                                 (unsigned long long)addr,
-                                 (unsigned long long)runtime_addr,
-                                 (unsigned long long)flags);
-                            found = true; found_addr = runtime_addr; break;
-                        } else {
-                            DLOG("reject export candidate for %s in image 0x%llx: runtime=0x%llx not in __TEXT [0x%llx,0x%llx)",
-                                 symbol,
-                                 (unsigned long long)img->info.header,
-                                 (unsigned long long)runtime_addr,
-                                 (unsigned long long)text_start,
-                                 (unsigned long long)text_end);
-                        }
-                    }
-                }
-            }
-            else {
-                namebuf[it.name_len] = '\0';
-                if (strcmp(namebuf, symbol) == 0) {
-                    DLOG("skip export for %s in image 0x%llx due to flags=0x%llx (reexport/stub)",
-                         symbol, (unsigned long long)img->info.header, (unsigned long long)flags);
-                }
-            }
-        }
-        // iterate children
-        for (uint8_t i = 0; i < childCount; i++) {
-            const uint8_t *s = p; while (s < end && *s) s++;
-            if (s >= end) break; size_t edge_len = (size_t)(s - p);
-            const uint8_t *after_name = s + 1; // skip NUL
-            uint64_t childOff = 0; const uint8_t *after_off = after_name; if (!read_uleb128(&after_off, end, &childOff)) break;
-            // push child if name fits
-            if (it.name_len + edge_len + 1 < sizeof(namebuf) && sp < (sizeof(stack)/sizeof(stack[0]) - 1)) {
-                memcpy(namebuf + it.name_len, p, edge_len);
-                namebuf[it.name_len + edge_len] = '\0';
-                stack[sp++] = (stack_item_t){ .off = (uint32_t)childOff, .name_len = it.name_len + edge_len };
-            }
-            p = after_off;
+    // 1) Cached SYMTAB lookup (fast path)
+    // Build (or reuse) per-image cache and do a binary search
+    // NOTE: The caller (higher level) will manage invalidation across image list changes.
+    // Here we only cache within this TU for the specific image header.
+    // To get per-task cache, higher-level finders call this per image.
+    // We'll lazily keep a small LRU via task_cache list.
+    // We piggyback on the task_cache APIs defined above.
+    task_cache_t *tcache = ensure_task_cache(task);
+    if (!tcache) return false;
+    image_cache_t *ic = find_image_cache(tcache, img->info.header);
+    if (!ic) ic = add_image_cache(tcache, img->info.header);
+    if (!ic) return false;
+    if (!ic->initialized) {
+        if (build_image_symtab_cache(task, img, ic) != 0) {
+            // Fallback to slow path below (exports)
         }
     }
-    free(trie);
-    if (found) { *out_addr = found_addr; return true; }
+    if (ic->initialized) {
+        mach_vm_address_t addr = 0;
+        if (cached_lookup_in_image(ic, symbol, &addr) == 0) { *out_addr = addr; return true; }
+    }
+
+    // 2) Fast export-trie lookup (cached per image)
+    if (!ic->have_exports) (void)ensure_exports_cache(task, img, ic);
+    if (ic->have_exports) {
+        mach_vm_address_t addr = 0;
+        if (lookup_export_trie_by_name(ic, symbol, img->info.slide,
+                                       img->text.vmaddr + img->info.slide,
+                                       img->text.vmaddr + img->info.slide + img->text.vmsize,
+                                       &addr)) {
+            *out_addr = addr; return true;
+        }
+    }
     return false;
 }
 
@@ -340,6 +504,22 @@ int xniff_find_symbol_in_main_image(mach_port_t task, const char *symbol, mach_v
         return -1;
     }
 
+    // Compute fingerprint and manage per-task cache/invalidation
+    uint64_t fp = ((uint64_t)count << 32);
+    for (uint32_t i = 0; i < count; i++) {
+        fp ^= (uint64_t)(uintptr_t)localArray[i].imageLoadAddress;
+        fp = (fp << 7) | (fp >> (64 - 7));
+    }
+    task_cache_t *tc = ensure_task_cache(task);
+    if (tc) {
+        if (tc->fingerprint != fp) {
+            DLOG("image list changed: invalidating cache (fp=0x%llx -> 0x%llx)", (unsigned long long)tc->fingerprint, (unsigned long long)fp);
+            free_task_cache(tc);
+            tc->task = task; // free_task_cache resets fields
+        }
+        tc->fingerprint = fp;
+    }
+
     int rc = -1;
     for (uint32_t i = 0; i < count; i++) {
         mach_vm_address_t header_addr = (mach_vm_address_t)(uintptr_t)localArray[i].imageLoadAddress;
@@ -371,6 +551,22 @@ int xniff_find_symbol_in_task(mach_port_t task, const char *symbol, mach_vm_addr
         return -1;
     }
 
+    // Manage per-task cache / invalidation
+    uint64_t fp = ((uint64_t)count << 32);
+    for (uint32_t i = 0; i < count; i++) {
+        fp ^= (uint64_t)(uintptr_t)localArray[i].imageLoadAddress;
+        fp = (fp << 7) | (fp >> (64 - 7));
+    }
+    task_cache_t *tc = ensure_task_cache(task);
+    if (tc) {
+        if (tc->fingerprint != fp) {
+            DLOG("image list changed: invalidating cache (fp=0x%llx -> 0x%llx)", (unsigned long long)tc->fingerprint, (unsigned long long)fp);
+            free_task_cache(tc);
+            tc->task = task;
+        }
+        tc->fingerprint = fp;
+    }
+
     int rc = -1;
     DLOG("search task for symbol %s", symbol);
     for (uint32_t i = 0; i < count; i++) {
@@ -392,6 +588,43 @@ int xniff_find_symbol_in_task(mach_port_t task, const char *symbol, mach_vm_addr
     return rc;
 }
 
+#include <stdio.h>
+int xniff_find_symbol_in_image_path_contains(mach_port_t task,
+                                            const char *path_substring,
+                                            const char *symbol,
+                                            mach_vm_address_t *out_addr) {
+    if (!path_substring || !*path_substring || !symbol || !out_addr) return -1;
+    struct dyld_all_image_infos infos; struct dyld_image_info *arr = NULL; uint32_t count = 0;
+    if (!enumerate_images(task, &infos, &arr, &count)) return -1;
+    int rc = -1;
+    for (uint32_t i = 0; i < count; i++) {
+        char path[PATH_MAX] = {0};
+        (void)remote_read_cstring(task, (mach_vm_address_t)(uintptr_t)arr[i].imageFilePath, path, sizeof(path));
+        if (!*path || !strstr(path, path_substring)) continue;
+        parsed_image_t img; if (!parse_image_at(task, (mach_vm_address_t)(uintptr_t)arr[i].imageLoadAddress, &img)) continue;
+        if (find_symbol_in_image(task, &img, symbol, out_addr)) { rc = 0; break; }
+    }
+    free(arr); return rc;
+}
+
+int xniff_find_symbol_in_image_exact_path(mach_port_t task,
+                                          const char *exact_path,
+                                          const char *symbol,
+                                          mach_vm_address_t *out_addr) {
+    if (!exact_path || !*exact_path || !symbol || !out_addr) return -1;
+    struct dyld_all_image_infos infos; struct dyld_image_info *arr = NULL; uint32_t count = 0;
+    if (!enumerate_images(task, &infos, &arr, &count)) return -1;
+    int rc = -1;
+    for (uint32_t i = 0; i < count; i++) {
+        char path[PATH_MAX] = {0};
+        (void)remote_read_cstring(task, (mach_vm_address_t)(uintptr_t)arr[i].imageFilePath, path, sizeof(path));
+        if (*path && strcmp(path, exact_path) == 0) {
+            parsed_image_t img; if (!parse_image_at(task, (mach_vm_address_t)(uintptr_t)arr[i].imageLoadAddress, &img)) continue;
+            if (find_symbol_in_image(task, &img, symbol, out_addr)) { rc = 0; break; }
+        }
+    }
+    free(arr); return rc;
+}
 #else
 int xniff_find_symbol_in_main_image(mach_port_t task, const char *symbol, mach_vm_address_t *out_addr) {
     (void)task; (void)symbol; (void)out_addr; return -1;

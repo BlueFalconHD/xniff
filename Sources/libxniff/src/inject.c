@@ -32,19 +32,40 @@ int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path, mach_vm_ad
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
     if (!task || !dylib_path) return -1;
 
-    // Resolve dlopen and pthread_exit in target
+    // Resolve dlopen and pthread_exit in target using filtered lookups
+    // Prefer exact paths; fall back to substring matches; finally optional global scan.
     mach_vm_address_t dlopen_addr = 0;
     mach_vm_address_t pthr_exit_addr = 0;
 
-    printf("resolving _dlopen in target...\n");
-    if (xniff_find_symbol_in_task(task, "_dlopen", &dlopen_addr) != 0) {
-        fprintf(stderr, "could not resolve _dlopen in target\n");
+    printf("resolving _dlopen in target (filtered)...\n");
+    const char *libdyld_exact = "/usr/lib/system/libdyld.dylib";
+    const char *libdyld_sub   = "libdyld";
+    const char *dyld_path     = "/usr/lib/dyld";
+
+    if (xniff_find_symbol_in_image_exact_path(task, libdyld_exact, "_dlopen", &dlopen_addr) != 0 &&
+        xniff_find_symbol_in_image_path_contains(task, libdyld_sub, "_dlopen", &dlopen_addr) != 0 &&
+        xniff_find_symbol_in_image_exact_path(task, dyld_path, "_dlopen", &dlopen_addr) != 0 &&
+        xniff_find_symbol_in_task(task, "_dlopen", &dlopen_addr) != 0 &&
+        xniff_find_symbol_in_image_exact_path(task, libdyld_exact, "dlopen", &dlopen_addr) != 0 &&
+        xniff_find_symbol_in_image_path_contains(task, libdyld_sub, "dlopen", &dlopen_addr) != 0 &&
+        xniff_find_symbol_in_image_exact_path(task, dyld_path, "dlopen", &dlopen_addr) != 0 &&
+        xniff_find_symbol_in_task(task, "dlopen", &dlopen_addr) != 0) {
+        fprintf(stderr, "could not resolve dlopen in target\n");
         return -1;
     }
 
-    printf("resolving _pthread_exit in target...\n");
-    if (xniff_find_symbol_in_task(task, "_pthread_exit", &pthr_exit_addr) != 0) {
-        // Fallback: thread_terminate? If not found, we still proceed and let thread spin.
+    printf("resolving _pthread_exit in target (filtered)...\n");
+    const char *libpth_exact = "/usr/lib/system/libsystem_pthread.dylib";
+    const char *libpth_sub   = "libsystem_pthread";
+    if (xniff_find_symbol_in_image_exact_path(task, libpth_exact, "_pthread_exit", &pthr_exit_addr) != 0 &&
+        xniff_find_symbol_in_image_path_contains(task, libpth_sub, "_pthread_exit", &pthr_exit_addr) != 0 &&
+        xniff_find_symbol_in_image_exact_path(task, dyld_path, "_pthread_exit", &pthr_exit_addr) != 0 &&
+        xniff_find_symbol_in_task(task, "_pthread_exit", &pthr_exit_addr) != 0 &&
+        xniff_find_symbol_in_image_exact_path(task, libpth_exact, "pthread_exit", &pthr_exit_addr) != 0 &&
+        xniff_find_symbol_in_image_path_contains(task, libpth_sub, "pthread_exit", &pthr_exit_addr) != 0 &&
+        xniff_find_symbol_in_image_exact_path(task, dyld_path, "pthread_exit", &pthr_exit_addr) != 0 &&
+        xniff_find_symbol_in_task(task, "pthread_exit", &pthr_exit_addr) != 0) {
+        // Not fatal; we will proceed without a clean thread exit.
         pthr_exit_addr = 0;
     }
 
@@ -79,7 +100,7 @@ int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path, mach_vm_ad
     state.__x[1] = 2;
     state.__pc   = dlopen_addr;
     state.__sp   = sp;
-    state.__lr   = pthr_exit_addr; // if 0, return to 0 -> crash; acceptable for quick and dirty
+    state.__lr   = pthr_exit_addr; // if 0, thread may crash on return; acceptable fallback
 
     printf("creating remote thread...\n");
     thread_act_t th = MACH_PORT_NULL;

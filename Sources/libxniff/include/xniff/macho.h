@@ -12,4 +12,16 @@ int xniff_find_symbol_in_task(mach_port_t task, const char *symbol, mach_vm_addr
 /* Search only the main executable image. */
 int xniff_find_symbol_in_main_image(mach_port_t task, const char *symbol, mach_vm_address_t *out_addr);
 
+/* Search for a symbol only within images whose file path contains the given substring. */
+int xniff_find_symbol_in_image_path_contains(mach_port_t task,
+                                            const char *path_substring,
+                                            const char *symbol,
+                                            mach_vm_address_t *out_addr);
+
+/* Search for a symbol only within the image whose file path matches exactly. */
+int xniff_find_symbol_in_image_exact_path(mach_port_t task,
+                                          const char *exact_path,
+                                          const char *symbol,
+                                          mach_vm_address_t *out_addr);
+
 #endif /* XNIFF_MACHO_H */

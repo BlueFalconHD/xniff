@@ -187,6 +187,7 @@ static int cmd_load_rt(pid_t pid, const char *dylib_path) {
     return rc;
 }
 
+
 int main(int argc, char **argv) {
     if (argc < 2) { usage(argv[0]); return 2; }
 
@@ -214,6 +215,8 @@ int main(int argc, char **argv) {
         int rc = cmd_hook_exit(pid, symbuf, entry_sym, exit_sym);
         return (rc == 0) ? 0 : 1;
     }
+
+    // hook-xpc subcommand removed (hooks dylib retired)
 
     // Default mode: patch a symbol
     if (argc < 2 || argc > 3) { usage(argv[0]); return 2; }
@@ -255,8 +258,10 @@ static int cmd_hook_exit(pid_t pid, const char *symbol_name, const char *entry_s
     if (xniff_find_symbol_in_task(task, entry_name, &entry_hook) != 0) {
         if (xniff_find_symbol_in_task(task, "_xniff_remote_hook", &entry_hook) != 0 &&
             xniff_find_symbol_in_task(task, "xniff_remote_hook", &entry_hook) != 0) {
-            fprintf(stderr, "warning: entry hook %s not found; proceeding without entry hook\n", entry_name);
-            entry_hook = 0;
+            fprintf(stderr, "error: entry hook %s not found; cannot install extended trampoline safely.\n", entry_name);
+            if (did_suspend) task_resume(task);
+            detach_process(pid);
+            return -1;
         }
     }
     if (xniff_find_symbol_in_task(task, exit_name, &exit_hook) != 0) {
