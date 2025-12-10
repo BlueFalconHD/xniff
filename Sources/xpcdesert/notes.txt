@@ -1,0 +1,40 @@
+
+
+floats - 0x5000
+    64 bit number following is little endian floating point
+
+int64 - 0x3000
+    64 bit signed number following
+
+uint64 - 0x4000
+    64 bit unsigned number following
+
+bool - 0x2000
+    32 bit follows (0 == false, else true)
+
+array - 0xE000
+    32 bit number of total bytes
+    then 32 bit number of elements
+
+array - 0xF000
+    32 bit number of total bytes
+    then 32 bit number of elements
+    then a key string (nul term), align up to 4, then parse value
+
+data - 0x8000
+    32 bit number of total bytes
+    then raw data bytes
+
+string - 0x9000
+    32 bit string length (including nul) follows
+    then string data
+
+uuid - 0xA000
+    16 bytes follows
+
+date - 0x7000
+    64 bit number follows, unix time??
+
+file - 0xB000
+    not sure, doesn't seem to take any data after?
+    some special thing, look at _xpc_fd_deserialize -> _xpc_graph_deserializer_read_port

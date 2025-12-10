@@ -8,6 +8,15 @@
   #include <stdlib.h>
   #include <string.h>
   #include <stdio.h>
+  #include <limits.h>
+
+// Debug logging (enable via XNIFF_DEBUG=1)
+static int xniff_debug_enabled(void) {
+    return 1;
+    const char *e = getenv("XNIFF_DEBUG");
+    return (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+}
+#define DLOG(fmt, ...) do { if (xniff_debug_enabled()) fprintf(stderr, "[xniff][sym] " fmt "\n", ##__VA_ARGS__); } while(0)
 
 typedef struct image_info {
     mach_vm_address_t header;
@@ -41,6 +50,26 @@ static bool remote_read_alloc(mach_port_t task, mach_vm_address_t addr, size_t s
     if (!buf) return false;
     if (!remote_read(task, addr, buf, size)) { free(buf); return false; }
     *out_buf = buf; return true;
+}
+
+static bool remote_read_cstring(mach_port_t task, mach_vm_address_t addr, char *out, size_t max_len) {
+    if (!out || max_len == 0) return false;
+    size_t off = 0;
+    while (off + 1 < max_len) {
+        char chunk[64];
+        size_t to_read = (max_len - 1 - off) < sizeof(chunk) ? (max_len - 1 - off) : sizeof(chunk);
+        if (!remote_read(task, addr + off, chunk, to_read)) {
+            break;
+        }
+        for (size_t i = 0; i < to_read; i++) {
+            out[off++] = chunk[i];
+            if (chunk[i] == '\0') { return true; }
+            if (off + 1 >= max_len) break;
+        }
+        if (to_read < sizeof(chunk)) break;
+    }
+    if (off < max_len) out[off] = '\0';
+    return false;
 }
 
 static bool load_image_info(mach_port_t task, mach_vm_address_t header_addr, image_info_t *out) {
@@ -89,6 +118,11 @@ static bool parse_load_commands(mach_port_t task, parsed_image_t *img) {
     free(buf);
     if (img->have_text) {
         img->info.slide = (mach_vm_address_t)(img->info.header) - img->text.vmaddr;
+        DLOG("image 0x%llx: __TEXT vmaddr=0x%llx vmsize=0x%llx slide=0x%llx",
+             (unsigned long long)img->info.header,
+             (unsigned long long)img->text.vmaddr,
+             (unsigned long long)img->text.vmsize,
+             (unsigned long long)img->info.slide);
     }
     return true;
 }
@@ -133,7 +167,35 @@ static bool find_symbol_in_image(mach_port_t task, parsed_image_t *img, const ch
             const char *name = (nl->n_un.n_strx < strsize) ? ((const char *)strtab + nl->n_un.n_strx) : NULL;
             if (!name) continue;
             if (strcmp(name, symbol) == 0) {
-                *out_addr = (mach_vm_address_t)nl->n_value + img->info.slide;
+                uint8_t type = (uint8_t)(nl->n_type & N_TYPE);
+                // Only accept defined-in-section symbols (not undefined/re-exports)
+                if (type != N_SECT || nl->n_sect == NO_SECT || nl->n_value == 0) {
+                    DLOG("skip SYMTAB match for %s in image 0x%llx: type=0x%x sect=%u n_value=0x%llx",
+                         symbol,
+                         (unsigned long long)img->info.header,
+                         (unsigned int)type, (unsigned int)nl->n_sect,
+                         (unsigned long long)nl->n_value);
+                    continue;
+                }
+                mach_vm_address_t runtime = (mach_vm_address_t)nl->n_value + img->info.slide;
+                // Validate within __TEXT range
+                mach_vm_address_t text_start = img->text.vmaddr + img->info.slide;
+                mach_vm_address_t text_end   = text_start + img->text.vmsize;
+                if (runtime < text_start || runtime >= text_end) {
+                    DLOG("reject SYMTAB candidate for %s in image 0x%llx: runtime=0x%llx not in __TEXT [0x%llx,0x%llx)",
+                         symbol,
+                         (unsigned long long)img->info.header,
+                         (unsigned long long)runtime,
+                         (unsigned long long)text_start,
+                         (unsigned long long)text_end);
+                    continue;
+                }
+                DLOG("found %s via SYMTAB in image 0x%llx: n_value=0x%llx runtime=0x%llx",
+                     symbol,
+                     (unsigned long long)img->info.header,
+                     (unsigned long long)nl->n_value,
+                     (unsigned long long)runtime);
+                *out_addr = runtime;
                 free(strtab); free(nls); return true;
             }
         }
@@ -173,13 +235,45 @@ static bool find_symbol_in_image(mach_port_t task, parsed_image_t *img, const ch
         if (term > 0) {
             const uint8_t *tp = term_info; const uint8_t *tend = term_info + term;
             uint64_t flags = 0; (void)read_uleb128(&tp, tend, &flags);
-            // export flags: 0x08 re-export, 0x10 stub, 0x20 resolver
-            if ((flags & 0x08) == 0) {
-                uint64_t addr = 0; if (read_uleb128(&tp, tend, &addr)) {
+            // export flags of interest:
+            //  - 0x08: re-export (no address in this image)
+            //  - 0x10: stub and resolver (not a concrete function body to patch)
+            //  - 0x20: resolver (legacy; treat as not patchable)
+            bool is_reexport = (flags & 0x08) != 0;
+            bool is_stub_or_resolver = (flags & 0x10) != 0 || (flags & 0x20) != 0;
+            if (!is_reexport && !is_stub_or_resolver) {
+                uint64_t addr = 0;
+                if (read_uleb128(&tp, tend, &addr)) {
                     namebuf[it.name_len] = '\0';
                     if (strcmp(namebuf, symbol) == 0) {
-                        found = true; found_addr = (mach_vm_address_t)addr + img->info.slide; break;
+                        // Validate that the address is in the __TEXT segment to avoid bogus 0 addrs
+                        mach_vm_address_t runtime_addr = (mach_vm_address_t)addr + img->info.slide;
+                        mach_vm_address_t text_start = img->text.vmaddr + img->info.slide;
+                        mach_vm_address_t text_end   = text_start + img->text.vmsize;
+                        if (runtime_addr >= text_start && runtime_addr < text_end) {
+                            DLOG("found %s via EXPORTS in image 0x%llx: addr=0x%llx runtime=0x%llx flags=0x%llx",
+                                 symbol,
+                                 (unsigned long long)img->info.header,
+                                 (unsigned long long)addr,
+                                 (unsigned long long)runtime_addr,
+                                 (unsigned long long)flags);
+                            found = true; found_addr = runtime_addr; break;
+                        } else {
+                            DLOG("reject export candidate for %s in image 0x%llx: runtime=0x%llx not in __TEXT [0x%llx,0x%llx)",
+                                 symbol,
+                                 (unsigned long long)img->info.header,
+                                 (unsigned long long)runtime_addr,
+                                 (unsigned long long)text_start,
+                                 (unsigned long long)text_end);
+                        }
                     }
+                }
+            }
+            else {
+                namebuf[it.name_len] = '\0';
+                if (strcmp(namebuf, symbol) == 0) {
+                    DLOG("skip export for %s in image 0x%llx due to flags=0x%llx (reexport/stub)",
+                         symbol, (unsigned long long)img->info.header, (unsigned long long)flags);
                 }
             }
         }
@@ -224,6 +318,10 @@ static bool enumerate_images(mach_port_t task, struct dyld_all_image_infos *out_
     }
     *out_local_array = localArray;
     *out_count = imageCount;
+    DLOG("enumerate_images: count=%u, infos@0x%llx array@0x%llx",
+         imageCount,
+         (unsigned long long)out_infos->infoArray,
+         (unsigned long long)(uintptr_t)localArray);
     return true;
 }
 
@@ -248,8 +346,14 @@ int xniff_find_symbol_in_main_image(mach_port_t task, const char *symbol, mach_v
         parsed_image_t img;
         if (!parse_image_at(task, header_addr, &img)) continue;
         if (img.info.filetype == MH_EXECUTE) {
+            char path[PATH_MAX] = {0};
+            (void)remote_read_cstring(task, (mach_vm_address_t)(uintptr_t)localArray[i].imageFilePath, path, sizeof(path));
+            DLOG("search main image: %s (header=0x%llx) for %s",
+                 path[0] ? path : "<unknown>", (unsigned long long)header_addr, symbol);
             if (find_symbol_in_image(task, &img, symbol, out_addr)) {
                 rc = 0;
+                DLOG("resolved %s in main image %s => 0x%llx",
+                     symbol, path[0] ? path : "<unknown>", (unsigned long long)*out_addr);
             }
             break;
         }
@@ -268,12 +372,19 @@ int xniff_find_symbol_in_task(mach_port_t task, const char *symbol, mach_vm_addr
     }
 
     int rc = -1;
+    DLOG("search task for symbol %s", symbol);
     for (uint32_t i = 0; i < count; i++) {
         mach_vm_address_t header_addr = (mach_vm_address_t)(uintptr_t)localArray[i].imageLoadAddress;
         parsed_image_t img;
         if (!parse_image_at(task, header_addr, &img)) continue;
+        char path[PATH_MAX] = {0};
+        (void)remote_read_cstring(task, (mach_vm_address_t)(uintptr_t)localArray[i].imageFilePath, path, sizeof(path));
+        DLOG("scan image[%u]: %s (header=0x%llx filetype=%u)",
+             i, path[0] ? path : "<unknown>", (unsigned long long)header_addr, img.info.filetype);
         if (find_symbol_in_image(task, &img, symbol, out_addr)) {
             rc = 0;
+            DLOG("resolved %s in %s => 0x%llx",
+                 symbol, path[0] ? path : "<unknown>", (unsigned long long)*out_addr);
             break;
         }
     }

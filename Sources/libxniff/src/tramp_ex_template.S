@@ -45,8 +45,9 @@ _XTRAMP_CTX_ADRP:
     ADRP    X9, _dummy_patch_hook@PAGE         // patched to context base for this trampoline slot
 _XTRAMP_CTX_ADD:
     ADD     X9, X9, _dummy_patch_hook@PAGEOFF
-    MRS     X10, TPIDRRO_EL0                   // thread id
-    UBFX    X10, X10, #0, #6                   // idx = low 6 bits (0..63)
+    MRS     X10, TPIDRRO_EL0                   // thread id base
+    // Use 8 low bits to reduce aliasing across threads (0..255)
+    UBFX    X10, X10, #0, #8                   // idx = low 8 bits (0..255)
     LSL     X10, X10, #8                       // thread-slot size = 256 bytes
     ADD     X9, X9, X10                        // X9 = thread-slot base
     // depth at [X9, #0] (32-bit)
@@ -73,6 +74,10 @@ _XTRAMP_EXITLR_ADRP:
     ADRP    X16, _XTRAMP_EXIT_STUB@PAGE
 _XTRAMP_EXITLR_ADD:
     ADD     X16, X16, _XTRAMP_EXIT_STUB@PAGEOFF
+    // Sign the replacement LR with key B using the function's frame pointer (X29).
+    // The callee epilogue typically does: MOV SP, X29 ; LDP X29, X30, [SP], #16 ; RETAB
+    // so RETAB will authenticate against SP == X29. Using X29 here makes the signature match.
+    PACIB   X16, X29
     STR     X16, [X29, #0x8]
 
     // Snapshot argument registers into frame (x0..x7)
@@ -132,7 +137,7 @@ _XTRAMP_EXIT_CTX_ADRP:
 _XTRAMP_EXIT_CTX_ADD:
     ADD     X9, X9, _dummy_patch_hook@PAGEOFF
     MRS     X10, TPIDRRO_EL0
-    UBFX    X10, X10, #0, #6
+    UBFX    X10, X10, #0, #8
     LSL     X10, X10, #8
     ADD     X9,  X9,  X10                      // thread-slot base
     LDR     W11, [X9, #0]

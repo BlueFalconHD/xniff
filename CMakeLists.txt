@@ -71,6 +71,19 @@ file(GLOB XNIFF_TEST_SOURCES CONFIGURE_DEPENDS
 add_executable(xniff-test ${XNIFF_TEST_SOURCES})
 target_link_libraries(xniff-test PRIVATE)
 
+# Optional: xpcdesert CLI (built if sources are present)
+file(GLOB XPCDESERT_SOURCES CONFIGURE_DEPENDS
+    "${PROJECT_SOURCE_DIR}/Sources/xpcdesert/*.c"
+    "${PROJECT_SOURCE_DIR}/Sources/xpcdesert/*.s"
+    "${PROJECT_SOURCE_DIR}/Sources/xpcdesert/*.S"
+)
+
+if(XPCDESERT_SOURCES)
+    add_executable(xpcdesert ${XPCDESERT_SOURCES})
+    target_include_directories(xpcdesert PRIVATE ${PROJECT_SOURCE_DIR}/Sources/libxniff/include)
+    target_link_libraries(xpcdesert PRIVATE xniff PkgConfig::CAPSTONE)
+endif()
+
 # macOS codesigning with JIT entitlements (for testing self-modifying code)
 if(APPLE)
     set(XNIFF_ENTITLEMENTS "${PROJECT_SOURCE_DIR}/macos.entitlements.plist")
@@ -90,6 +103,12 @@ if(APPLE)
         add_custom_command(TARGET xniff-cli POST_BUILD
             COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xniff-cli>"
             COMMENT "Codesigning xniff-cli with JIT entitlements")
+
+        if(TARGET xpcdesert)
+            add_custom_command(TARGET xpcdesert POST_BUILD
+                COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xpcdesert>"
+                COMMENT "Codesigning xpcdesert with JIT entitlements")
+        endif()
     else()
         message(WARNING "macos.entitlements.plist not found; binaries will not be codesigned.")
     endif()
