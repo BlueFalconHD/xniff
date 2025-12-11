@@ -110,33 +110,6 @@ void assemble_trampoline_at(uint8_t *tramp_base, uint64_t hook_address,
                             uint64_t return_address,
                             int reload_reg, uint64_t reload_target);
 
-/*
- * Modifies the page protections for a memory region.
- */
-kern_return_t modify_page_protections(void *address, size_t size,
-                                      vm_prot_t new_prot);
-
-/*
- * Sets up page protections for patching instructions.
- * Given a starting address and a number of bytes, makes
- * the memory region readable and writable.
- */
-int prepare_protections_for_patching(void *address, size_t size);
-
-/*
- * Restores page protections after patching.
- * Given a starting address and a number of bytes, makes
- * the memory region read and execute only.
- */
-int restore_protections_after_patching(void *address, size_t size);
-
-/*
- * Patches a function to branch to a provided trampoline buffer, after copying
- * a copyable prologue into the trampoline and assembling the trampoline tail.
- * Returns number of bytes copied into the trampoline, or -1 on error.
- */
-int patch_function_with_trampoline(void *target_function, void *trampoline_buffer, void *hook_function);
-
 // Extended: entry + exit (position-independent helper code embedded in trampoline).
 // Assembles and installs a trampoline that saves args, redirects LR to an exit stub,
 // and calls an exit hook on return. Context memory base is provided per trampoline slot.
@@ -184,8 +157,6 @@ size_t trampoline_template_size(void);
 /* Suggest a reasonable per-trampoline slot size. */
 size_t trampoline_recommended_slot_size(void);
 
-/* Initialize a trampoline bank with given capacity and slot size. */
-int trampoline_bank_init(trampoline_bank_t *bank, size_t capacity, size_t per_trampoline_size);
 int trampoline_bank_init_task(trampoline_bank_t *bank, mach_port_t task, size_t capacity, size_t per_trampoline_size);
 
 /* Tear down the bank and free resources. */
@@ -194,11 +165,6 @@ void trampoline_bank_deinit(trampoline_bank_t *bank);
 /* Allocate a raw slot for manual use; returns NULL if full or size exceeds slot. */
 void *trampoline_bank_alloc_slot(trampoline_bank_t *bank, size_t required_size, size_t *out_index);
 
-/*
- * Install a trampoline for the given target -> hook and record metadata.
- * On success returns 0 and optionally sets out_index.
- */
-int trampoline_bank_install(trampoline_bank_t *bank, void *target_function, void *hook_function, size_t *out_index);
 int trampoline_bank_install_task(trampoline_bank_t *bank,
                                  mach_vm_address_t target_function,
                                  mach_vm_address_t hook_function,
