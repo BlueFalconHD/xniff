@@ -494,30 +494,13 @@ int xniff_dump_task_images(mach_port_t task) {
     struct dyld_image_info *arr = NULL;
     uint32_t count = 0;
     if (!enumerate_images(task, &infos, &arr, &count)) {
-        fprintf(stderr, "[xniff] enumerate_images failed\n");
+        fprintf(stderr, "enumerate_images failed\n");
         return -1;
     }
-    fprintf(stderr, "[xniff] dyld images: %u total\n", count);
     for (uint32_t i = 0; i < count; i++) {
         mach_vm_address_t header = (mach_vm_address_t)(uintptr_t)arr[i].imageLoadAddress;
         parsed_image_t img; char path[PATH_MAX] = {0};
         (void)remote_read_cstring(task, (mach_vm_address_t)(uintptr_t)arr[i].imageFilePath, path, sizeof(path));
-        if (parse_image_at(task, header, &img)) {
-            fprintf(stderr,
-                    "[xniff]  [%4u] header=0x%llx slide=0x%llx type=%u path=%s\n",
-                    i,
-                    (unsigned long long)header,
-                    (unsigned long long)img.info.slide,
-                    img.info.filetype,
-                    path[0] ? path : "<unknown>");
-        } else {
-            // Print at least basic info if parsing fails
-            fprintf(stderr,
-                    "[xniff]  [%4u] header=0x%llx slide=? type=? path=%s (parse failed)\n",
-                    i,
-                    (unsigned long long)header,
-                    path[0] ? path : "<unknown>");
-        }
     }
     free(arr);
     return 0;

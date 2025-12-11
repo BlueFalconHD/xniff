@@ -28,6 +28,8 @@
 #include <xniff/macho.h>
 #include <xniff/inject.h>
 
+// New combined workflow command
+#include "sniff_xpc_cmd.h"
 
 static int attach_and_get_task(pid_t pid, mach_port_t *out_task) {
     // Attempt to get the task port first; if allowed, we can avoid ptrace.
@@ -154,8 +156,9 @@ static void usage(const char *prog) {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s <pid> [symbol]              Patch a function entry with trampoline.\n", prog);
     fprintf(stderr, "  %s hook-exit <pid> [symbol] [entry_hook] [exit_hook]\n", prog);
-    fprintf(stderr, "  %s hook-xpc <pid> <hooks.dylib>  Inject hooks and patch mach_msg[_overwrite|2].\n", prog);
+    fprintf(stderr, "  %s hook-xpc <pid> <hooks.dylib>  Inject hooks and patch mach_msg_overwrite + mach_msg2_internal.\n", prog);
     fprintf(stderr, "  %s listen <pid>                 Listen for events from target via Unix socket.\n", prog);
+    fprintf(stderr, "  %s sniff-xpc <pid> <hooks.dylib> Start listener, inject hooks, and patch automatically.\n", prog);
     fprintf(stderr, "\nNotes:\n");
     fprintf(stderr, "- For patching: if [symbol] is omitted, defaults to _mach_msg_overwrite.\n");
     fprintf(stderr, "- Provide Mach-O symbol (with or without leading underscore).\n");
@@ -175,6 +178,16 @@ int main(int argc, char **argv) {
         pid_t pid = (pid_t)strtol(argv[2], NULL, 10);
         if (pid <= 0) { usage(argv[0]); return 2; }
         int rc = cmd_listen(pid);
+        return (rc == 0) ? 0 : 1;
+    }
+
+    // Subcommand: sniff-xpc <pid> <hooks.dylib>
+    if (strcmp(argv[1], "sniff-xpc") == 0) {
+        if (argc != 4) { usage(argv[0]); return 2; }
+        pid_t pid = (pid_t)strtol(argv[2], NULL, 10);
+        if (pid <= 0) { usage(argv[0]); return 2; }
+        const char *path = argv[3];
+        int rc = cmd_sniff_xpc(pid, path);
         return (rc == 0) ? 0 : 1;
     }
 
@@ -533,7 +546,9 @@ static int cmd_hook_xpc(pid_t pid, const char *dylib_path) {
     }
 
     // Candidate symbols to patch (resolve in libsystem_kernel only to reduce scanning)
-    const char *candidates[] = { "_mach_msg_overwrite", "_mach_msg", "_mach_msg2" };
+    // Policy: hook mach_msg_overwrite for non-vector messages and mach_msg2_internal for vector.
+    // No fallback to legacy _mach_msg or _mach_msg2.
+    const char *candidates[] = { "_mach_msg_overwrite", "_mach_msg2_internal" };
     const int n = (int)(sizeof(candidates)/sizeof(candidates[0]));
     int patched = 0;
     for (int i = 0; i < n; i++) {
@@ -543,7 +558,7 @@ static int cmd_hook_xpc(pid_t pid, const char *dylib_path) {
         // Choose appropriate hook pair for each symbol
         mach_vm_address_t eh = entry_hook_v1;
         mach_vm_address_t xh = exit_hook_v1;
-        if (strcmp(candidates[i], "_mach_msg2") == 0) { eh = entry_hook_v2; xh = exit_hook_v2; }
+        if (strcmp(candidates[i], "_mach_msg2_internal") == 0) { eh = entry_hook_v2; xh = exit_hook_v2; }
         // If we cannot resolve the entry hook for this symbol, skip patching to avoid branching to 0
         if (eh == 0) {
             fprintf(stderr, "warning: skipping patch for %s because entry hook not resolved\n", candidates[i]);
@@ -578,4 +593,41 @@ static int cmd_hook_xpc(pid_t pid, const char *dylib_path) {
     detach_process(pid);
     printf("patched %d symbols\n", patched);
     return patched > 0 ? 0 : -1;
+}
+
+// Combined workflow: start listener, then inject hooks and patch mach_msg*.
+int cmd_sniff_xpc(pid_t pid, const char *dylib_path) {
+    pid_t child = fork();
+    if (child == 0) {
+        int rc = cmd_listen(pid);
+        _exit(rc == 0 ? 0 : 1);
+    }
+    if (child < 0) {
+        perror("fork");
+        return -1;
+    }
+
+    // Wait for listener socket to exist to minimize dropped early events
+    char sock_path[108];
+    if (xniff_ipc_path_for_pid(pid, sock_path, sizeof(sock_path)) == 0) {
+        for (int i = 0; i < 50; i++) { // ~2.5s
+            struct stat st;
+            if (stat(sock_path, &st) == 0) break;
+            usleep(50 * 1000);
+        }
+    }
+
+    int rc = cmd_hook_xpc(pid, dylib_path);
+    if (rc != 0) {
+        fprintf(stderr, "sniff-xpc: hook-xpc failed; terminating listener (pid %d)\n", (int)child);
+        kill(child, SIGTERM);
+        (void)waitpid(child, NULL, 0);
+        return -1;
+    }
+
+    printf("sniff-xpc: hooks installed; streaming events (listener pid %d). Press Ctrl-C to stop.\n", (int)child);
+    int status = 0;
+    (void)waitpid(child, &status, 0);
+    if (WIFEXITED(status)) return WEXITSTATUS(status) == 0 ? 0 : -1;
+    return -1;
 }
