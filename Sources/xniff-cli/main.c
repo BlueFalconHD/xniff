@@ -153,14 +153,12 @@ static int patch_symbol_in_task(pid_t pid, const char *symbol_name) {
 static void usage(const char *prog) {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s <pid> [symbol]              Patch a function entry with trampoline.\n", prog);
-    fprintf(stderr, "  %s load-rt <pid> <path>        Inject xniff-rt dylib via remote dlopen.\n", prog);
     fprintf(stderr, "  %s hook-exit <pid> [symbol] [entry_hook] [exit_hook]\n", prog);
     fprintf(stderr, "  %s hook-xpc <pid> <hooks.dylib>  Inject hooks and patch mach_msg[_overwrite|2].\n", prog);
     fprintf(stderr, "  %s listen <pid>                 Listen for events from target via Unix socket.\n", prog);
     fprintf(stderr, "\nNotes:\n");
     fprintf(stderr, "- For patching: if [symbol] is omitted, defaults to _mach_msg_overwrite.\n");
     fprintf(stderr, "- Provide Mach-O symbol (with or without leading underscore).\n");
-    fprintf(stderr, "- For load-rt: <path> must be an absolute path to xniff-rt dylib.\n");
 }
 
 // Forward declare subcommand implementation
@@ -168,49 +166,8 @@ static int cmd_hook_exit(pid_t pid, const char *symbol_name, const char *entry_s
 static int cmd_hook_xpc(pid_t pid, const char *dylib_path);
 static int cmd_listen(pid_t pid);
 
-static int cmd_load_rt(pid_t pid, const char *dylib_path) {
-    mach_port_t task;
-    if (attach_and_get_task(pid, &task) != 0) return -1;
-    bool did_suspend = false;
-    // Resolve absolute path to the runtime dylib to ensure dlopen in the target can locate it
-    char abs_path[PATH_MAX] = {0};
-    if (!realpath(dylib_path, abs_path)) {
-        perror("realpath");
-        if (did_suspend) task_resume(task);
-        detach_process(pid);
-        return -1;
-    }
-
-    mach_vm_address_t addr_enter = 0, addr_exit = 0, addr_exit_hook = 0;
-    // Do not suspend before injection; allow dlopen to run
-    int rc = xniff_load_runtime_task(task, abs_path, &addr_enter, &addr_exit, &addr_exit_hook);
-    if (rc == 0) {
-        printf("xniff-rt injected. ctx_enter=0x%llx ctx_exit=0x%llx exit_hook=0x%llx\n",
-               (unsigned long long)addr_enter,
-               (unsigned long long)addr_exit,
-               (unsigned long long)addr_exit_hook);
-    } else {
-        fprintf(stderr, "failed to inject runtime into pid %d\n", pid);
-    }
-
-    if (did_suspend) task_resume(task);
-    detach_process(pid);
-    return rc;
-}
-
-
 int main(int argc, char **argv) {
     if (argc < 2) { usage(argv[0]); return 2; }
-
-    // Subcommand: load-rt <pid> <path>
-    if (strcmp(argv[1], "load-rt") == 0) {
-        if (argc != 4) { usage(argv[0]); return 2; }
-        pid_t pid = (pid_t)strtol(argv[2], NULL, 10);
-        if (pid <= 0) { usage(argv[0]); return 2; }
-        const char *path = argv[3];
-        int rc = cmd_load_rt(pid, path);
-        return (rc == 0) ? 0 : 1;
-    }
 
     // Subcommand: listen <pid>
     if (strcmp(argv[1], "listen") == 0) {

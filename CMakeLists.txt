@@ -44,13 +44,8 @@ set_target_properties(xniff PROPERTIES
     SOVERSION ${PROJECT_VERSION_MAJOR}
 )
 
-# Runtime dylib to inject into target processes
-file(GLOB XNIFF_RT_SOURCES CONFIGURE_DEPENDS
-    "${PROJECT_SOURCE_DIR}/Sources/xniff-rt/*.c"
-)
-add_library(xniff-rt SHARED ${XNIFF_RT_SOURCES})
-target_include_directories(xniff-rt PUBLIC ${PROJECT_SOURCE_DIR}/Sources/xniff-rt)
-set_target_properties(xniff-rt PROPERTIES OUTPUT_NAME xniff-rt)
+## Removed: xniff-rt runtime dylib target
+## (former target and sources under Sources/xniff-rt)
 
 # Hooks dylib with Mach message entry/exit hooks (XPC sniffing)
 file(GLOB XNIFF_HOOKS_SOURCES CONFIGURE_DEPENDS
@@ -106,9 +101,7 @@ if(APPLE)
             COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xniff>"
             COMMENT "Codesigning libxniff with JIT entitlements")
 
-        add_custom_command(TARGET xniff-rt POST_BUILD
-            COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xniff-rt>"
-            COMMENT "Codesigning xniff-rt with JIT entitlements")
+        ## Removed codesign step for xniff-rt (runtime dylib)
 
         if(TARGET xniff-hooks)
             add_custom_command(TARGET xniff-hooks POST_BUILD

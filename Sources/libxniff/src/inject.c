@@ -73,17 +73,8 @@ int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path, mach_vm_ad
         pthr_exit_addr = 0;
     }
 
-
-    printf("dlopen addr: 0x%llx, pthread_exit addr: 0x%llx\n",
-           (unsigned long long)dlopen_addr,
-           (unsigned long long)pthr_exit_addr);
-
-    printf("injecting dylib %s into target...\n", dylib_path);
-    // Note: for the assembly stub path we embed the path inside the stub blob,
-    // so no remote string allocation is needed.
-
-    // Create a small stack for the bootstrap Mach thread that will call pthread_create*
-    const mach_vm_size_t stack_size = 1 << 16; // 64 KB
+    // allocate 64kb stack for remote thread
+    const mach_vm_size_t stack_size = 1 << 16;
     vm_address_t stack_addr = 0;
     kern_return_t kr = vm_allocate(task, &stack_addr, stack_size, VM_FLAGS_ANYWHERE);
     if (kr != KERN_SUCCESS) {
@@ -108,8 +99,6 @@ int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path, mach_vm_ad
             break;
         }
 
-        printf("writing injection stub to 0x%llx (size %zu bytes)\n",
-               (unsigned long long)code_addr2, blob_size);
 
         // get current memory protections of thing for debugging
 
@@ -151,10 +140,6 @@ int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path, mach_vm_ad
         // Restore code mapping to RX before execution
         (void)restore_protections_after_patching_task(task, (mach_vm_address_t)code_addr2, (size_t)blob_size);
 
-        printf("launching injection stub thread at 0x%llx with sp 0x%llx\n",
-               (unsigned long long)code_addr2,
-               (unsigned long long)sp);
-
         // Launch the stub directly as a raw Mach thread. The stub itself creates
         // a proper pthread via pthread_create_from_mach_thread and then spins
         // with WFE to avoid CPU spikes.
@@ -163,9 +148,7 @@ int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path, mach_vm_ad
         st.__pc = code_addr2; // entry of stub
         thread_act_t th2 = MACH_PORT_NULL;
 
-        printf("creating remote stub thread...\n");
         kr = thread_create_running(task, ARM_THREAD_STATE64, (thread_state_t)&st, ARM_THREAD_STATE64_COUNT, &th2);
-        printf("thread_create_running returned: %d\n", kr);
 
         if (kr == KERN_SUCCESS) {
             if (out_handle) *out_handle = 0;
@@ -184,54 +167,4 @@ int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path, mach_vm_ad
 #endif
 }
 
-int xniff_load_runtime_task(mach_port_t task, const char *runtime_dylib_path,
-                            mach_vm_address_t *out_ctx_enter,
-                            mach_vm_address_t *out_ctx_exit,
-                            mach_vm_address_t *out_exit_hook) {
-    if (!task || !runtime_dylib_path) return -1;
-    if (xniff_inject_dylib_task(task, runtime_dylib_path, NULL) != 0) return -1;
-
-    // give dyld a moment (caller should ideally synchronize via breakpoint or polling)
-    usleep(100 * 1000);
-
-    // Resolve helpers exported by xniff-rt, preferring image-scoped lookups
-    const char *base = xniff_path_basename(runtime_dylib_path);
-    mach_vm_address_t addr = 0;
-
-    if (out_ctx_enter) {
-        addr = 0;
-        if (xniff_find_symbol_in_image_exact_path(task, runtime_dylib_path, "_xniff_ctx_enter", &addr) != 0 &&
-            xniff_find_symbol_in_image_path_contains(task, base, "_xniff_ctx_enter", &addr) != 0 &&
-            xniff_find_symbol_in_image_exact_path(task, runtime_dylib_path, "xniff_ctx_enter", &addr) != 0 &&
-            xniff_find_symbol_in_image_path_contains(task, base, "xniff_ctx_enter", &addr) != 0) {
-            *out_ctx_enter = 0;
-        } else {
-            *out_ctx_enter = addr;
-        }
-    }
-
-    if (out_ctx_exit) {
-        addr = 0;
-        if (xniff_find_symbol_in_image_exact_path(task, runtime_dylib_path, "_xniff_ctx_exit", &addr) != 0 &&
-            xniff_find_symbol_in_image_path_contains(task, base, "_xniff_ctx_exit", &addr) != 0 &&
-            xniff_find_symbol_in_image_exact_path(task, runtime_dylib_path, "xniff_ctx_exit", &addr) != 0 &&
-            xniff_find_symbol_in_image_path_contains(task, base, "xniff_ctx_exit", &addr) != 0) {
-            *out_ctx_exit = 0;
-        } else {
-            *out_ctx_exit = addr;
-        }
-    }
-
-    if (out_exit_hook) {
-        addr = 0;
-        if (xniff_find_symbol_in_image_exact_path(task, runtime_dylib_path, "_xniff_exit_hook", &addr) != 0 &&
-            xniff_find_symbol_in_image_path_contains(task, base, "_xniff_exit_hook", &addr) != 0 &&
-            xniff_find_symbol_in_image_exact_path(task, runtime_dylib_path, "xniff_exit_hook", &addr) != 0 &&
-            xniff_find_symbol_in_image_path_contains(task, base, "xniff_exit_hook", &addr) != 0) {
-            *out_exit_hook = 0;
-        } else {
-            *out_exit_hook = addr;
-        }
-    }
-    return 0;
-}
+/* xniff_load_runtime_task removed along with xniff-rt component. */

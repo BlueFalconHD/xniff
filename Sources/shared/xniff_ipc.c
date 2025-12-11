@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>
 
 #ifndef SUN_LEN
 #define SUN_LEN(su) (offsetof(struct sockaddr_un, sun_path) + strlen((su)->sun_path))
@@ -70,6 +71,10 @@ int xniff_ipc_server_listen(pid_t pid) {
         errno = e;
         return -1;
     }
+
+    // Make the socket broadly accessible so differently-sandboxed targets can connect.
+    // NOTE: This relaxes permissions; if undesired, tighten to 0600 or gate by a flag.
+    (void)chmod(path, 0666);
 
     if (listen(fd, 4) != 0) {
         int e = errno;
