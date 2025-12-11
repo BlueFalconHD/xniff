@@ -52,7 +52,17 @@ add_library(xniff-rt SHARED ${XNIFF_RT_SOURCES})
 target_include_directories(xniff-rt PUBLIC ${PROJECT_SOURCE_DIR}/Sources/xniff-rt)
 set_target_properties(xniff-rt PROPERTIES OUTPUT_NAME xniff-rt)
 
-# (Removed) hooks dylib: previous Mach message hooks have been retired
+# Hooks dylib with Mach message entry/exit hooks (XPC sniffing)
+file(GLOB XNIFF_HOOKS_SOURCES CONFIGURE_DEPENDS
+    "${PROJECT_SOURCE_DIR}/Sources/xniff-hooks/*.c"
+)
+if(XNIFF_HOOKS_SOURCES)
+    add_library(xniff-hooks SHARED ${XNIFF_HOOKS_SOURCES} ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_ipc.c)
+    target_include_directories(xniff-hooks PUBLIC 
+        ${PROJECT_SOURCE_DIR}/Sources/xniff-hooks 
+        ${PROJECT_SOURCE_DIR}/Sources/shared)
+    set_target_properties(xniff-hooks PROPERTIES OUTPUT_NAME xniff-hooks)
+endif()
 
 file(GLOB XNIFF_CLI_SOURCES CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/Sources/xniff-cli/*.c"
@@ -60,9 +70,11 @@ file(GLOB XNIFF_CLI_SOURCES CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/Sources/xniff-cli/*.S"
 )
 
-add_executable(xniff-cli ${XNIFF_CLI_SOURCES})
+add_executable(xniff-cli ${XNIFF_CLI_SOURCES} ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_ipc.c)
 target_link_libraries(xniff-cli PRIVATE xniff PkgConfig::CAPSTONE)
-target_include_directories(xniff-cli PRIVATE ${PROJECT_SOURCE_DIR}/Sources/libxniff/include)
+target_include_directories(xniff-cli PRIVATE 
+    ${PROJECT_SOURCE_DIR}/Sources/libxniff/include
+    ${PROJECT_SOURCE_DIR}/Sources/shared)
 
 file(GLOB XNIFF_TEST_SOURCES CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/Sources/xniff-tests/*.c"
@@ -98,7 +110,11 @@ if(APPLE)
             COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xniff-rt>"
             COMMENT "Codesigning xniff-rt with JIT entitlements")
 
-        # xniff-hooks codesigning removed (hooks dylib no longer built)
+        if(TARGET xniff-hooks)
+            add_custom_command(TARGET xniff-hooks POST_BUILD
+                COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xniff-hooks>"
+                COMMENT "Codesigning xniff-hooks with JIT entitlements")
+        endif()
 
         add_custom_command(TARGET xniff-test POST_BUILD
             COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xniff-test>"

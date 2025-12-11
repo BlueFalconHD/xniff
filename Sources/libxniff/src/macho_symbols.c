@@ -42,6 +42,7 @@ typedef struct parsed_image {
 static bool remote_read(mach_port_t task, mach_vm_address_t addr, void *buf, size_t size);
 static bool remote_read_alloc(mach_port_t task, mach_vm_address_t addr, size_t size, void **out_buf);
 static bool compute_linkedit_base(parsed_image_t *img, mach_vm_address_t *out);
+static bool parse_image_at(mach_port_t task, mach_vm_address_t header_addr, parsed_image_t *out);
 
 // ----------------------------
 // Symbol cache (per image)
@@ -487,6 +488,68 @@ static bool enumerate_images(mach_port_t task, struct dyld_all_image_infos *out_
          (unsigned long long)out_infos->infoArray,
          (unsigned long long)(uintptr_t)localArray);
     return true;
+}
+
+int xniff_dump_task_images(mach_port_t task) {
+    struct dyld_all_image_infos infos;
+    struct dyld_image_info *arr = NULL;
+    uint32_t count = 0;
+    if (!enumerate_images(task, &infos, &arr, &count)) {
+        fprintf(stderr, "[xniff] enumerate_images failed\n");
+        return -1;
+    }
+    fprintf(stderr, "[xniff] dyld images: %u total\n", count);
+    for (uint32_t i = 0; i < count; i++) {
+        mach_vm_address_t header = (mach_vm_address_t)(uintptr_t)arr[i].imageLoadAddress;
+        parsed_image_t img; char path[PATH_MAX] = {0};
+        (void)remote_read_cstring(task, (mach_vm_address_t)(uintptr_t)arr[i].imageFilePath, path, sizeof(path));
+        if (parse_image_at(task, header, &img)) {
+            fprintf(stderr,
+                    "[xniff]  [%4u] header=0x%llx slide=0x%llx type=%u path=%s\n",
+                    i,
+                    (unsigned long long)header,
+                    (unsigned long long)img.info.slide,
+                    img.info.filetype,
+                    path[0] ? path : "<unknown>");
+        } else {
+            // Print at least basic info if parsing fails
+            fprintf(stderr,
+                    "[xniff]  [%4u] header=0x%llx slide=? type=? path=%s (parse failed)\n",
+                    i,
+                    (unsigned long long)header,
+                    path[0] ? path : "<unknown>");
+        }
+    }
+    free(arr);
+    return 0;
+}
+
+int xniff_image_exists_exact(mach_port_t task, const char *exact_path) {
+    if (!exact_path || !*exact_path) return -1;
+    struct dyld_all_image_infos infos; struct dyld_image_info *arr = NULL; uint32_t count = 0;
+    if (!enumerate_images(task, &infos, &arr, &count)) return -1;
+    int found = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        char path[PATH_MAX] = {0};
+        (void)remote_read_cstring(task, (mach_vm_address_t)(uintptr_t)arr[i].imageFilePath, path, sizeof(path));
+        if (*path && strcmp(path, exact_path) == 0) { found = 1; break; }
+    }
+    free(arr);
+    return found;
+}
+
+int xniff_image_exists_contains(mach_port_t task, const char *substring) {
+    if (!substring || !*substring) return -1;
+    struct dyld_all_image_infos infos; struct dyld_image_info *arr = NULL; uint32_t count = 0;
+    if (!enumerate_images(task, &infos, &arr, &count)) return -1;
+    int found = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        char path[PATH_MAX] = {0};
+        (void)remote_read_cstring(task, (mach_vm_address_t)(uintptr_t)arr[i].imageFilePath, path, sizeof(path));
+        if (*path && strstr(path, substring)) { found = 1; break; }
+    }
+    free(arr);
+    return found;
 }
 
 static bool parse_image_at(mach_port_t task, mach_vm_address_t header_addr, parsed_image_t *out) {
