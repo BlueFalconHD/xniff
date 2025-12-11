@@ -1,5 +1,8 @@
 .text
+#include "xniff_ctx_config.h"
 .align 2
+// Ensure valid landing pads for indirect branches/returns on BTI-enabled systems
+// (harmless NOPs where BTI is not enforced).
 .globl _XTRAMP_START_AFTER_PROLOGUE
 .globl _XTRAMP_HOOK_ADRP
 .globl _XTRAMP_HOOK_ADD
@@ -21,6 +24,8 @@
 
 // Extended trampoline that snapshots args, redirects LR to exit stub, and calls entry hook.
 _XTRAMP_START_AFTER_PROLOGUE:
+    // Valid BTI landing for BR from patched entry; allow both jump/call
+    BTI     jc
     // Save all general-purpose registers x0-x30
     SUB     SP, SP, #0x120
     STP     X0,  X1,  [SP, #0x00]
@@ -40,15 +45,50 @@ _XTRAMP_START_AFTER_PROLOGUE:
     STP     X28, X29, [SP, #0xE0]
     STR     X30,      [SP, #0xF0]
 
+    // Save FP/SIMD state and NZCV to ensure complete transparency across calls.
+    // Layout (at current SP after GPR save):
+    //   [0x000..0x1FF]  Q0..Q31 (512 bytes)
+    //   [0x200]         FPCR (8 bytes)
+    //   [0x208]         FPSR (8 bytes)
+    //   [0x210]         NZCV (8 bytes)
+    SUB     SP, SP, #0x220
+    STP     Q0,  Q1,  [SP, #0x000]
+    STP     Q2,  Q3,  [SP, #0x020]
+    STP     Q4,  Q5,  [SP, #0x040]
+    STP     Q6,  Q7,  [SP, #0x060]
+    STP     Q8,  Q9,  [SP, #0x080]
+    STP     Q10, Q11, [SP, #0x0A0]
+    STP     Q12, Q13, [SP, #0x0C0]
+    STP     Q14, Q15, [SP, #0x0E0]
+    STP     Q16, Q17, [SP, #0x100]
+    STP     Q18, Q19, [SP, #0x120]
+    STP     Q20, Q21, [SP, #0x140]
+    STP     Q22, Q23, [SP, #0x160]
+    STP     Q24, Q25, [SP, #0x180]
+    STP     Q26, Q27, [SP, #0x1A0]
+    STP     Q28, Q29, [SP, #0x1C0]
+    STP     Q30, Q31, [SP, #0x1E0]
+    MRS     X14, FPCR
+    STR     X14,      [SP, #0x200]
+    MRS     X14, FPSR
+    STR     X14,      [SP, #0x208]
+    MRS     X14, NZCV
+    STR     X14,      [SP, #0x210]
+
     // Compute per-thread context frame address in X9
 _XTRAMP_CTX_ADRP:
     ADRP    X9, _dummy_patch_hook@PAGE         // patched to context base for this trampoline slot
 _XTRAMP_CTX_ADD:
     ADD     X9, X9, _dummy_patch_hook@PAGEOFF
     MRS     X10, TPIDRRO_EL0                   // thread id base
-    // Use 8 low bits to reduce aliasing across threads (0..255)
-    UBFX    X10, X10, #0, #8                   // idx = low 8 bits (0..255)
-    LSL     X10, X10, #8                       // thread-slot size = 256 bytes
+    // Mix bits to reduce aliasing across threads (TPIDRRO is page-aligned).
+    EOR     X10, X10, X10, LSR #15
+    EOR     X10, X10, X10, LSR #30
+    // Derive per-thread index from mixed value and scale by slot size.
+    // Configurable via XNIFF_CTX_IDX_BITS and XNIFF_CTX_SLOT_SHIFT.
+    // Use AArch64 form (UBFM) rather than UBFX alias for broad assembler compatibility.
+    UBFM    X10, X10, #0, #(XNIFF_CTX_IDX_BITS - 1) // idx in [0, 2^bits)
+    LSL     X10, X10, #XNIFF_CTX_SLOT_SHIFT    // bytes per thread-slot
     ADD     X9, X9, X10                        // X9 = thread-slot base
     // depth at [X9, #0] (32-bit)
     LDR     W11, [X9, #0]
@@ -67,16 +107,19 @@ _XTRAMP_RESUME_ADD:
     ADD     X15, X15, _dummy_patch_hook@PAGEOFF
     STR     X15, [X9, #8]
 
-    // Save original LR from function frame and redirect LR to our exit stub
-    LDR     X16, [X29, #0x8]
+    // Save original LR register (incoming return address) into our frame
+    MOV     X16, X30
     STR     X16, [X9,  #0]                     // frame->lr_orig
 _XTRAMP_EXITLR_ADRP:
     ADRP    X16, _XTRAMP_EXIT_STUB@PAGE
 _XTRAMP_EXITLR_ADD:
     ADD     X16, X16, _XTRAMP_EXIT_STUB@PAGEOFF
-    // Sign the replacement LR with key B using the function's frame pointer (X29).
-    // The callee epilogue typically does: MOV SP, X29 ; LDP X29, X30, [SP], #16 ; RETAB
-    // so RETAB will authenticate against SP == X29. Using X29 here makes the signature match.
+    // Redirect return to our exit stub by overwriting the caller-saved LR slot.
+    // The target prologue has already established X29 as frame pointer via
+    //   STP X29, X30, [SP, #imm]; ADD X29, SP, #imm
+    // Epilogue typically does: MOV SP, X29; LDP X29, X30, [SP], #16; RETAB
+    // So we sign the exit stub pointer with key B using X29 as the context,
+    // matching the MOV SP, X29 before RETAB.
     PACIB   X16, X29
     STR     X16, [X29, #0x8]
 
@@ -105,8 +148,37 @@ _XTRAMP_HOOK_ADD:
     BLR     X16
 1:
 
+    // Restore FP/SIMD state and NZCV first to minimize side-effects
+    LDP     Q0,  Q1,  [SP, #0x000]
+    LDP     Q2,  Q3,  [SP, #0x020]
+    LDP     Q4,  Q5,  [SP, #0x040]
+    LDP     Q6,  Q7,  [SP, #0x060]
+    LDP     Q8,  Q9,  [SP, #0x080]
+    LDP     Q10, Q11, [SP, #0x0A0]
+    LDP     Q12, Q13, [SP, #0x0C0]
+    LDP     Q14, Q15, [SP, #0x0E0]
+    LDP     Q16, Q17, [SP, #0x100]
+    LDP     Q18, Q19, [SP, #0x120]
+    LDP     Q20, Q21, [SP, #0x140]
+    LDP     Q22, Q23, [SP, #0x160]
+    LDP     Q24, Q25, [SP, #0x180]
+    LDP     Q26, Q27, [SP, #0x1A0]
+    LDP     Q28, Q29, [SP, #0x1C0]
+    LDP     Q30, Q31, [SP, #0x1E0]
+    LDR     X14,      [SP, #0x200]
+    MSR     FPCR, X14
+    LDR     X14,      [SP, #0x208]
+    MSR     FPSR, X14
+    LDR     X14,      [SP, #0x210]
+    MSR     NZCV, X14
+    ADD     SP, SP, #0x220
+
     // Restore all GPRs and unwind stack
-    LDR     X30,      [SP, #0xF0]
+    // Note: do not restore X30 here; we want the prologue-saved X30 to remain
+    // our patched, PAC-signed exit stub so the RETAB in the callee epilogue
+    // will branch to our exit path. If we restore X30 from our own save
+    // (pre-prologue), it would skip the exit stub.
+    // LDR   X30,      [SP, #0xF0]
     LDP     X28, X29, [SP, #0xE0]
     LDP     X26, X27, [SP, #0xD0]
     LDP     X24, X25, [SP, #0xC0]
@@ -132,52 +204,72 @@ _XTRAMP_RETURN_ADD:
 
 // Exit stub: called when target RETs (LR replaced by our address). x0 holds return value.
 _XTRAMP_EXIT_STUB:
+    // Valid BTI landing for RET
+    BTI     c
 _XTRAMP_EXIT_CTX_ADRP:
     ADRP    X9, _dummy_patch_hook@PAGE         // patched to same context base as above
 _XTRAMP_EXIT_CTX_ADD:
     ADD     X9, X9, _dummy_patch_hook@PAGEOFF
     MRS     X10, TPIDRRO_EL0
-    UBFX    X10, X10, #0, #8
-    LSL     X10, X10, #8
+    EOR     X10, X10, X10, LSR #15
+    EOR     X10, X10, X10, LSR #30
+    UBFM    X10, X10, #0, #(XNIFF_CTX_IDX_BITS - 1)
+    LSL     X10, X10, #XNIFF_CTX_SLOT_SHIFT
     ADD     X9,  X9,  X10                      // thread-slot base
-    LDR     W11, [X9, #0]
-    SUB     W11, W11, #1
-    STR     W11, [X9, #0]
-    // frame = base + 16 + ((depth & 1) << 7) ; match entry ring selection
-    AND     W12, W11, #1
+    LDR     W11, [X9, #0]                      // current depth
+    MOV     W13, W11                           // save old depth (matches entry)
+    // frame = base + 16 + ((old_depth & 1) << 7) ; use same ring as entry
+    AND     W12, W13, #1
     UXTW    X12, W12
     LSL     X12, X12, #7
     ADD     X12, X12, #16
     ADD     X9,  X9,  X12                      // X9 = frame ptr
     // Save return value into frame at offset 80
     STR     X0,  [X9, #80]
+    // Now decrement depth (after selecting frame based on old depth)
+    SUB     W11, W11, #1
+    // Write back new depth to slot header
+    SUB     X12, X9, #16
+    STR     W11, [X12]
     // Call exit hook: x0 is ret, x1 = ctx
 _XTRAMP_EXIT_HOOK_ADRP:
     ADRP    X16, _dummy_patch_hook@PAGE
 _XTRAMP_EXIT_HOOK_ADD:
     ADD     X16, X16, _dummy_patch_hook@PAGEOFF
-    // Preserve ctx pointer across the call without clobbering callee-saved regs
-    // Save X9 (ctx) on stack to keep ABI promises for X19..X28
-    STP     X9, X10, [SP, #-16]!
+    // Preserve return-value registers and flags across exit-hook call to ensure
+    // caller observes exactly what the callee returned.
+    // Layout (0xB0 bytes):
+    //   [0x000..0x07F] q0..q7
+    //   [0x080]        x0,x1
+    //   [0x090]        x9,x10
+    //   [0x0A0]        NZCV
+    //   [0x0A8]        depth-after-decrement snapshot (W11)
+    SUB     SP, SP, #0xB0
+    STP     Q0,  Q1,  [SP, #0x000]
+    STP     Q2,  Q3,  [SP, #0x020]
+    STP     Q4,  Q5,  [SP, #0x040]
+    STP     Q6,  Q7,  [SP, #0x060]
+    STP     X0,  X1,  [SP, #0x080]
+    STP     X9,  X10, [SP, #0x090]
+    MRS     X10, NZCV
+    STR     X10,      [SP, #0x0A0]
+    // Snapshot depth after decrement for post-call decisions (W11 is caller-saved)
+    STR     W11,      [SP, #0x0A8]
     MOV     X1,  X9
     // Call exit hook only when depth reached zero (outermost)
-    CBNZ    W11, 2f
+    CBNZ    W11, 1f
     BLR     X16
-    // Ensure original return value is restored to x0 before returning to caller
-    // (exit hook may have clobbered x0)
-    // Restore saved ctx pointer and reload original return value
-    LDP     X9, X10, [SP], #16
-    LDR     X0, [X9, #80]
-2:
-    // Return to original caller using lr_orig saved in frame
-    // If we skipped the call (depth!=0), restore stack slot we reserved
-    // (paired with the STP above). When we did call, X9/X10 already popped.
-    CBNZ    W11, 3f
-    B       4f
-3:
-    // Depth != 0 path: we didn't branch to the hook, so pop the saved regs now
-    LDP     X9, X10, [SP], #16
-4:
+1:
+    // Restore flags and return-value registers (always restore to callee's values)
+    LDR     X10,      [SP, #0x0A0]
+    MSR     NZCV, X10
+    LDP     X9,  X10, [SP, #0x090]
+    LDP     X0,  X1,  [SP, #0x080]
+    LDP     Q0,  Q1,  [SP, #0x000]
+    LDP     Q2,  Q3,  [SP, #0x020]
+    LDP     Q4,  Q5,  [SP, #0x040]
+    LDP     Q6,  Q7,  [SP, #0x060]
+    ADD     SP, SP, #0xB0
     LDR     X16, [X9, #0]
     MOV     X30, X16
     RET
@@ -186,4 +278,5 @@ _XTRAMP_END:
 
 // Simple no-op hook that immediately returns
 _XTRAMP_NOOP:
+    BTI     jc
     RET

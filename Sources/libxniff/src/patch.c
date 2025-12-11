@@ -1,5 +1,6 @@
 #include <xniff/patch.h>
 #include "assembler.h"
+#include "xniff_ctx_config.h"
 
 
 // Forward declarations for helpers used before their definitions
@@ -465,8 +466,12 @@ size_t trampoline_template_size(void) {
 }
 
 size_t trampoline_recommended_slot_size(void) {
-    // Prologue typically small; add headroom for safety.
-    return trampoline_template_size() + 64; // 64 bytes for copied prologue & alignment slop
+    // Recommend capacity large enough for either template variant (simple or extended),
+    // plus headroom for copied prologue and minor alignment slop.
+    size_t base  = trampoline_template_size();
+    size_t xbase = xtrampoline_template_size();
+    size_t tmpl  = (base > xbase) ? base : xbase;
+    return tmpl + 64;
 }
 
 int trampoline_bank_init_task(trampoline_bank_t *bank, mach_port_t task, size_t capacity, size_t per_trampoline_size) {
@@ -477,8 +482,10 @@ int trampoline_bank_init_task(trampoline_bank_t *bank, mach_port_t task, size_t 
     if (per_trampoline_size == 0) {
         per_trampoline_size = trampoline_recommended_slot_size();
     }
-    if (per_trampoline_size < trampoline_template_size() + 32) {
-        per_trampoline_size = trampoline_template_size() + 32;
+    // Enforce a minimum that accommodates either trampoline flavor with a touch of slack.
+    size_t min_needed = trampoline_recommended_slot_size();
+    if (per_trampoline_size < min_needed) {
+        per_trampoline_size = min_needed;
     }
     per_trampoline_size = (per_trampoline_size + 3) & ~((size_t)3);
 
@@ -747,10 +754,10 @@ int trampoline_bank_install_task_with_exit(trampoline_bank_t *bank,
 
     // Allocate per-slot context region (RW).
     // Context region layout per trampoline slot:
-    // - 256 thread slots (indexed by low 8 bits of TPIDRRO_EL0)
-    // - 256 bytes per thread slot (2 frames × 128B)
-    // Total = 256 * 256 = 65536 bytes (64KB)
-    const size_t ctx_per_slot = (256u * 256u);
+    // - XNIFF_CTX_INDEX_COUNT per-thread slots (derived from TPIDRRO_EL0)
+    // - XNIFF_CTX_SLOT_SIZE bytes per thread slot (2 frames × 128B = 256B)
+    // Total = XNIFF_CTX_TOTAL_BYTES (defaults to 4096 * 256 = 1 MiB)
+    const size_t ctx_per_slot = (size_t)XNIFF_CTX_TOTAL_BYTES;
     vm_address_t ctx_addr = 0;
     if (vm_allocate(bank->task, &ctx_addr, (vm_size_t)ctx_per_slot, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
         fprintf(stderr, "Failed to allocate remote context slot\n");

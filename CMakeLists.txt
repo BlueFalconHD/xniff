@@ -66,10 +66,11 @@ file(GLOB XNIFF_CLI_SOURCES CONFIGURE_DEPENDS
 )
 
 add_executable(xniff-cli ${XNIFF_CLI_SOURCES} ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_ipc.c)
-target_link_libraries(xniff-cli PRIVATE xniff PkgConfig::CAPSTONE)
+target_link_libraries(xniff-cli PRIVATE xniff xpcdesert PkgConfig::CAPSTONE)
 target_include_directories(xniff-cli PRIVATE 
     ${PROJECT_SOURCE_DIR}/Sources/libxniff/include
-    ${PROJECT_SOURCE_DIR}/Sources/shared)
+    ${PROJECT_SOURCE_DIR}/Sources/shared
+    ${PROJECT_SOURCE_DIR}/Sources/xpcdesert)
 
 file(GLOB XNIFF_TEST_SOURCES CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/Sources/xniff-tests/*.c"
@@ -80,18 +81,20 @@ file(GLOB XNIFF_TEST_SOURCES CONFIGURE_DEPENDS
 add_executable(xniff-test ${XNIFF_TEST_SOURCES})
 target_link_libraries(xniff-test PRIVATE)
 
-# Optional: xpcdesert CLI (built if sources are present)
-file(GLOB XPCDESERT_SOURCES CONFIGURE_DEPENDS
-    "${PROJECT_SOURCE_DIR}/Sources/xpcdesert/*.c"
-    "${PROJECT_SOURCE_DIR}/Sources/xpcdesert/*.s"
-    "${PROJECT_SOURCE_DIR}/Sources/xpcdesert/*.S"
+# xpcdesert shared library + CLI
+set(XPCDESERT_DIR "${PROJECT_SOURCE_DIR}/Sources/xpcdesert")
+set(XPCDESERT_LIB_SOURCES
+    "${XPCDESERT_DIR}/xpcdesert.c"
+    "${XPCDESERT_DIR}/stream.c"
 )
+add_library(xpcdesert SHARED ${XPCDESERT_LIB_SOURCES})
+target_include_directories(xpcdesert PUBLIC ${XPCDESERT_DIR})
+set_target_properties(xpcdesert PROPERTIES OUTPUT_NAME xpcdesert)
 
-if(XPCDESERT_SOURCES)
-    add_executable(xpcdesert ${XPCDESERT_SOURCES})
-    target_include_directories(xpcdesert PRIVATE ${PROJECT_SOURCE_DIR}/Sources/libxniff/include)
-    target_link_libraries(xpcdesert PRIVATE xniff PkgConfig::CAPSTONE)
-endif()
+# CLI builds on the same sources as before but now links against the library
+add_executable(xpcdesert-cli "${XPCDESERT_DIR}/xpcdesert_cli.c")
+target_include_directories(xpcdesert-cli PRIVATE ${XPCDESERT_DIR})
+target_link_libraries(xpcdesert-cli PRIVATE xpcdesert xniff PkgConfig::CAPSTONE)
 
 # macOS codesigning with JIT entitlements (for testing self-modifying code)
 if(APPLE)
@@ -120,7 +123,12 @@ if(APPLE)
         if(TARGET xpcdesert)
             add_custom_command(TARGET xpcdesert POST_BUILD
                 COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xpcdesert>"
-                COMMENT "Codesigning xpcdesert with JIT entitlements")
+                COMMENT "Codesigning xpcdesert (lib) with JIT entitlements")
+        endif()
+        if(TARGET xpcdesert-cli)
+            add_custom_command(TARGET xpcdesert-cli POST_BUILD
+                COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xpcdesert-cli>"
+                COMMENT "Codesigning xpcdesert-cli with JIT entitlements")
         endif()
     else()
         message(WARNING "macos.entitlements.plist not found; binaries will not be codesigned.")

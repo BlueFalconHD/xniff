@@ -30,6 +30,8 @@
 
 // New combined workflow command
 #include "sniff_xpc_cmd.h"
+// XPC wire parser (shared library)
+#include "../xpcdesert/xpcdesert.h"
 
 static int attach_and_get_task(pid_t pid, mach_port_t *out_task) {
     // Attempt to get the task port first; if allowed, we can avoid ptrace.
@@ -380,7 +382,9 @@ static void print_event(int kind, const xniff_ipc_mach_payload_t *pl, const uint
     unsigned opt32 = pl->option_lo;
     unsigned opt_hi = pl->option_hi;
     unsigned bits = hdr ? (unsigned)hdr->msgh_bits : 0;
-    printf("[%s][+%0.6fs] %s: api=%u dir=%u id=%d size=%u copy=%u bits=0x%08x addr=0x%llx opt=0x%08x%08x ret=0x%llx desc=%u prio=%u timeout=%llu\n",
+    mach_port_t remote = hdr ? hdr->msgh_remote_port : MACH_PORT_NULL;
+    mach_port_t local  = hdr ? hdr->msgh_local_port  : MACH_PORT_NULL;
+    printf("[%s][+%0.6fs] %s: api=%u dir=%u id=%d size=%u copy=%u bits=0x%08x addr=0x%llx opt=0x%08x%08x ret=0x%llx desc=%u prio=%u timeout=%llu remote=0x%08x local=0x%08x\n",
            tbuf, mono_s, kstr,
            pl->api, pl->direction,
            hdr ? hdr->msgh_id : -1,
@@ -389,7 +393,8 @@ static void print_event(int kind, const xniff_ipc_mach_payload_t *pl, const uint
            (unsigned long long)pl->msg_addr,
            opt_hi, opt32,
            (unsigned long long)pl->ret_value,
-           pl->desc_count, pl->priority, (unsigned long long)pl->timeout);
+           pl->desc_count, pl->priority, (unsigned long long)pl->timeout,
+           remote, local);
 
     // Optionally, print a short hexdump of the first 64 bytes of the message
     size_t dump_len = msg_len < 64 ? msg_len : 64;
@@ -398,6 +403,23 @@ static void print_event(int kind, const xniff_ipc_mach_payload_t *pl, const uint
         printf("  msg[%zu]: ", dump_len);
         for (size_t i = 0; i < dump_len; i++) printf("%02x", p[i]);
         printf("\n");
+    }
+
+    // Try to detect and pretty-print an inline XPC payload using shared lib
+    if (msg_bytes && msg_len >= 16) {
+        size_t xoff = 0;
+        if (xpcd_find_payload(msg_bytes, msg_len, 512, &xoff) == 0) {
+            xpcd_object_t *root = xpcd_parse(msg_bytes + xoff, msg_len - xoff);
+            if (root) {
+                char *pretty = xpcd_format(root);
+                if (pretty) {
+                    printf("  xpc: offset=+%zu\n", xoff);
+                    printf("%s\n", pretty);
+                    free(pretty);
+                }
+                xpcd_free(root);
+            }
+        }
     }
 }
 
