@@ -1,14 +1,13 @@
 #include <xniff/macho.h>
 
-#if defined(__APPLE__)
-  #include <mach/task_info.h>
-  #include <mach-o/loader.h>
-  #include <mach-o/nlist.h>
-  #include <mach-o/dyld_images.h>
-  #include <stdlib.h>
-  #include <string.h>
-  #include <stdio.h>
-  #include <limits.h>
+#include <limits.h>
+#include <mach-o/dyld_images.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <mach/task_info.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 // Debug logging (enable via XNIFF_DEBUG=1)
 static int xniff_debug_enabled(void) {
@@ -651,7 +650,6 @@ int xniff_find_symbol_in_task(mach_port_t task, const char *symbol, mach_vm_addr
     return rc;
 }
 
-#include <stdio.h>
 int xniff_find_symbol_in_image_path_contains(mach_port_t task,
                                             const char *path_substring,
                                             const char *symbol,
@@ -688,11 +686,3 @@ int xniff_find_symbol_in_image_exact_path(mach_port_t task,
     }
     free(arr); return rc;
 }
-#else
-int xniff_find_symbol_in_main_image(mach_port_t task, const char *symbol, mach_vm_address_t *out_addr) {
-    (void)task; (void)symbol; (void)out_addr; return -1;
-}
-int xniff_find_symbol_in_task(mach_port_t task, const char *symbol, mach_vm_address_t *out_addr) {
-    (void)task; (void)symbol; (void)out_addr; return -1;
-}
-#endif

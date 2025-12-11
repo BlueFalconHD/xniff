@@ -10,15 +10,8 @@ int prepare_protections_for_patching_task(mach_port_t task, mach_vm_address_t ad
 int restore_protections_after_patching_task(mach_port_t task, mach_vm_address_t address, size_t size);
 
 
-/*
- * Determines whether an instruction contains PC-relative
- * or other non-copyable elements which will break if we
- * try to copy it before patching.
- *
- * These include:
- * - PC relative access/store/branch
- * - Branches
- */
+// Returns false for instructions that rely on PC-relative state or branch semantics.
+// Prevents copying instructions that would misbehave once relocated.
 bool is_instruction_copyable(const cs_insn *insn) {
     // ARM64: non-copyable if instruction uses PC-relative addressing or is a branch/call/ret.
     if (!insn) {
@@ -71,17 +64,9 @@ bool is_instruction_copyable(const cs_insn *insn) {
     return true;
 };
 
-/*
- * Copies copyable instructions until the
- * limit or a non-copyable instruction is found.
- * Returns the number of bytes copied.
- *
- * If you already have a capstone handle,
- * you can pass it in via 'handle', otherwise
- * pass NULL and one will be created internally.
- *
- * Use to copy a prologue (roughly) to a trampoline.
- */
+// Copies instructions until the limit is hit or a non-copyable instruction appears.
+// Returns the number of bytes copied and can reuse a caller provided Capstone handle.
+// Handy for lifting a prologue into a trampoline buffer.
 int copy_instructions(uint8_t *dst, const uint8_t *src_fun, size_t limit, csh handle) {
     csh local_handle = handle;
     bool created_handle = false;
@@ -134,40 +119,24 @@ int copy_instructions(uint8_t *dst, const uint8_t *src_fun, size_t limit, csh ha
 };
 
 
-/*
- * This is the default branch target for patched functions.
- * It does nothing and returns immediately.
- */
+// Default branch target for patched functions; acts as a safe no-op.
 __attribute__((used, noinline)) void dummy_patch_hook(void) {
     return;
 }
 
-/*
- * This is the dummy return target for patched functions.
- * If the patch fails, execution might reach here, where
- * an error will be logged and the process will loop forever.
- */
+// Dummy return target used if a patch fails and execution falls through.
+// Logs the failure and then parks the thread forever.
 __attribute__((used, noinline, noreturn)) void dummy_trampoline_return(void) {
     printf("Error: dummy_trampoline_return called! This indicates a patching error.\n");
 
-    for(;;) {
-    #if defined(__aarch64__) || defined(__arm64__)
+    for (;;) {
         __asm__ volatile ("wfe");
-    #else
-        // On non-ARM targets, yield without special instructions
-        usleep(1000);
-    #endif
     }
 }
 
-/*
- * Assembles the trampoline starting at some address
- * (should be instruction aligned after the copied prologue).
- *
- * Copies the assembly template from tramp_template.S into tramp_base,
- * then patches its ADRP/ADD pairs to target the provided hook and return
- * addresses.
- */
+// Builds a trampoline directly in the provided buffer after the copied prologue.
+// Copies the template bytes and patches the ADRP/ADD pairs to point at the hook,
+// the resume address, and any optional reload target.
 void assemble_trampoline_at(uint8_t *tramp_base, uint64_t hook_address, uint64_t return_address,
                             int reload_reg, uint64_t reload_target) {
 
@@ -213,20 +182,8 @@ void assemble_trampoline_at(uint8_t *tramp_base, uint64_t hook_address, uint64_t
     __builtin___clear_cache((char *)tramp_base, (char *)tramp_base + tmpl_size);
 }
 
-/*
- * Assembles the trampoline into a local buffer, but computes ADRP immediates
- * relative to the remote PC where it will execute.
- *
- * This is required for remote patching: ADRP encodes the page delta relative
- * to the instruction's PC. If we assemble using a local buffer address as the
- * PC, the encoded immediates will be wrong when executed in the target process.
- *
- * Parameters:
- *  - tramp_local_base: start of the local buffer where the trampoline bytes are written
- *  - tramp_remote_base: remote address where tramp_local_base[0] will reside in the target
- *  - hook_address: absolute address of the hook function in the target
- *  - return_address: absolute address in the target where we resume execution
- */
+// Builds a trampoline in a local buffer while calculating ADRP immediates as if it ran remotely.
+// Needed for remote patching because ADRP encodes deltas from the instruction's PC.
 static void assemble_trampoline_at_with_remote_pc(uint8_t *tramp_local_base,
                                                   uint64_t tramp_remote_base,
                                                   uint64_t hook_address,
@@ -462,12 +419,8 @@ int patch_function_with_exit_trampoline_task(mach_port_t task,
     return prologue_bytes;
 }
 
-/*
- * Extracts the prologue from a function, copies it to a trampoline,
- * and patches the original function to jump to the trampoline.
- *
- * Returns bytes copied to the trampoline, or -1 on error.
- */
+// Copies a function prologue into the given trampoline buffer and patches the entry.
+// Returns the number of bytes relocated or -1 on failure.
 int patch_function_with_trampoline(void *target_function, void *trampoline_buffer, void *hook_function) {
 
     // first, copy the prologue
@@ -515,9 +468,7 @@ int patch_function_with_trampoline(void *target_function, void *trampoline_buffe
     return copied_bytes;
 }
 
-/*
- * Internal helper to modify protections with control over set_maximum (task or self).
- */
+// Internal helper that exposes vm_protect with explicit set_max control for any task.
 kern_return_t vm_protect_pages_task(mach_port_t task, mach_vm_address_t addr, size_t size, boolean_t set_max, vm_prot_t new_prot) {
     mach_vm_size_t sz = (mach_vm_size_t)size;
     mach_vm_address_t page_start = PAGE_RANGE_START(addr);
@@ -531,10 +482,7 @@ kern_return_t vm_protect_pages(void *address, size_t size, boolean_t set_max, vm
     return vm_protect_pages_task(task, addr, size, set_max, new_prot);
 }
 
-/*
- * Modifies the page protections for a memory region.
- * (Compat wrapper: does not change maximum protections.)
- */
+// Convenience wrapper that switches current protections without touching max permissions.
 kern_return_t modify_page_protections(void *address, size_t size, vm_prot_t new_prot) {
     return vm_protect_pages(address, size, FALSE, new_prot);
 }
@@ -543,11 +491,7 @@ kern_return_t modify_page_protections_task(mach_port_t task, mach_vm_address_t a
     return vm_protect_pages_task(task, address, size, FALSE, new_prot);
 }
 
-/*
- * Sets up page protections for patching instructions.
- * Given a starting address and a number of bytes, makes
- * the memory region readable and writable.
- */
+// Expands protections so the target range becomes writable for patching.
 int prepare_protections_for_patching(void *address, size_t size) {
     // On Apple platforms, W^X forbids simultaneous W+X. Make the page RW (not RXW),
     // but first widen the maximum protections so WRITE is allowed on text pages.
@@ -580,11 +524,7 @@ int prepare_protections_for_patching_task(mach_port_t task, mach_vm_address_t ad
     return 0;
 }
 
-/*
- * Restores page protections after patching.
- * Given a starting address and a number of bytes, makes
- * the memory region read and execute only.
- */
+// Restores patched code back to RX once writing is complete.
 int restore_protections_after_patching(void *address, size_t size) {
     kern_return_t kr = modify_page_protections(address, size, VM_PROT_READ | VM_PROT_EXECUTE);
     if (kr != KERN_SUCCESS) {
@@ -620,7 +560,7 @@ size_t trampoline_recommended_slot_size(void) {
 }
 
 static inline void jit_write_allow(void) {
-#if defined(__APPLE__) && defined(MAP_JIT)
+#if defined(MAP_JIT)
     pthread_jit_write_protect_np(0);
 #else
     (void)0;
@@ -628,7 +568,7 @@ static inline void jit_write_allow(void) {
 }
 
 static inline void jit_write_deny(void) {
-#if defined(__APPLE__) && defined(MAP_JIT)
+#if defined(MAP_JIT)
     pthread_jit_write_protect_np(1);
 #else
     (void)0;
