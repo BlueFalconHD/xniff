@@ -27,6 +27,7 @@
 
 static int g_ipc_fd = -1; // lazily connect per-process
 static uint64_t g_next_connect_ns = 0;
+static pthread_mutex_t g_ipc_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t now_monotonic_ns(void) {
     struct timespec ts;
@@ -34,23 +35,19 @@ static uint64_t now_monotonic_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-static void ipc_drop_connection(void) {
-    int fd = g_ipc_fd;
-    if (fd == -1) return;
-    if (__sync_bool_compare_and_swap(&g_ipc_fd, fd, -1)) {
-        close(fd);
-    }
+static void ipc_drop_connection_locked(void) {
+    if (g_ipc_fd == -1) return;
+    close(g_ipc_fd);
+    g_ipc_fd = -1;
 }
 
-static int ensure_ipc_fd(void) {
+static int ensure_ipc_fd_locked(void) {
     if (g_ipc_fd != -1) return g_ipc_fd;
     uint64_t now = now_monotonic_ns();
     if (now && now < g_next_connect_ns) return -1;
     int fd = xniff_ipc_client_connect(getpid());
     if (fd >= 0) {
-        if (!__sync_bool_compare_and_swap(&g_ipc_fd, -1, fd)) {
-            close(fd);
-        }
+        g_ipc_fd = fd;
     } else {
         // Avoid hammering connect() if the listener is gone.
         if (now) g_next_connect_ns = now + 250ull * 1000ull * 1000ull;
@@ -87,7 +84,8 @@ static size_t attachments_size_for_msg(const mach_msg_header_t *msg) {
 static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
                               const mach_msg_header_t *msg) {
     if (!msg || !pl_in) return;
-    if (ensure_ipc_fd() < 0) { return; }
+    pthread_mutex_lock(&g_ipc_lock);
+    if (ensure_ipc_fd_locked() < 0) { pthread_mutex_unlock(&g_ipc_lock); return; }
 
     uint32_t copy_len = msg->msgh_size;
     const uint8_t *base = (const uint8_t *)msg;
@@ -109,9 +107,9 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
     pl.msg_addr = (uint64_t)(uintptr_t)msg;
 
     // Send header, payload, and inline bytes (blocking to ensure ordering)
-    if (xniff_ipc_send_all(g_ipc_fd, &hdr, sizeof(hdr)) != 0) { ipc_drop_connection(); return; }
-    if (xniff_ipc_send_all(g_ipc_fd, &pl, sizeof(pl)) != 0)  { ipc_drop_connection(); return; }
-    if (xniff_ipc_send_all(g_ipc_fd, base, copy_len) != 0)   { ipc_drop_connection(); return; }
+    if (xniff_ipc_send_all(g_ipc_fd, &hdr, sizeof(hdr)) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
+    if (xniff_ipc_send_all(g_ipc_fd, &pl, sizeof(pl)) != 0)  { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
+    if (xniff_ipc_send_all(g_ipc_fd, base, copy_len) != 0)   { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
 
     // Send attachments
     if (msg->msgh_bits & MACH_MSGH_BITS_COMPLEX) {
@@ -129,10 +127,10 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
                     md.flags = (ool->deallocate ? 1u : 0u) | (ool->copy ? 2u : 0u);
                     md.address = (uint64_t)(uintptr_t)ool->address;
                     md.size = (uint32_t)ool->size;
-                    if (xniff_ipc_send_all(g_ipc_fd, &h, sizeof(h)) != 0)  { ipc_drop_connection(); return; }
-                    if (xniff_ipc_send_all(g_ipc_fd, &md, sizeof(md)) != 0) { ipc_drop_connection(); return; }
+                    if (xniff_ipc_send_all(g_ipc_fd, &h, sizeof(h)) != 0)  { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
+                    if (xniff_ipc_send_all(g_ipc_fd, &md, sizeof(md)) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
                     if (ool->address && ool->size) {
-                        if (xniff_ipc_send_all(g_ipc_fd, ool->address, ool->size) != 0) { ipc_drop_connection(); return; }
+                        if (xniff_ipc_send_all(g_ipc_fd, ool->address, ool->size) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
                     }
                 } else if (t == MACH_MSG_OOL_PORTS_DESCRIPTOR) {
                     const mach_msg_ool_ports_descriptor_t *op = &desc->ool_ports;
@@ -143,16 +141,17 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
                     md.count = (uint32_t)op->count;
                     md.address = (uint64_t)(uintptr_t)op->address;
                     md.elem_size = (uint32_t)sizeof(mach_port_t);
-                    if (xniff_ipc_send_all(g_ipc_fd, &h, sizeof(h)) != 0)  { ipc_drop_connection(); return; }
-                    if (xniff_ipc_send_all(g_ipc_fd, &md, sizeof(md)) != 0) { ipc_drop_connection(); return; }
+                    if (xniff_ipc_send_all(g_ipc_fd, &h, sizeof(h)) != 0)  { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
+                    if (xniff_ipc_send_all(g_ipc_fd, &md, sizeof(md)) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
                     if (op->address && ports_bytes) {
-                        if (xniff_ipc_send_all(g_ipc_fd, op->address, ports_bytes) != 0) { ipc_drop_connection(); return; }
+                        if (xniff_ipc_send_all(g_ipc_fd, op->address, ports_bytes) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
                     }
                 }
             }
             (void)0;
         }
     }
+    pthread_mutex_unlock(&g_ipc_lock);
 }
 
 
@@ -346,15 +345,16 @@ void xniff_msg2_exit_hook(uint64_t ret, xniff_ctx_frame_t *ctx)
     xniff_parse_msg2_args(
         data, option64, bits_send, r_l, v_id, d_name, r_p, timeout, &p);
 
-    if ((p.option64 & MACH64_RCV_MSG) == 0) {
-        return;
-    }
-
-    if (!p.rcv_msg) {
-        return;
-    }
-
-    if (ret != MACH_MSG_SUCCESS) {
+    mach_msg_header_t *out_msg = NULL;
+    if ((p.option64 & MACH64_RCV_MSG) && p.rcv_msg && ret == MACH_MSG_SUCCESS) {
+        // Successful receive: dump the response buffer.
+        out_msg = p.rcv_msg;
+    } else if (p.send_msg) {
+        // No receive (or receive failed): still emit an exit event so the listener can correlate.
+        out_msg = p.send_msg;
+    } else if (p.rcv_msg) {
+        out_msg = p.rcv_msg;
+    } else {
         return;
     }
 
@@ -369,5 +369,5 @@ void xniff_msg2_exit_hook(uint64_t ret, xniff_ctx_frame_t *ctx)
     pl.aux_addr = (uint64_t)(uintptr_t)p.aux;
     pl.ret_value = ret;
     for (int i = 0; i < 8; i++) pl.args[i] = ctx->x[i];
-    ipc_send_msg_full(XNIFF_EVT_MACH2_EXIT, &pl, p.rcv_msg);
+    ipc_send_msg_full(XNIFF_EVT_MACH2_EXIT, &pl, out_msg);
 }

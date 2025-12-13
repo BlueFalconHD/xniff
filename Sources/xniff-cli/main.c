@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 
 #include "../shared/xniff_ipc.h"
+#include "../shared/mach_private.h"
 
 #include <xniff/patch.h>
 #include <xniff/macho.h>
@@ -33,17 +34,60 @@
 // XPC wire parser (shared library)
 #include "../xpcdesert/xpcdesert.h"
 
+typedef struct {
+    bool jsonl;
+    bool dump_files;
+    bool parse_xpc;
+    size_t hex_preview_len;
+} listener_opts_t;
+
+static listener_opts_t g_listener_opts = {
+    .jsonl = false,
+    .dump_files = true,
+    .parse_xpc = true,
+    .hex_preview_len = 64,
+};
+
+static FILE *xniff_diag_stream(void) {
+    return g_listener_opts.jsonl ? stderr : stdout;
+}
+
+#define XNIFF_DIAGF(...) fprintf(xniff_diag_stream(), __VA_ARGS__)
+
+static int parse_listener_flags(listener_opts_t *opts, int argc, char **argv, int start_idx) {
+    if (!opts) return -1;
+    for (int i = start_idx; i < argc; i++) {
+        const char *a = argv[i];
+        if (!a) continue;
+        if (strcmp(a, "--jsonl") == 0 || strcmp(a, "--format=jsonl") == 0) {
+            opts->jsonl = true;
+        } else if (strcmp(a, "--text") == 0 || strcmp(a, "--format=text") == 0) {
+            opts->jsonl = false;
+        } else if (strcmp(a, "--no-dump") == 0) {
+            opts->dump_files = false;
+        } else if (strcmp(a, "--no-xpc") == 0) {
+            opts->parse_xpc = false;
+        } else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
+            return 1;
+        } else {
+            fprintf(stderr, "unknown listen flag: %s\n", a);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int attach_and_get_task(pid_t pid, mach_port_t *out_task) {
     // Attempt to get the task port first; if allowed, we can avoid ptrace.
     mach_port_t task = MACH_PORT_NULL;
     kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
     if (kr == KERN_SUCCESS) {
-        printf("got task port for pid %d without attach\n", pid);
+        XNIFF_DIAGF("got task port for pid %d without attach\n", pid);
         *out_task = task;
         return 0;
     }
 
-    printf("attaching to pid %d\n", pid);
+    XNIFF_DIAGF("attaching to pid %d\n", pid);
     if (ptrace(PT_ATTACHEXC, pid, 0, 0) != 0) {
         perror("ptrace(PT_ATTACHEXC)");
         return -1;
@@ -61,7 +105,7 @@ static int attach_and_get_task(pid_t pid, mach_port_t *out_task) {
         (void)ptrace(PT_DETACH, pid, 0, 0);
         return -1;
     }
-    printf("getting task port for pid %d\n", pid);
+    XNIFF_DIAGF("getting task port for pid %d\n", pid);
     *out_task = task;
     return 0;
 }
@@ -106,7 +150,7 @@ static int patch_symbol_in_task(pid_t pid, const char *symbol_name) {
         return -1;
     }
 
-    printf("found hook at 0x%llx, target %s at 0x%llx\n",
+    XNIFF_DIAGF("found hook at 0x%llx, target %s at 0x%llx\n",
            (unsigned long long)hook_addr, symbol_name, (unsigned long long)target_addr);
 
     trampoline_bank_t bank;
@@ -130,7 +174,7 @@ static int patch_symbol_in_task(pid_t pid, const char *symbol_name) {
     }
         if (did_suspend) task_resume(task); detach_process(pid); return -1;
     }
-    printf("installed remote trampoline at slot %zu\n", idx);
+    XNIFF_DIAGF("installed remote trampoline at slot %zu\n", idx);
     // Provide helpful addresses for debugging in LLDB
     if (idx < bank.capacity) {
         trampoline_info_t *info = &bank.infos[idx];
@@ -139,17 +183,17 @@ static int patch_symbol_in_task(pid_t pid, const char *symbol_name) {
         uint64_t stub_entry = tramp_base + (uint64_t)XNIFF_TRAMPOLINE_PRELUDE_BYTES + (uint64_t)info->prologue_bytes;
         uint64_t after_restore_off = (uint64_t)(uintptr_t)(TRAMPOLINE_AFTER_RESTORE - TRAMPOLINE_START_AFTER_PROLOGUE);
         uint64_t stub_after_restore = stub_entry + after_restore_off;
-        printf("  trampoline slot @ 0x%llx, resume @ 0x%llx, hook @ 0x%llx\n",
+        XNIFF_DIAGF("  trampoline slot @ 0x%llx, resume @ 0x%llx, hook @ 0x%llx\n",
                (unsigned long long)tramp_base,
                (unsigned long long)resume_addr,
                (unsigned long long)hook_addr);
-        printf("  stub entry(after stolen) @ 0x%llx, stub after_restore @ 0x%llx\n",
+        XNIFF_DIAGF("  stub entry(after stolen) @ 0x%llx, stub after_restore @ 0x%llx\n",
                (unsigned long long)stub_entry,
                (unsigned long long)stub_after_restore);
-        printf("  lldb: command script import lldb/xniff_regcheck.py ; xniff-regcheck --entry 0x%llx --exit 0x%llx --once --stop-on-mismatch\n",
+        XNIFF_DIAGF("  lldb: command script import lldb/xniff_regcheck.py ; xniff-regcheck --entry 0x%llx --exit 0x%llx --once --stop-on-mismatch\n",
                (unsigned long long)stub_entry,
                (unsigned long long)stub_after_restore);
-        printf("  debug: set XNIFF_TRAMP_BRK=1 when running xniff-cli to write a BRK at stub entry\n");
+        XNIFF_DIAGF("  debug: set XNIFF_TRAMP_BRK=1 when running xniff-cli to write a BRK at stub entry\n");
     }
 
     // Keep remote trampoline mapping alive; free local bookkeeping only.
@@ -170,11 +214,16 @@ static void usage(const char *prog) {
     fprintf(stderr, "  %s <pid> [symbol]              Patch a function entry with trampoline.\n", prog);
     fprintf(stderr, "  %s hook-exit <pid> [symbol] [entry_hook] [exit_hook]\n", prog);
     fprintf(stderr, "  %s hook-xpc <pid> <hooks.dylib>  Inject hooks and patch mach_msg_overwrite + mach_msg2_internal.\n", prog);
-    fprintf(stderr, "  %s listen <pid>                 Listen for events from target via Unix socket.\n", prog);
-    fprintf(stderr, "  %s sniff-xpc <pid> <hooks.dylib> Start listener, inject hooks, and patch automatically.\n", prog);
+    fprintf(stderr, "  %s listen <pid> [flags]          Listen for events from target via Unix socket.\n", prog);
+    fprintf(stderr, "  %s sniff-xpc <pid> <hooks.dylib> [flags] Start listener, inject hooks, and patch automatically.\n", prog);
     fprintf(stderr, "\nNotes:\n");
     fprintf(stderr, "- For patching: if [symbol] is omitted, defaults to _mach_msg_overwrite.\n");
     fprintf(stderr, "- Provide Mach-O symbol (with or without leading underscore).\n");
+    fprintf(stderr, "\nListen flags:\n");
+    fprintf(stderr, "  --jsonl           Emit JSON Lines (one event per line)\n");
+    fprintf(stderr, "  --text            Human-readable output (default)\n");
+    fprintf(stderr, "  --no-dump         Do not write /tmp/xniff/<pid>/* files\n");
+    fprintf(stderr, "  --no-xpc          Disable XPC payload parsing/formatting\n");
 }
 
 // Forward declare subcommand implementation
@@ -187,19 +236,23 @@ int main(int argc, char **argv) {
 
     // Subcommand: listen <pid>
     if (strcmp(argv[1], "listen") == 0) {
-        if (argc != 3) { usage(argv[0]); return 2; }
+        if (argc < 3) { usage(argv[0]); return 2; }
         pid_t pid = (pid_t)strtol(argv[2], NULL, 10);
         if (pid <= 0) { usage(argv[0]); return 2; }
+        int prc = parse_listener_flags(&g_listener_opts, argc, argv, 3);
+        if (prc != 0) { usage(argv[0]); return prc > 0 ? 0 : 2; }
         int rc = cmd_listen(pid);
         return (rc == 0) ? 0 : 1;
     }
 
     // Subcommand: sniff-xpc <pid> <hooks.dylib>
     if (strcmp(argv[1], "sniff-xpc") == 0) {
-        if (argc != 4) { usage(argv[0]); return 2; }
+        if (argc < 4) { usage(argv[0]); return 2; }
         pid_t pid = (pid_t)strtol(argv[2], NULL, 10);
         if (pid <= 0) { usage(argv[0]); return 2; }
         const char *path = argv[3];
+        int prc = parse_listener_flags(&g_listener_opts, argc, argv, 4);
+        if (prc != 0) { usage(argv[0]); return prc > 0 ? 0 : 2; }
         int rc = cmd_sniff_xpc(pid, path);
         return (rc == 0) ? 0 : 1;
     }
@@ -288,7 +341,7 @@ static int cmd_hook_exit(pid_t pid, const char *symbol_name, const char *entry_s
         return -1;
     }
 
-    printf("found target %s at 0x%llx, entry_hook 0x%llx, exit_hook 0x%llx\n",
+    XNIFF_DIAGF("found target %s at 0x%llx, entry_hook 0x%llx, exit_hook 0x%llx\n",
            symbol_name, (unsigned long long)target_addr,
            (unsigned long long)entry_hook, (unsigned long long)exit_hook);
 
@@ -306,19 +359,19 @@ static int cmd_hook_exit(pid_t pid, const char *symbol_name, const char *entry_s
         if (bank.is_remote) { if (bank.infos) free(bank.infos); memset(&bank, 0, sizeof(bank)); }
         if (did_suspend) task_resume(task); detach_process(pid); return -1;
     }
-    printf("installed entry+exit trampoline at slot %zu\n", idx);
+    XNIFF_DIAGF("installed entry+exit trampoline at slot %zu\n", idx);
     if (idx < bank.capacity) {
         trampoline_info_t *info = &bank.infos[idx];
         uint64_t resume_addr = (uint64_t)target_addr + (uint64_t)info->prologue_bytes;
         // Compute exit stub address to help set LLDB breakpoints
         size_t ex_off = (size_t)(XTRAMP_EXIT_STUB - XTRAMP_START_AFTER_PROLOGUE);
         uint64_t exit_stub_addr = (uint64_t)(uintptr_t)info->trampoline + (uint64_t)info->prologue_bytes + (uint64_t)ex_off;
-        printf("  trampoline slot @ 0x%llx, resume @ 0x%llx, exit_stub @ 0x%llx\n",
+        XNIFF_DIAGF("  trampoline slot @ 0x%llx, resume @ 0x%llx, exit_stub @ 0x%llx\n",
                (unsigned long long)(uintptr_t)info->trampoline,
                (unsigned long long)resume_addr,
                (unsigned long long)exit_stub_addr);
         if (info->ctx_base) {
-            printf("  ctx_base @ 0x%llx size %zu bytes\n",
+            XNIFF_DIAGF("  ctx_base @ 0x%llx size %zu bytes\n",
                    (unsigned long long)(uintptr_t)info->ctx_base, info->ctx_size);
         }
     }
@@ -336,7 +389,7 @@ static ssize_t read_fully(int fd, void *buf, size_t len) {
     size_t left = len;
     while (left > 0) {
         ssize_t n = recv(fd, p, left, 0);
-        if (n == 0) return -1; // EOF
+        if (n == 0) { errno = 0; return -1; } // EOF
         if (n < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -345,6 +398,28 @@ static ssize_t read_fully(int fd, void *buf, size_t len) {
         left -= (size_t)n;
     }
     return (ssize_t)len;
+}
+
+static void diag_dump_header(const char *why, const xniff_ipc_hdr_t *hdr) {
+    if (!hdr) return;
+    const uint8_t *b = (const uint8_t *)hdr;
+    char hex[sizeof(*hdr) * 2 + 1];
+    for (size_t i = 0; i < sizeof(*hdr); i++) snprintf(&hex[i * 2], 3, "%02x", b[i]);
+    XNIFF_DIAGF("%s: raw_hdr=%s\n", why ? why : "header", hex);
+    XNIFF_DIAGF("%s: magic=0x%08x (want 0x%08x) ver=%u (want %u) kind=%u pid=%u tid_low=%u payload_len=%u\n",
+                why ? why : "header",
+                hdr->magic, XNIFF_IPC_MAGIC,
+                (unsigned)hdr->version, (unsigned)XNIFF_IPC_VERSION,
+                (unsigned)hdr->kind, hdr->pid, hdr->tid_low, hdr->payload_len);
+}
+
+static void diag_disconnect(const char *where) {
+    int e = errno;
+    if (e == 0) {
+        XNIFF_DIAGF("%s: client disconnected (EOF)\n", where ? where : "listen");
+    } else {
+        XNIFF_DIAGF("%s: client disconnected (errno=%d: %s)\n", where ? where : "listen", e, strerror(e));
+    }
 }
 
 static void format_time(char *buf, size_t sz, double *mono_s_out) {
@@ -379,6 +454,231 @@ static const char* kind_to_tag(int kind) {
     return "unknown";
 }
 
+typedef struct pending_call {
+    uint32_t pid;
+    uint32_t tid_low;
+    uint32_t api;
+    uint64_t call_id;
+    unsigned long long entry_event_id;
+    struct pending_call *next;
+} pending_call_t;
+
+static pending_call_t *g_pending_calls = NULL;
+static uint64_t g_next_call_id = 1;
+
+static void pending_calls_clear_pid(uint32_t pid) {
+    pending_call_t **pp = &g_pending_calls;
+    while (*pp) {
+        pending_call_t *c = *pp;
+        if (c->pid == pid) {
+            *pp = c->next;
+            free(c);
+            continue;
+        }
+        pp = &c->next;
+    }
+}
+
+static void pending_calls_drop_one(uint32_t pid, uint32_t tid_low, uint32_t api) {
+    pending_call_t **pp = &g_pending_calls;
+    while (*pp) {
+        pending_call_t *c = *pp;
+        if (c->pid == pid && c->tid_low == tid_low && c->api == api) {
+            *pp = c->next;
+            free(c);
+            return;
+        }
+        pp = &c->next;
+    }
+}
+
+static uint64_t pending_calls_push(uint32_t pid, uint32_t tid_low, uint32_t api, unsigned long long entry_event_id) {
+    pending_calls_drop_one(pid, tid_low, api); // avoid unbounded growth if an exit event is dropped
+    pending_call_t *c = (pending_call_t *)calloc(1, sizeof(*c));
+    if (!c) return 0;
+    c->pid = pid;
+    c->tid_low = tid_low;
+    c->api = api;
+    c->call_id = g_next_call_id++;
+    if (c->call_id == 0) c->call_id = g_next_call_id++;
+    c->entry_event_id = entry_event_id;
+    c->next = g_pending_calls;
+    g_pending_calls = c;
+    return c->call_id;
+}
+
+static bool pending_calls_pop(uint32_t pid, uint32_t tid_low, uint32_t api, uint64_t *call_id_out, unsigned long long *entry_event_id_out) {
+    pending_call_t **pp = &g_pending_calls;
+    while (*pp) {
+        pending_call_t *c = *pp;
+        if (c->pid == pid && c->tid_low == tid_low && c->api == api) {
+            *pp = c->next;
+            if (call_id_out) *call_id_out = c->call_id;
+            if (entry_event_id_out) *entry_event_id_out = c->entry_event_id;
+            free(c);
+            return true;
+        }
+        pp = &c->next;
+    }
+    return false;
+}
+
+static void json_write_escaped(FILE *out, const char *s) {
+    fputc('"', out);
+    if (s) {
+        for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+            unsigned char c = *p;
+            switch (c) {
+                case '"':  fputs("\\\"", out); break;
+                case '\\': fputs("\\\\", out); break;
+                case '\b': fputs("\\b", out); break;
+                case '\f': fputs("\\f", out); break;
+                case '\n': fputs("\\n", out); break;
+                case '\r': fputs("\\r", out); break;
+                case '\t': fputs("\\t", out); break;
+                default:
+                    if (c < 0x20) fprintf(out, "\\u%04x", (unsigned)c);
+                    else fputc((int)c, out);
+                    break;
+            }
+        }
+    }
+    fputc('"', out);
+}
+
+static void json_write_hex(FILE *out, const uint8_t *p, size_t len) {
+    fputc('"', out);
+    for (size_t i = 0; i < len; i++) fprintf(out, "%02x", p[i]);
+    fputc('"', out);
+}
+
+static void json_write_hex_u64(FILE *out, uint64_t v) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)v);
+    json_write_escaped(out, buf);
+}
+
+typedef struct {
+    uint16_t type;
+    uint32_t index;
+    uint64_t address;
+    uint32_t size_bytes;
+    uint32_t count;
+    uint32_t elem_size;
+    char path[600];
+} xniff_att_meta_t;
+
+static void jsonl_print_event(
+    unsigned long long event_id,
+    uint64_t call_id,
+    unsigned long long entry_event_id,
+    const xniff_ipc_hdr_t *ihdr,
+    const xniff_ipc_mach_payload_t *pl,
+    const uint8_t *msg_bytes,
+    size_t msg_len,
+    const char *tbuf,
+    double mono_s,
+    const char *msg_path,
+    const xniff_att_meta_t *atts,
+    size_t att_count)
+{
+    const mach_msg_header_t *mh = NULL;
+    if (msg_bytes && msg_len >= sizeof(mach_msg_header_t)) mh = (const mach_msg_header_t *)msg_bytes;
+
+    uint64_t option64 = ((uint64_t)pl->option_hi << 32) | (uint64_t)pl->option_lo;
+    bool is_send = false, is_recv = false;
+    if (pl->api == XNIFF_API_MACH_MSG) {
+        is_send = (pl->option_lo & MACH_SEND_MSG) != 0;
+        is_recv = (pl->option_lo & MACH_RCV_MSG) != 0;
+    } else {
+        is_send = (option64 & MACH64_SEND_MSG) != 0;
+        is_recv = (option64 & MACH64_RCV_MSG) != 0;
+    }
+
+    size_t xpc_offset = 0;
+    char *xpc_pretty = NULL;
+    if (g_listener_opts.parse_xpc && msg_bytes && msg_len >= 16) {
+        if (xpcd_find_payload(msg_bytes, msg_len, 512, &xpc_offset) == 0) {
+            xpcd_object_t *root = xpcd_parse(msg_bytes + xpc_offset, msg_len - xpc_offset);
+            if (root) {
+                xpc_pretty = xpcd_format(root);
+                xpcd_free(root);
+            }
+        }
+    }
+
+    fputc('{', stdout);
+    fputs("\"schema\":\"xniff.event.v1\",", stdout);
+    fputs("\"event_id\":", stdout); fprintf(stdout, "%llu,", event_id);
+    fputs("\"call_id\":", stdout); fprintf(stdout, "%llu,", (unsigned long long)call_id);
+    fputs("\"entry_event_id\":", stdout); fprintf(stdout, "%llu,", entry_event_id);
+    fputs("\"kind\":", stdout); json_write_escaped(stdout, kind_to_tag((int)ihdr->kind)); fputc(',', stdout);
+    fputs("\"pid\":", stdout); fprintf(stdout, "%u,", ihdr->pid);
+    fputs("\"tid_low\":", stdout); fprintf(stdout, "%u,", ihdr->tid_low);
+    fputs("\"ts_real\":", stdout); json_write_escaped(stdout, tbuf); fputc(',', stdout);
+    fputs("\"ts_mono_s\":", stdout); fprintf(stdout, "%.9f,", mono_s);
+
+    fputs("\"mach\":{", stdout);
+    fputs("\"api\":", stdout); fprintf(stdout, "%u,", pl->api);
+    fputs("\"direction\":", stdout); fprintf(stdout, "%u,", pl->direction);
+    fputs("\"is_send\":", stdout); fputs(is_send ? "true," : "false,", stdout);
+    fputs("\"is_recv\":", stdout); fputs(is_recv ? "true," : "false,", stdout);
+    fputs("\"msgh_id\":", stdout); fprintf(stdout, "%d,", mh ? mh->msgh_id : -1);
+    fputs("\"msgh_bits\":", stdout); fprintf(stdout, "%u,", mh ? (unsigned)mh->msgh_bits : 0u);
+    fputs("\"remote\":", stdout); fprintf(stdout, "%u,", mh ? (unsigned)mh->msgh_remote_port : 0u);
+    fputs("\"local\":", stdout); fprintf(stdout, "%u,", mh ? (unsigned)mh->msgh_local_port : 0u);
+    fputs("\"msg_addr\":", stdout); json_write_hex_u64(stdout, pl->msg_addr); fputc(',', stdout);
+    fputs("\"aux_addr\":", stdout); json_write_hex_u64(stdout, pl->aux_addr); fputc(',', stdout);
+    fputs("\"option64\":", stdout); json_write_hex_u64(stdout, option64); fputc(',', stdout);
+    fputs("\"ret\":", stdout); fprintf(stdout, "%llu,", (unsigned long long)pl->ret_value);
+    fputs("\"priority\":", stdout); fprintf(stdout, "%u,", pl->priority);
+    fputs("\"timeout\":", stdout); fprintf(stdout, "%llu,", (unsigned long long)pl->timeout);
+    fputs("\"msgh_size\":", stdout); fprintf(stdout, "%u,", pl->msgh_size);
+    fputs("\"copy_len\":", stdout); fprintf(stdout, "%u,", pl->copy_len);
+    fputs("\"msg_len\":", stdout); fprintf(stdout, "%zu", msg_len);
+    fputs("},", stdout);
+
+    fputs("\"dump\":{", stdout);
+    fputs("\"msg_path\":", stdout); if (msg_path) json_write_escaped(stdout, msg_path); else fputs("null", stdout);
+    fputs(",\"msg_hex\":", stdout);
+    size_t preview = g_listener_opts.hex_preview_len;
+    if (preview > msg_len) preview = msg_len;
+    if (msg_bytes && preview) json_write_hex(stdout, msg_bytes, preview);
+    else fputs("\"\"", stdout);
+    fputs(",\"attachments\":[", stdout);
+    for (size_t i = 0; i < att_count; i++) {
+        if (i) fputc(',', stdout);
+        fputc('{', stdout);
+        fputs("\"type\":", stdout);
+        if (atts[i].type == XNIFF_TLV_OOL_DATA) json_write_escaped(stdout, "ool_data");
+        else if (atts[i].type == XNIFF_TLV_OOL_PORTS) json_write_escaped(stdout, "ool_ports");
+        else json_write_escaped(stdout, "unknown");
+        fputs(",\"index\":", stdout); fprintf(stdout, "%u", atts[i].index);
+        fputs(",\"address\":", stdout); json_write_hex_u64(stdout, atts[i].address);
+        if (atts[i].type == XNIFF_TLV_OOL_DATA) {
+            fputs(",\"size\":", stdout); fprintf(stdout, "%u", atts[i].size_bytes);
+        } else if (atts[i].type == XNIFF_TLV_OOL_PORTS) {
+            fputs(",\"count\":", stdout); fprintf(stdout, "%u", atts[i].count);
+            fputs(",\"elem_size\":", stdout); fprintf(stdout, "%u", atts[i].elem_size);
+            fputs(",\"size\":", stdout); fprintf(stdout, "%u", atts[i].size_bytes);
+        }
+        fputs(",\"path\":", stdout); json_write_escaped(stdout, atts[i].path);
+        fputc('}', stdout);
+    }
+    fputs("]}", stdout);
+
+    if (xpc_pretty) {
+        fputs(",\"xpc\":{", stdout);
+        fputs("\"offset\":", stdout); fprintf(stdout, "%zu,", xpc_offset);
+        fputs("\"pretty\":", stdout); json_write_escaped(stdout, xpc_pretty);
+        fputc('}', stdout);
+    }
+
+    fputs("}\n", stdout);
+    fflush(stdout);
+    if (xpc_pretty) free(xpc_pretty);
+}
+
 static void print_event(int kind, const xniff_ipc_mach_payload_t *pl, const uint8_t *msg_bytes, size_t msg_len) {
     const mach_msg_header_t *hdr = (const mach_msg_header_t *)msg_bytes;
     const char *kstr = "?";
@@ -408,7 +708,7 @@ static void print_event(int kind, const xniff_ipc_mach_payload_t *pl, const uint
            remote, local);
 
     // Optionally, print a short hexdump of the first 64 bytes of the message
-    size_t dump_len = msg_len < 64 ? msg_len : 64;
+    size_t dump_len = msg_len < g_listener_opts.hex_preview_len ? msg_len : g_listener_opts.hex_preview_len;
     if (hdr && dump_len) {
         const uint8_t *p = (const uint8_t *)hdr;
         printf("  msg[%zu]: ", dump_len);
@@ -417,7 +717,7 @@ static void print_event(int kind, const xniff_ipc_mach_payload_t *pl, const uint
     }
 
     // Try to detect and pretty-print an inline XPC payload using shared lib
-    if (msg_bytes && msg_len >= 16) {
+    if (g_listener_opts.parse_xpc && msg_bytes && msg_len >= 16) {
         size_t xoff = 0;
         if (xpcd_find_payload(msg_bytes, msg_len, 512, &xoff) == 0) {
             xpcd_object_t *root = xpcd_parse(msg_bytes + xoff, msg_len - xoff);
@@ -438,62 +738,153 @@ static int cmd_listen(pid_t pid) {
     int sfd = xniff_ipc_server_listen(pid);
     if (sfd < 0) { perror("listen"); return -1; }
     char path[108]; xniff_ipc_path_for_pid(pid, path, sizeof(path));
-    printf("listening on %s...\n", path);
+    XNIFF_DIAGF("listening on %s...\n", path);
 
     // Prepare dump directory for this pid
     char base_dir[256];
     snprintf(base_dir, sizeof(base_dir), "/tmp/xniff/%d", (int)pid);
-    mkdir("/tmp/xniff", 0755);
-    mkdir(base_dir, 0755);
+    if (g_listener_opts.dump_files) {
+        mkdir("/tmp/xniff", 0755);
+        mkdir(base_dir, 0755);
+    }
     unsigned long long evt_idx = 0;
 
     for (;;) {
         int cfd = xniff_ipc_accept(sfd);
         if (cfd < 0) { if (errno == EINTR) continue; perror("accept"); return -1; }
-        printf("client connected\n");
+        XNIFF_DIAGF("client connected\n");
         for (;;) {
             xniff_ipc_hdr_t hdr;
-            if (read_fully(cfd, &hdr, sizeof(hdr)) != sizeof(hdr)) { close(cfd); printf("client disconnected\n"); break; }
-            if (hdr.magic != XNIFF_IPC_MAGIC || hdr.version != XNIFF_IPC_VERSION) { fprintf(stderr, "bad header/magic\n"); close(cfd); break; }
+            if (read_fully(cfd, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+                diag_disconnect("read header");
+                close(cfd);
+                pending_calls_clear_pid((uint32_t)pid);
+                break;
+            }
+            if (hdr.magic != XNIFF_IPC_MAGIC || hdr.version != XNIFF_IPC_VERSION) {
+                diag_dump_header("bad header/magic", &hdr);
+                XNIFF_DIAGF("bad header/magic: this is often caused by interleaved writes from multiple hook threads; ensure you’re using the updated xniff-hooks.\n");
+                close(cfd);
+                pending_calls_clear_pid((uint32_t)pid);
+                break;
+            }
             if (hdr.payload_len < sizeof(xniff_ipc_mach_payload_t)) { fprintf(stderr, "short payload len %u\n", hdr.payload_len); close(cfd); break; }
+            if (hdr.payload_len > (64u * 1024u * 1024u)) {
+                diag_dump_header("insane payload_len", &hdr);
+                close(cfd);
+                pending_calls_clear_pid((uint32_t)pid);
+                break;
+            }
 
             uint8_t *buf = (uint8_t *)malloc(hdr.payload_len);
             if (!buf) { fprintf(stderr, "oom %u\n", hdr.payload_len); close(cfd); break; }
-            if (read_fully(cfd, buf, hdr.payload_len) != (ssize_t)hdr.payload_len) { free(buf); close(cfd); printf("client disconnected\n"); break; }
+            if (read_fully(cfd, buf, hdr.payload_len) != (ssize_t)hdr.payload_len) {
+                diag_disconnect("read payload");
+                free(buf);
+                close(cfd);
+                pending_calls_clear_pid((uint32_t)pid);
+                break;
+            }
 
             xniff_ipc_mach_payload_t *pl = (xniff_ipc_mach_payload_t *)buf;
             uint8_t *msg_bytes = buf + sizeof(*pl);
-            print_event(hdr.kind, pl, msg_bytes, pl->copy_len);
+            size_t msg_avail = 0;
+            if (hdr.payload_len > sizeof(*pl)) msg_avail = (size_t)hdr.payload_len - sizeof(*pl);
+            size_t msg_len = pl->copy_len;
+            if (msg_len > msg_avail) msg_len = msg_avail;
 
-            // Dump inline message bytes to file
-            char prefix[512];
-            snprintf(prefix, sizeof(prefix), "%s/%s_%06llu", base_dir, kind_to_tag(hdr.kind), evt_idx);
-            if (pl->copy_len && pl->copy_len <= hdr.payload_len - sizeof(*pl)) {
-                char pmsg[600]; snprintf(pmsg, sizeof(pmsg), "%s_msg.bin", prefix);
-                FILE *fp = fopen(pmsg, "wb"); if (fp) { fwrite(msg_bytes, 1, pl->copy_len, fp); fclose(fp); }
+            unsigned long long cur_evt_id = evt_idx;
+            uint64_t call_id = 0;
+            unsigned long long entry_evt_id = 0;
+            bool is_entry = (hdr.kind == XNIFF_EVT_MACH_ENTRY || hdr.kind == XNIFF_EVT_MACH2_ENTRY);
+            bool is_exit  = (hdr.kind == XNIFF_EVT_MACH_EXIT  || hdr.kind == XNIFF_EVT_MACH2_EXIT);
+            if (is_entry) {
+                call_id = pending_calls_push(hdr.pid, hdr.tid_low, pl->api, cur_evt_id);
+            } else if (is_exit) {
+                (void)pending_calls_pop(hdr.pid, hdr.tid_low, pl->api, &call_id, &entry_evt_id);
+            }
+
+            // Dump inline message bytes + attachments to files (optional), and collect metadata for JSONL.
+            char prefix[512] = {0};
+            char pmsg[600] = {0};
+            const char *msg_path = NULL;
+            xniff_att_meta_t *atts = NULL;
+            size_t att_count = 0, att_cap = 0;
+
+            if (g_listener_opts.dump_files) {
+                snprintf(prefix, sizeof(prefix), "%s/%s_%06llu", base_dir, kind_to_tag(hdr.kind), evt_idx);
+                if (msg_len) {
+                    snprintf(pmsg, sizeof(pmsg), "%s_msg.bin", prefix);
+                    FILE *fp = fopen(pmsg, "wb");
+                    if (fp) { fwrite(msg_bytes, 1, msg_len, fp); fclose(fp); msg_path = pmsg; }
+                }
             }
 
             // Parse TLVs already contained in payload and dump them
-            size_t offset = sizeof(*pl) + pl->copy_len;
+            size_t offset = sizeof(*pl) + msg_len;
             while (offset + sizeof(xniff_ipc_tlv_t) <= hdr.payload_len) {
                 xniff_ipc_tlv_t *tlv = (xniff_ipc_tlv_t *)(buf + offset);
                 offset += sizeof(*tlv);
                 if (offset + tlv->length > hdr.payload_len) break; // malformed
                 uint8_t *val = buf + offset;
-                if (tlv->type == XNIFF_TLV_OOL_DATA) {
-                    xniff_ool_data_t *md = (xniff_ool_data_t *)val;
-                    const uint8_t *bytes = val + sizeof(*md);
-                    char ppath[600]; snprintf(ppath, sizeof(ppath), "%s_ool%u.bin", prefix, md->index);
-                    FILE *fp = fopen(ppath, "wb"); if (fp) { fwrite(bytes, 1, md->size, fp); fclose(fp); }
-                } else if (tlv->type == XNIFF_TLV_OOL_PORTS) {
-                    xniff_ool_ports_t *md = (xniff_ool_ports_t *)val;
-                    const uint8_t *bytes = val + sizeof(*md);
-                    char ppath[600]; snprintf(ppath, sizeof(ppath), "%s_ool_ports%u.bin", prefix, md->index);
-                    size_t bytes_len = (size_t)md->count * md->elem_size;
-                    FILE *fp = fopen(ppath, "wb"); if (fp) { fwrite(bytes, 1, bytes_len, fp); fclose(fp); }
+
+                if ((tlv->type == XNIFF_TLV_OOL_DATA && tlv->length >= sizeof(xniff_ool_data_t)) ||
+                    (tlv->type == XNIFF_TLV_OOL_PORTS && tlv->length >= sizeof(xniff_ool_ports_t))) {
+                    if (att_count == att_cap) {
+                        size_t new_cap = att_cap ? att_cap * 2 : 8;
+                        xniff_att_meta_t *tmp = (xniff_att_meta_t *)realloc(atts, new_cap * sizeof(*atts));
+                        if (!tmp) break;
+                        atts = tmp;
+                        att_cap = new_cap;
+                    }
+                    xniff_att_meta_t *m = &atts[att_count++];
+                    memset(m, 0, sizeof(*m));
+                    m->type = tlv->type;
+                    if (tlv->type == XNIFF_TLV_OOL_DATA) {
+                        xniff_ool_data_t *md = (xniff_ool_data_t *)val;
+                        m->index = md->index;
+                        m->address = md->address;
+                        m->size_bytes = md->size;
+                        if (g_listener_opts.dump_files) {
+                            snprintf(m->path, sizeof(m->path), "%s_ool%u.bin", prefix, md->index);
+                            const uint8_t *bytes = val + sizeof(*md);
+                            FILE *fp = fopen(m->path, "wb");
+                            if (fp) { fwrite(bytes, 1, md->size, fp); fclose(fp); }
+                        } else {
+                            m->path[0] = '\0';
+                        }
+                    } else if (tlv->type == XNIFF_TLV_OOL_PORTS) {
+                        xniff_ool_ports_t *md = (xniff_ool_ports_t *)val;
+                        m->index = md->index;
+                        m->address = md->address;
+                        m->count = md->count;
+                        m->elem_size = md->elem_size;
+                        size_t bytes_len = (size_t)md->count * (size_t)md->elem_size;
+                        m->size_bytes = (uint32_t)bytes_len;
+                        if (g_listener_opts.dump_files) {
+                            snprintf(m->path, sizeof(m->path), "%s_ool_ports%u.bin", prefix, md->index);
+                            const uint8_t *bytes = val + sizeof(*md);
+                            FILE *fp = fopen(m->path, "wb");
+                            if (fp) { fwrite(bytes, 1, bytes_len, fp); fclose(fp); }
+                        } else {
+                            m->path[0] = '\0';
+                        }
+                    }
                 }
+
                 offset += tlv->length;
             }
+
+            if (g_listener_opts.jsonl) {
+                char tbuf[64];
+                double mono_s = 0.0;
+                format_time(tbuf, sizeof(tbuf), &mono_s);
+                jsonl_print_event(cur_evt_id, call_id, entry_evt_id, &hdr, pl, msg_bytes, msg_len, tbuf, mono_s, msg_path, atts, att_count);
+            } else {
+                print_event(hdr.kind, pl, msg_bytes, msg_len);
+            }
+
+            if (atts) free(atts);
 
             evt_idx++;
             free(buf);
@@ -606,13 +997,13 @@ static int cmd_hook_xpc(pid_t pid, const char *dylib_path) {
                 uint64_t resume_addr = (uint64_t)target + (uint64_t)info->prologue_bytes;
                 size_t ex_off = (size_t)(XTRAMP_EXIT_STUB - XTRAMP_START_AFTER_PROLOGUE);
                 uint64_t exit_stub_addr = (uint64_t)(uintptr_t)info->trampoline + (uint64_t)info->prologue_bytes + (uint64_t)ex_off;
-                printf("patched %s: slot @ 0x%llx, resume @ 0x%llx, exit_stub @ 0x%llx\n",
+                XNIFF_DIAGF("patched %s: slot @ 0x%llx, resume @ 0x%llx, exit_stub @ 0x%llx\n",
                        candidates[i],
                        (unsigned long long)(uintptr_t)info->trampoline,
                        (unsigned long long)resume_addr,
                        (unsigned long long)exit_stub_addr);
             } else {
-                printf("patched %s\n", candidates[i]);
+                XNIFF_DIAGF("patched %s\n", candidates[i]);
             }
         } else {
             fprintf(stderr, "failed to patch %s\n", candidates[i]);
@@ -624,7 +1015,7 @@ static int cmd_hook_xpc(pid_t pid, const char *dylib_path) {
 
     if (did_suspend) task_resume(task);
     detach_process(pid);
-    printf("patched %d symbols\n", patched);
+    XNIFF_DIAGF("patched %d symbols\n", patched);
     return patched > 0 ? 0 : -1;
 }
 
@@ -638,6 +1029,10 @@ int cmd_sniff_xpc(pid_t pid, const char *dylib_path) {
     if (child < 0) {
         perror("fork");
         return -1;
+    }
+    if (g_listener_opts.jsonl) {
+        // Keep JSONL on stdout clean: route parent stdout to stderr.
+        (void)dup2(STDERR_FILENO, STDOUT_FILENO);
     }
 
     // Wait for listener socket to exist to minimize dropped early events
@@ -658,7 +1053,7 @@ int cmd_sniff_xpc(pid_t pid, const char *dylib_path) {
         return -1;
     }
 
-    printf("sniff-xpc: hooks installed; streaming events (listener pid %d). Press Ctrl-C to stop.\n", (int)child);
+    XNIFF_DIAGF("sniff-xpc: hooks installed; streaming events (listener pid %d). Press Ctrl-C to stop.\n", (int)child);
     int status = 0;
     (void)waitpid(child, &status, 0);
     if (WIFEXITED(status)) return WEXITSTATUS(status) == 0 ? 0 : -1;
