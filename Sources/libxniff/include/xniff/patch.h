@@ -15,12 +15,19 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+// Trampoline prelude inserted before copied prologue bytes.
+// When the target is patched with a stub that uses X16/X17 as scratch (like Frida Gum),
+// the stub first pushes {x16,x17}. The trampoline prelude then restores them (and SP)
+// before executing the copied prologue to keep the callee's entry state intact.
+#define XNIFF_TRAMPOLINE_PRELUDE_BYTES 8u
+
 // from tramp_template.S
 extern const uint8_t TRAMPOLINE_START_AFTER_PROLOGUE[];
 extern const uint8_t TRAMPOLINE_INTERMEDIATE_ADRP[];
 extern const uint8_t TRAMPOLINE_INTERMEDIATE_ADD[];
 extern const uint8_t TRAMPOLINE_RELOAD_ADRP[];
 extern const uint8_t TRAMPOLINE_RELOAD_ADD[];
+extern const uint8_t TRAMPOLINE_AFTER_RESTORE[];
 extern const uint8_t TRAMPOLINE_RETURN_ADRP[];
 extern const uint8_t TRAMPOLINE_RETURN_ADD[];
 

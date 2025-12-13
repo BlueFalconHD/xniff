@@ -107,21 +107,11 @@ _XTRAMP_RESUME_ADD:
     ADD     X15, X15, _dummy_patch_hook@PAGEOFF
     STR     X15, [X9, #8]
 
-    // Save original LR register (incoming return address) into our frame
+    // Save original LR register (incoming return address) into our frame.
+    // We will later replace X30 (LR) with our exit stub *before* executing the
+    // relocated prologue, so the callee's own prologue will save/sign it as usual.
     MOV     X16, X30
     STR     X16, [X9,  #0]                     // frame->lr_orig
-_XTRAMP_EXITLR_ADRP:
-    ADRP    X16, _XTRAMP_EXIT_STUB@PAGE
-_XTRAMP_EXITLR_ADD:
-    ADD     X16, X16, _XTRAMP_EXIT_STUB@PAGEOFF
-    // Redirect return to our exit stub by overwriting the caller-saved LR slot.
-    // The target prologue has already established X29 as frame pointer via
-    //   STP X29, X30, [SP, #imm]; ADD X29, SP, #imm
-    // Epilogue typically does: MOV SP, X29; LDP X29, X30, [SP], #16; RETAB
-    // So we sign the exit stub pointer with key B using X29 as the context,
-    // matching the MOV SP, X29 before RETAB.
-    PACIB   X16, X29
-    STR     X16, [X29, #0x8]
 
     // Snapshot argument registers into frame (x0..x7)
     STR     X0,  [X9, #16]
@@ -147,6 +137,16 @@ _XTRAMP_HOOK_ADD:
     CBNZ    W13, 1f
     BLR     X16
 1:
+
+    // Redirect return to our exit stub by updating X30 (LR).
+    // This avoids relying on any particular stack-frame layout (e.g. X29-based),
+    // and matches Frida Gum's approach of modifying the saved return address in
+    // the captured CPU context rather than poking at the function's frame.
+_XTRAMP_EXITLR_ADRP:
+    ADRP    X16, _XTRAMP_EXIT_STUB@PAGE
+_XTRAMP_EXITLR_ADD:
+    ADD     X16, X16, _XTRAMP_EXIT_STUB@PAGEOFF
+    MOV     X30, X16
 
     // Restore FP/SIMD state and NZCV first to minimize side-effects
     LDP     Q0,  Q1,  [SP, #0x000]

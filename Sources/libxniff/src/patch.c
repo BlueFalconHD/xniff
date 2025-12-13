@@ -2,6 +2,39 @@
 #include "assembler.h"
 #include "xniff_ctx_config.h"
 
+// Trampoline prelude (inserted before copied prologue bytes).
+// We patch function entries using a Frida-like redirect stub that:
+//   1) pushes {x16,x17} to avoid clobbering caller state
+//   2) uses ADRP/ADD/BR via x16 to transfer control
+// This means the trampoline must restore {x16,x17} (and SP) before executing the copied
+// prologue, otherwise the callee will observe corrupted x16/x17 and a shifted SP.
+//
+// Additionally, because we transfer control via an *indirect* branch, BTI-enabled systems
+// require a valid BTI landing pad at the destination. `bti jc` is a no-op where BTI isn't
+// enforced.
+static const uint32_t XNIFF_TRAMPOLINE_PRELUDE_INSNS[] = {
+    0xD50324DFu, // bti jc
+    0xF047C1A8u, // ldp x16, x17, [sp], #0x10
+};
+
+static int xniff_tramp_brk_enabled(void) {
+    const char *e = getenv("XNIFF_TRAMP_BRK");
+    return (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+}
+static const uint32_t XNIFF_TRAMPOLINE_BRK_INSN = 0xD4200840u; // brk #0x42
+
+// Size of the patch stub written into the target function entry.
+// Must match both:
+// - minimum number of prologue bytes we can safely relocate
+// - size passed to prepare/restore_protections_after_patching_task()
+// Patch layout:
+//   stp x16, x17, [sp, #-16]!
+//   adrp x16, trampoline@PAGE
+//   add  x16, x16, trampoline@PAGEOFF
+//   br   x16
+static const size_t XNIFF_PATCH_STUB_SIZE = 16;
+static const uint32_t XNIFF_PATCH_PUSH_X16_X17 = 0xF047BFA9u; // stp x16, x17, [sp, #-0x10]!
+
 
 // Forward declarations for helpers used before their definitions
 static int remote_copy_prologue_bytes(mach_port_t task, mach_vm_address_t target_function, uint8_t *out_buf, size_t max_bytes);
@@ -243,7 +276,8 @@ static size_t xtrampoline_template_size(void) {
 static void assemble_xtrampoline_at_with_remote_pc(uint8_t *tramp_local_base,
                                                    uint64_t tramp_remote_base,
                                                    uint64_t entry_hook,
-                                                   uint64_t return_address,
+                                                   uint64_t stored_resume_address,
+                                                   uint64_t next_hop_address,
                                                    uint64_t exit_hook,
                                                    uint64_t ctx_base_remote) {
     const uint8_t *tmpl_start = XTRAMP_START_AFTER_PROLOGUE;
@@ -297,13 +331,13 @@ static void assemble_xtrampoline_at_with_remote_pc(uint8_t *tramp_local_base,
 
     // Patch resume PC (entry side store) and branch-return pair
     // Resume PC is stored from X15 in the template
-    uint32_t insn_res_adrp = assemble_adrp_reg_page(15u, pc_res_adrp, return_address);
-    uint32_t insn_res_add  = assemble_add_reg_pageoff(15u, return_address);
+    uint32_t insn_res_adrp = assemble_adrp_reg_page(15u, pc_res_adrp, stored_resume_address);
+    uint32_t insn_res_add  = assemble_add_reg_pageoff(15u, stored_resume_address);
     *(uint32_t *)(tramp_local_base + off_res_adrp) = insn_res_adrp;
     *(uint32_t *)(tramp_local_base + off_res_add)  = insn_res_add;
 
-    uint32_t insn_ret_adrp = assemble_adrp_x16_page(pc_ret_adrp, return_address);
-    uint32_t insn_ret_add  = assemble_add_x16_pageoff(return_address);
+    uint32_t insn_ret_adrp = assemble_adrp_x16_page(pc_ret_adrp, next_hop_address);
+    uint32_t insn_ret_add  = assemble_add_x16_pageoff(next_hop_address);
     *(uint32_t *)(tramp_local_base + off_ret_adrp) = insn_ret_adrp;
     *(uint32_t *)(tramp_local_base + off_ret_add)  = insn_ret_add;
 
@@ -342,13 +376,22 @@ int patch_function_with_exit_trampoline_task(mach_port_t task,
                 (unsigned long long)target_function);
         return -1;
     }
-    if ((size_t)prologue_bytes < 12) {
-        fprintf(stderr, "[xniff] exit-tramp: prologue too short/non-copyable (%d) at 0x%llx\n",
-                prologue_bytes, (unsigned long long)target_function);
+    if ((size_t)prologue_bytes < XNIFF_PATCH_STUB_SIZE) {
+        fprintf(stderr,
+                "[xniff] exit-tramp: prologue too short/non-copyable (%d < %zu) at 0x%llx\n",
+                prologue_bytes, XNIFF_PATCH_STUB_SIZE,
+                (unsigned long long)target_function);
         return -1;
     }
 
-    size_t need = (size_t)prologue_bytes + xtrampoline_template_size();
+    const size_t tmpl_size = xtrampoline_template_size();
+    const size_t prologue_bti_size = 4;   // bti landing pad for indirect BR inside trampoline
+    const size_t resume_stub_size  = 12;  // adrp/add/br to jump back into original
+    size_t need = (size_t)XNIFF_TRAMPOLINE_PRELUDE_BYTES +
+                  tmpl_size +
+                  prologue_bti_size +
+                  (size_t)prologue_bytes +
+                  resume_stub_size;
 
     kern_return_t krp = vm_protect_pages_task(task, trampoline_buffer, need, TRUE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
     if (krp != KERN_SUCCESS) {
@@ -361,7 +404,7 @@ int patch_function_with_exit_trampoline_task(mach_port_t task,
                 (unsigned long long)trampoline_buffer, need, krp);
         return -1;
     }
-    if (prepare_protections_for_patching_task(task, target_function, 12) != 0) {
+    if (prepare_protections_for_patching_task(task, target_function, XNIFF_PATCH_STUB_SIZE) != 0) {
         fprintf(stderr, "[xniff] exit-tramp: prepare_protections_for_patching_task failed for target 0x%llx\n",
                 (unsigned long long)target_function);
         (void)vm_protect_pages_task(task, trampoline_buffer, need, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
@@ -369,46 +412,106 @@ int patch_function_with_exit_trampoline_task(mach_port_t task,
     }
 
     if ((size_t)prologue_bytes > sizeof(local_prologue)) return -1;
+
+    // Trampoline prelude: valid landing pad for indirect branch + restore x16/x17.
     kern_return_t kr = vm_write(task, trampoline_buffer,
-                                (vm_offset_t)(uintptr_t)local_prologue,
-                                (mach_msg_type_number_t)prologue_bytes);
+                                (vm_offset_t)(uintptr_t)XNIFF_TRAMPOLINE_PRELUDE_INSNS,
+                                (mach_msg_type_number_t)sizeof(XNIFF_TRAMPOLINE_PRELUDE_INSNS));
     if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "[xniff] exit-tramp: vm_write prologue to 0x%llx failed (kr=%d)\n",
+        fprintf(stderr, "[xniff] exit-tramp: vm_write prelude to 0x%llx failed (kr=%d)\n",
                 (unsigned long long)trampoline_buffer, kr);
         return -1;
     }
 
-    size_t tmpl_size = xtrampoline_template_size();
-    uint8_t *tail = (uint8_t *)malloc(tmpl_size);
-    if (!tail) return -1;
+    // Write xtrampoline template immediately after the prelude.
+    uint8_t *tmpl = (uint8_t *)malloc(tmpl_size);
+    if (!tmpl) return -1;
 
-    uint64_t remote_tail_pc = (uint64_t)trampoline_buffer + (uint64_t)prologue_bytes;
-    assemble_xtrampoline_at_with_remote_pc(tail, remote_tail_pc,
+    uint64_t remote_template_pc = (uint64_t)trampoline_buffer + (uint64_t)XNIFF_TRAMPOLINE_PRELUDE_BYTES;
+    uint64_t remote_prologue_block_pc = remote_template_pc + (uint64_t)tmpl_size;
+    uint64_t remote_prologue_pc = remote_prologue_block_pc + (uint64_t)prologue_bti_size;
+    uint64_t remote_resume_stub_pc = remote_prologue_pc + (uint64_t)prologue_bytes;
+
+    // Store the "resume PC" for diagnostics/exit-hook consumers, but branch first into the
+    // relocated prologue block so the target prologue runs with LR already redirected.
+    uint64_t resume_address = (uint64_t)target_function + (uint64_t)prologue_bytes;
+
+    assemble_xtrampoline_at_with_remote_pc(tmpl, remote_template_pc,
                                            (uint64_t)entry_hook_function,
-                                           (uint64_t)target_function + (uint64_t)prologue_bytes,
+                                           resume_address,
+                                           remote_prologue_block_pc,
                                            (uint64_t)exit_hook_function,
                                            (uint64_t)ctx_slot_base);
 
-    kr = vm_write(task, trampoline_buffer + (mach_vm_address_t)prologue_bytes,
-                  (vm_offset_t)(uintptr_t)tail, (mach_msg_type_number_t)tmpl_size);
-    free(tail);
+    kr = vm_write(task, trampoline_buffer + (mach_vm_address_t)XNIFF_TRAMPOLINE_PRELUDE_BYTES,
+                  (vm_offset_t)(uintptr_t)tmpl, (mach_msg_type_number_t)tmpl_size);
+    free(tmpl);
     if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "[xniff] exit-tramp: vm_write tail to 0x%llx failed (kr=%d)\n",
-                (unsigned long long)(trampoline_buffer + (mach_vm_address_t)prologue_bytes), kr);
+        fprintf(stderr, "[xniff] exit-tramp: vm_write template to 0x%llx failed (kr=%d)\n",
+                (unsigned long long)(trampoline_buffer + (mach_vm_address_t)XNIFF_TRAMPOLINE_PRELUDE_BYTES), kr);
         return -1;
+    }
+
+    // Emit a BTI landing pad for the xtrampoline's indirect BR into the prologue block.
+    const uint32_t bti_jc = 0xD50324DFu;
+    kr = vm_write(task, (mach_vm_address_t)remote_prologue_block_pc,
+                  (vm_offset_t)(uintptr_t)&bti_jc, (mach_msg_type_number_t)sizeof(bti_jc));
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "[xniff] exit-tramp: vm_write prologue BTI to 0x%llx failed (kr=%d)\n",
+                (unsigned long long)remote_prologue_block_pc, kr);
+        return -1;
+    }
+
+    // Write relocated prologue bytes after the BTI landing pad.
+    kr = vm_write(task, (mach_vm_address_t)remote_prologue_pc,
+                  (vm_offset_t)(uintptr_t)local_prologue,
+                  (mach_msg_type_number_t)prologue_bytes);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "[xniff] exit-tramp: vm_write prologue to 0x%llx failed (kr=%d)\n",
+                (unsigned long long)remote_prologue_pc, kr);
+        return -1;
+    }
+
+    // Write a tiny resume stub that jumps back into the original function after the
+    // relocated prologue.
+    uint32_t resume_adrp = assemble_adrp_x16_page(remote_resume_stub_pc, resume_address);
+    uint32_t resume_add  = assemble_add_x16_pageoff(resume_address);
+    uint32_t resume_br   = 0xD61F0200u | (16u << 5);
+    uint8_t resume_stub[12];
+    memcpy(resume_stub + 0, &resume_adrp, 4);
+    memcpy(resume_stub + 4, &resume_add, 4);
+    memcpy(resume_stub + 8, &resume_br, 4);
+    kr = vm_write(task, (mach_vm_address_t)remote_resume_stub_pc,
+                  (vm_offset_t)(uintptr_t)resume_stub,
+                  (mach_msg_type_number_t)sizeof(resume_stub));
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "[xniff] exit-tramp: vm_write resume stub to 0x%llx failed (kr=%d)\n",
+                (unsigned long long)remote_resume_stub_pc, kr);
+        return -1;
+    }
+
+    if (xniff_tramp_brk_enabled()) {
+        // Overwrite the first instruction of the template (normally BTI) with a BRK so LLDB stops here.
+        // This is intended only for debugging; without a debugger, SIGTRAP will usually terminate the process.
+        (void)vm_write(task, (mach_vm_address_t)remote_template_pc,
+                       (vm_offset_t)(uintptr_t)&XNIFF_TRAMPOLINE_BRK_INSN,
+                       (mach_msg_type_number_t)sizeof(XNIFF_TRAMPOLINE_BRK_INSN));
     }
 
     // Patch original entry with branch to trampoline
     uint64_t target_address = (uint64_t)target_function;
     uint64_t tramp_address = (uint64_t)trampoline_buffer;
-    uint32_t adrp_insn = assemble_adrp_x16_page(target_address, tramp_address);
+    uint32_t stp_insn  = XNIFF_PATCH_PUSH_X16_X17;
+    uint32_t adrp_insn = assemble_adrp_x16_page(target_address + 4, tramp_address);
     uint32_t add_insn  = assemble_add_x16_pageoff(tramp_address);
     uint32_t br_insn   = 0xD61F0200u | (16u << 5);
-    uint8_t patch_bytes[12];
-    memcpy(patch_bytes + 0, &adrp_insn, 4);
-    memcpy(patch_bytes + 4, &add_insn, 4);
-    memcpy(patch_bytes + 8, &br_insn, 4);
-    kr = vm_write(task, target_function, (vm_offset_t)(uintptr_t)patch_bytes, (mach_msg_type_number_t)sizeof(patch_bytes));
+    uint8_t patch_bytes[16];
+    memcpy(patch_bytes + 0,  &stp_insn,  4);
+    memcpy(patch_bytes + 4,  &adrp_insn, 4);
+    memcpy(patch_bytes + 8,  &add_insn,  4);
+    memcpy(patch_bytes + 12, &br_insn,   4);
+    kr = vm_write(task, target_function, (vm_offset_t)(uintptr_t)patch_bytes,
+                  (mach_msg_type_number_t)sizeof(patch_bytes));
     if (kr != KERN_SUCCESS) {
         fprintf(stderr, "[xniff] exit-tramp: vm_write patch to target 0x%llx failed (kr=%d)\n",
                 (unsigned long long)target_function, kr);
@@ -574,20 +677,32 @@ int patch_function_with_trampoline_task(mach_port_t task,
     if (copied_bytes <= 0) {
         return -1;
     }
-    if ((size_t)copied_bytes < 12) {
-        fprintf(stderr, "Refusing to patch remote target: non-copyable within first 12 bytes (copied=%d)\n", copied_bytes);
+    if ((size_t)copied_bytes < XNIFF_PATCH_STUB_SIZE) {
+        fprintf(stderr,
+                "Refusing to patch remote target: non-copyable within first %zu bytes (copied=%d)\n",
+                XNIFF_PATCH_STUB_SIZE, copied_bytes);
         return -1;
     }
 
-    // write prologue copy into trampoline slot
-    kern_return_t kr = vm_write(task, trampoline_buffer, (vm_offset_t)(uintptr_t)prologue, (mach_msg_type_number_t)copied_bytes);
+    // Trampoline prelude: valid landing pad for indirect branch.
+    kern_return_t kr = vm_write(task, trampoline_buffer,
+                                (vm_offset_t)(uintptr_t)XNIFF_TRAMPOLINE_PRELUDE_INSNS,
+                                (mach_msg_type_number_t)sizeof(XNIFF_TRAMPOLINE_PRELUDE_INSNS));
     if (kr != KERN_SUCCESS) {
         return -1;
     }
 
-    // Ensure we resume at least after the 12-byte patch window to avoid loops.
-    size_t patch_len2 = 12;
-    size_t resume_off2 = (size_t)copied_bytes < patch_len2 ? patch_len2 : (size_t)copied_bytes;
+    // write prologue copy into trampoline slot (after prelude)
+    kr = vm_write(task, trampoline_buffer + (mach_vm_address_t)XNIFF_TRAMPOLINE_PRELUDE_BYTES,
+                  (vm_offset_t)(uintptr_t)prologue, (mach_msg_type_number_t)copied_bytes);
+    if (kr != KERN_SUCCESS) {
+        return -1;
+    }
+
+    // Ensure we resume at least after the patch window to avoid loops.
+    size_t resume_off2 = (size_t)copied_bytes < XNIFF_PATCH_STUB_SIZE
+        ? XNIFF_PATCH_STUB_SIZE
+        : (size_t)copied_bytes;
     uint64_t return_address = (uint64_t)target_function + (uint64_t)resume_off2;
     size_t tmpl_size = trampoline_template_size();
     uint8_t *tail = (uint8_t *)malloc(tmpl_size);
@@ -630,27 +745,37 @@ int patch_function_with_trampoline_task(mach_port_t task,
     } while (0);
 
     // Assemble trampoline using the remote PC base where it will execute
-    uint64_t remote_tail_pc = (uint64_t)trampoline_buffer + (uint64_t)copied_bytes;
+    uint64_t remote_tail_pc = (uint64_t)trampoline_buffer + (uint64_t)XNIFF_TRAMPOLINE_PRELUDE_BYTES + (uint64_t)copied_bytes;
     assemble_trampoline_at_with_remote_pc(tail, remote_tail_pc, (uint64_t)hook_function, return_address,
                                           reload_reg, reload_target);
-    kr = vm_write(task, trampoline_buffer + (mach_vm_address_t)copied_bytes,
+    kr = vm_write(task, trampoline_buffer + (mach_vm_address_t)XNIFF_TRAMPOLINE_PRELUDE_BYTES + (mach_vm_address_t)copied_bytes,
                        (vm_offset_t)(uintptr_t)tail, (mach_msg_type_number_t)tmpl_size);
     free(tail);
     if (kr != KERN_SUCCESS) {
         return -1;
     }
 
+    if (xniff_tramp_brk_enabled()) {
+        // Overwrite the first instruction of the template (normally BTI) with a BRK so LLDB stops here.
+        (void)vm_write(task, (mach_vm_address_t)remote_tail_pc,
+                       (vm_offset_t)(uintptr_t)&XNIFF_TRAMPOLINE_BRK_INSN,
+                       (mach_msg_type_number_t)sizeof(XNIFF_TRAMPOLINE_BRK_INSN));
+    }
+
     // patch original: ADRP, ADD, BR
     uint64_t target_address = (uint64_t)target_function;
     uint64_t tramp_address = (uint64_t)trampoline_buffer;
-    uint32_t adrp_insn = assemble_adrp_x16_page(target_address, tramp_address);
+    uint32_t stp_insn  = XNIFF_PATCH_PUSH_X16_X17;
+    uint32_t adrp_insn = assemble_adrp_x16_page(target_address + 4, tramp_address);
     uint32_t add_insn  = assemble_add_x16_pageoff(tramp_address);
     uint32_t br_insn   = 0xD61F0200u | (16u << 5);
-    uint8_t patch_bytes[12];
-    memcpy(patch_bytes + 0, &adrp_insn, 4);
-    memcpy(patch_bytes + 4, &add_insn, 4);
-    memcpy(patch_bytes + 8, &br_insn, 4);
-    kr = vm_write(task, target_function, (vm_offset_t)(uintptr_t)patch_bytes, (mach_msg_type_number_t)sizeof(patch_bytes));
+    uint8_t patch_bytes[16];
+    memcpy(patch_bytes + 0,  &stp_insn,  4);
+    memcpy(patch_bytes + 4,  &adrp_insn, 4);
+    memcpy(patch_bytes + 8,  &add_insn,  4);
+    memcpy(patch_bytes + 12, &br_insn,   4);
+    kr = vm_write(task, target_function, (vm_offset_t)(uintptr_t)patch_bytes,
+                  (mach_msg_type_number_t)sizeof(patch_bytes));
     if (kr != KERN_SUCCESS) {
         return -1;
     }
@@ -672,12 +797,14 @@ int trampoline_bank_install_task(trampoline_bank_t *bank,
         fprintf(stderr, "Failed to analyze remote target prologue\n");
         return -1;
     }
-    if ((size_t)prologue_bytes < 12) {
-        fprintf(stderr, "Refusing to patch remote target: non-copyable within first 12 bytes (copied=%d)\n", prologue_bytes);
+    if ((size_t)prologue_bytes < XNIFF_PATCH_STUB_SIZE) {
+        fprintf(stderr,
+                "Refusing to patch remote target: non-copyable within first %zu bytes (copied=%d)\n",
+                XNIFF_PATCH_STUB_SIZE, prologue_bytes);
         return -1;
     }
 
-    size_t need = (size_t)prologue_bytes + trampoline_template_size();
+    size_t need = (size_t)XNIFF_TRAMPOLINE_PRELUDE_BYTES + (size_t)prologue_bytes + trampoline_template_size();
     size_t idx = 0;
     uint8_t *slot_ptr = (uint8_t *)trampoline_bank_alloc_slot(bank, need, &idx);
     if (!slot_ptr) {
@@ -692,7 +819,7 @@ int trampoline_bank_install_task(trampoline_bank_t *bank,
         fprintf(stderr, "Error: could not make remote trampoline slot RW\n");
         return -1;
     }
-    if (prepare_protections_for_patching_task(bank->task, target_function, 12) != 0) {
+    if (prepare_protections_for_patching_task(bank->task, target_function, XNIFF_PATCH_STUB_SIZE) != 0) {
         (void)vm_protect_pages_task(bank->task, slot, need, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
         return -1;
     }
@@ -700,7 +827,7 @@ int trampoline_bank_install_task(trampoline_bank_t *bank,
     int copied = patch_function_with_trampoline_task(bank->task, target_function, slot, hook_function);
 
     int rc = 0;
-    if (restore_protections_after_patching_task(bank->task, target_function, 12) != 0) {
+    if (restore_protections_after_patching_task(bank->task, target_function, XNIFF_PATCH_STUB_SIZE) != 0) {
         rc = -1;
     }
     (void)vm_protect_pages_task(bank->task, slot, need, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
@@ -736,14 +863,23 @@ int trampoline_bank_install_task_with_exit(trampoline_bank_t *bank,
         fprintf(stderr, "Failed to analyze remote target prologue\n");
         return -1;
     }
-    if ((size_t)prologue_bytes < 12) {
-        fprintf(stderr, "Refusing to patch remote target: non-copyable within first 12 bytes (copied=%d)\n", prologue_bytes);
+    if ((size_t)prologue_bytes < XNIFF_PATCH_STUB_SIZE) {
+        fprintf(stderr,
+                "Refusing to patch remote target: non-copyable within first %zu bytes (copied=%d)\n",
+                XNIFF_PATCH_STUB_SIZE, prologue_bytes);
         return -1;
     }
 
-    size_t need = (size_t)prologue_bytes + xtrampoline_template_size();
+    const size_t tmpl_size = xtrampoline_template_size();
+    const size_t prologue_bti_size = 4;
+    const size_t resume_stub_size  = 12;
+    size_t need = (size_t)XNIFF_TRAMPOLINE_PRELUDE_BYTES +
+                  tmpl_size +
+                  prologue_bti_size +
+                  (size_t)prologue_bytes +
+                  resume_stub_size;
     fprintf(stderr, "[xniff] bank-install exit: prologue=%d xtramp=%zu need=%zu slot_size=%zu\n",
-            prologue_bytes, xtrampoline_template_size(), need, bank->per_trampoline_size);
+            prologue_bytes, tmpl_size, need, bank->per_trampoline_size);
     size_t idx = 0;
     uint8_t *slot_ptr = (uint8_t *)trampoline_bank_alloc_slot(bank, need, &idx);
     if (!slot_ptr) {
@@ -771,7 +907,7 @@ int trampoline_bank_install_task_with_exit(trampoline_bank_t *bank,
         vm_deallocate(bank->task, ctx_addr, (vm_size_t)ctx_per_slot);
         return -1;
     }
-    if (prepare_protections_for_patching_task(bank->task, target_function, 12) != 0) {
+    if (prepare_protections_for_patching_task(bank->task, target_function, XNIFF_PATCH_STUB_SIZE) != 0) {
         (void)vm_protect_pages_task(bank->task, slot, need, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
         vm_deallocate(bank->task, ctx_addr, (vm_size_t)ctx_per_slot);
         return -1;
@@ -782,7 +918,7 @@ int trampoline_bank_install_task_with_exit(trampoline_bank_t *bank,
                                                           (mach_vm_address_t)ctx_addr);
 
     int rc = 0;
-    if (restore_protections_after_patching_task(bank->task, target_function, 12) != 0) {
+    if (restore_protections_after_patching_task(bank->task, target_function, XNIFF_PATCH_STUB_SIZE) != 0) {
         rc = -1;
     }
     (void)vm_protect_pages_task(bank->task, slot, need, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);

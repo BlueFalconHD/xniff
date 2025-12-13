@@ -135,10 +135,21 @@ static int patch_symbol_in_task(pid_t pid, const char *symbol_name) {
     if (idx < bank.capacity) {
         trampoline_info_t *info = &bank.infos[idx];
         uint64_t resume_addr = (uint64_t)target_addr + (uint64_t)info->prologue_bytes;
+        uint64_t tramp_base = (uint64_t)(uintptr_t)info->trampoline;
+        uint64_t stub_entry = tramp_base + (uint64_t)XNIFF_TRAMPOLINE_PRELUDE_BYTES + (uint64_t)info->prologue_bytes;
+        uint64_t after_restore_off = (uint64_t)(uintptr_t)(TRAMPOLINE_AFTER_RESTORE - TRAMPOLINE_START_AFTER_PROLOGUE);
+        uint64_t stub_after_restore = stub_entry + after_restore_off;
         printf("  trampoline slot @ 0x%llx, resume @ 0x%llx, hook @ 0x%llx\n",
-               (unsigned long long)(uintptr_t)info->trampoline,
+               (unsigned long long)tramp_base,
                (unsigned long long)resume_addr,
                (unsigned long long)hook_addr);
+        printf("  stub entry(after stolen) @ 0x%llx, stub after_restore @ 0x%llx\n",
+               (unsigned long long)stub_entry,
+               (unsigned long long)stub_after_restore);
+        printf("  lldb: command script import lldb/xniff_regcheck.py ; xniff-regcheck --entry 0x%llx --exit 0x%llx --once --stop-on-mismatch\n",
+               (unsigned long long)stub_entry,
+               (unsigned long long)stub_after_restore);
+        printf("  debug: set XNIFF_TRAMP_BRK=1 when running xniff-cli to write a BRK at stub entry\n");
     }
 
     // Keep remote trampoline mapping alive; free local bookkeeping only.
