@@ -3,6 +3,7 @@
 #define XNIFF_IPC_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include <sys/types.h>
 
 #ifdef __cplusplus
@@ -28,6 +29,17 @@ typedef struct {
     uint32_t tid_low;      // low bits of thread id (optional)
     uint32_t payload_len;  // length of following payload
 } xniff_ipc_hdr_t;
+
+// Guard against accidental struct packing/ABI mismatches between components.
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+_Static_assert(sizeof(xniff_ipc_hdr_t) == 20, "xniff_ipc_hdr_t must be 20 bytes");
+_Static_assert(offsetof(xniff_ipc_hdr_t, magic) == 0, "xniff_ipc_hdr_t.magic offset");
+_Static_assert(offsetof(xniff_ipc_hdr_t, version) == 4, "xniff_ipc_hdr_t.version offset");
+_Static_assert(offsetof(xniff_ipc_hdr_t, kind) == 6, "xniff_ipc_hdr_t.kind offset");
+_Static_assert(offsetof(xniff_ipc_hdr_t, pid) == 8, "xniff_ipc_hdr_t.pid offset");
+_Static_assert(offsetof(xniff_ipc_hdr_t, tid_low) == 12, "xniff_ipc_hdr_t.tid_low offset");
+_Static_assert(offsetof(xniff_ipc_hdr_t, payload_len) == 16, "xniff_ipc_hdr_t.payload_len offset");
+#endif
 
 // Payload used for XNIFF_EVT_MACH_ENTRY/EXIT
 // API identifier for payload interpretation

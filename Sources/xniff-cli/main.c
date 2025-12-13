@@ -400,6 +400,115 @@ static ssize_t read_fully(int fd, void *buf, size_t len) {
     return (ssize_t)len;
 }
 
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t kind;
+    uint32_t pid;
+    uint64_t tid;
+    uint32_t payload_len;
+} xniff_ipc_hdr_legacy24_t;
+
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+_Static_assert(sizeof(xniff_ipc_hdr_legacy24_t) == 24, "legacy header must be 24 bytes");
+#endif
+
+typedef enum {
+    XNIFF_HDR_WIRE_V1_20 = 20,
+    XNIFF_HDR_WIRE_LEGACY_24 = 24,
+} xniff_hdr_wire_kind_t;
+
+static bool payload_len_sane(uint32_t payload_len) {
+    if (payload_len < sizeof(xniff_ipc_mach_payload_t)) return false;
+    if (payload_len > (64u * 1024u * 1024u)) return false;
+    return true;
+}
+
+static bool peek_u32(const uint8_t *buf, size_t len, size_t off, uint32_t *out) {
+    if (!out) return false;
+    if (off + sizeof(uint32_t) > len) return false;
+    uint32_t v = 0;
+    memcpy(&v, buf + off, sizeof(v));
+    *out = v;
+    return true;
+}
+
+static int read_ipc_header_compat(int fd, xniff_ipc_hdr_t *out_hdr, xniff_hdr_wire_kind_t *wire_kind_out) {
+    if (!out_hdr) return -1;
+
+    // Peek enough bytes to discriminate between the current 20-byte header and a legacy 24-byte header.
+    // Also validate the first u32 of the payload (api) to reduce false positives.
+    uint8_t peek[64];
+    ssize_t pn = -1;
+    for (;;) {
+        pn = recv(fd, peek, sizeof(peek), MSG_PEEK);
+        if (pn < 0 && errno == EINTR) continue;
+        break;
+    }
+    if (pn == 0) { errno = 0; return -1; } // EOF
+    if (pn < 0) return -1;
+
+    size_t avail = (size_t)pn;
+    if (avail < sizeof(xniff_ipc_hdr_t)) {
+        if (read_fully(fd, out_hdr, sizeof(*out_hdr)) != (ssize_t)sizeof(*out_hdr)) return -1;
+        if (wire_kind_out) *wire_kind_out = XNIFF_HDR_WIRE_V1_20;
+        return 0;
+    }
+
+    xniff_ipc_hdr_t h1;
+    memcpy(&h1, peek, sizeof(h1));
+
+    bool h1_ok = (h1.magic == XNIFF_IPC_MAGIC) &&
+                 (h1.version == XNIFF_IPC_VERSION) &&
+                 payload_len_sane(h1.payload_len);
+    if (h1_ok && avail >= sizeof(xniff_ipc_hdr_t) + sizeof(uint32_t)) {
+        uint32_t api = 0;
+        if (peek_u32(peek, avail, sizeof(xniff_ipc_hdr_t), &api)) {
+            if (api != XNIFF_API_MACH_MSG && api != XNIFF_API_MACH_MSG2) h1_ok = false;
+        }
+    }
+
+    bool h0_ok = false;
+    xniff_ipc_hdr_legacy24_t h0;
+    if (avail >= sizeof(h0) + sizeof(uint32_t)) {
+        memcpy(&h0, peek, sizeof(h0));
+        h0_ok = (h0.magic == XNIFF_IPC_MAGIC) &&
+                (h0.version == XNIFF_IPC_VERSION) &&
+                payload_len_sane(h0.payload_len);
+        if (h0_ok) {
+            uint32_t api = 0;
+            if (peek_u32(peek, avail, sizeof(h0), &api)) {
+                if (api != XNIFF_API_MACH_MSG && api != XNIFF_API_MACH_MSG2) h0_ok = false;
+            }
+        }
+    }
+
+    // Prefer the current header when both validate; otherwise accept legacy if it validates.
+    if (h1_ok) {
+        if (read_fully(fd, out_hdr, sizeof(*out_hdr)) != (ssize_t)sizeof(*out_hdr)) return -1;
+        if (wire_kind_out) *wire_kind_out = XNIFF_HDR_WIRE_V1_20;
+        return 0;
+    }
+    if (h0_ok) {
+        uint8_t tmp[sizeof(h0)];
+        if (read_fully(fd, tmp, sizeof(tmp)) != (ssize_t)sizeof(tmp)) return -1;
+        memcpy(&h0, tmp, sizeof(h0));
+        out_hdr->magic = h0.magic;
+        out_hdr->version = h0.version;
+        out_hdr->kind = h0.kind;
+        out_hdr->pid = h0.pid;
+        out_hdr->tid_low = (uint32_t)h0.tid;
+        out_hdr->payload_len = h0.payload_len;
+        if (wire_kind_out) *wire_kind_out = XNIFF_HDR_WIRE_LEGACY_24;
+        return 0;
+    }
+
+    // Unknown framing; fall back to consuming the v1-sized header so the caller can emit diagnostics.
+    if (read_fully(fd, out_hdr, sizeof(*out_hdr)) != (ssize_t)sizeof(*out_hdr)) return -1;
+    if (wire_kind_out) *wire_kind_out = XNIFF_HDR_WIRE_V1_20;
+    return 0;
+}
+
 static void diag_dump_header(const char *why, const xniff_ipc_hdr_t *hdr) {
     if (!hdr) return;
     const uint8_t *b = (const uint8_t *)hdr;
@@ -753,13 +862,19 @@ static int cmd_listen(pid_t pid) {
         int cfd = xniff_ipc_accept(sfd);
         if (cfd < 0) { if (errno == EINTR) continue; perror("accept"); return -1; }
         XNIFF_DIAGF("client connected\n");
+        bool warned_legacy_hdr = false;
         for (;;) {
             xniff_ipc_hdr_t hdr;
-            if (read_fully(cfd, &hdr, sizeof(hdr)) != sizeof(hdr)) {
+            xniff_hdr_wire_kind_t wire_kind = XNIFF_HDR_WIRE_V1_20;
+            if (read_ipc_header_compat(cfd, &hdr, &wire_kind) != 0) {
                 diag_disconnect("read header");
                 close(cfd);
                 pending_calls_clear_pid((uint32_t)pid);
                 break;
+            }
+            if (wire_kind == XNIFF_HDR_WIRE_LEGACY_24 && !warned_legacy_hdr) {
+                warned_legacy_hdr = true;
+                XNIFF_DIAGF("note: detected legacy 24-byte IPC header (tid64). Your injected xniff-hooks is older/different; rebuild and reinject to use the current 20-byte header.\n");
             }
             if (hdr.magic != XNIFF_IPC_MAGIC || hdr.version != XNIFF_IPC_VERSION) {
                 diag_dump_header("bad header/magic", &hdr);
@@ -770,10 +885,31 @@ static int cmd_listen(pid_t pid) {
             }
             if (hdr.payload_len < sizeof(xniff_ipc_mach_payload_t)) { fprintf(stderr, "short payload len %u\n", hdr.payload_len); close(cfd); break; }
             if (hdr.payload_len > (64u * 1024u * 1024u)) {
-                diag_dump_header("insane payload_len", &hdr);
-                close(cfd);
-                pending_calls_clear_pid((uint32_t)pid);
-                break;
+                // Compatibility: some older/mismatched hook builds appear to scribble the upper 16 bits of
+                // payload_len (often 0xAAAAxxxx). If the low 16 bits look sane and the payload begins with
+                // a valid api field, salvage the length instead of hard-failing.
+                uint32_t hi = hdr.payload_len & 0xFFFF0000u;
+                uint32_t lo = hdr.payload_len & 0x0000FFFFu;
+                bool salvaged = false;
+                if ((hi == 0xAAAA0000u || hi == 0x55550000u) && payload_len_sane(lo)) {
+                    uint32_t api = 0;
+                    ssize_t pk;
+                    do {
+                        pk = recv(cfd, &api, sizeof(api), MSG_PEEK | MSG_WAITALL);
+                    } while (pk < 0 && errno == EINTR);
+                    if (pk == (ssize_t)sizeof(api) && (api == XNIFF_API_MACH_MSG || api == XNIFF_API_MACH_MSG2)) {
+                        XNIFF_DIAGF("warning: salvaging scribbled payload_len 0x%08x -> %u (likely old/mismatched xniff-hooks)\n",
+                                    hdr.payload_len, lo);
+                        hdr.payload_len = lo;
+                        salvaged = true;
+                    }
+                }
+                if (!salvaged) {
+                    diag_dump_header("insane payload_len", &hdr);
+                    close(cfd);
+                    pending_calls_clear_pid((uint32_t)pid);
+                    break;
+                }
             }
 
             uint8_t *buf = (uint8_t *)malloc(hdr.payload_len);
