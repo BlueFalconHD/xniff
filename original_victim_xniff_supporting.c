@@ -409,8 +409,16 @@ static void write_dump_files(const mach_msg_header_t *msg, const char *tag) {
 }
 
 __attribute__((used, noinline, visibility("default")))
-void xniff_remote_entry_hook(mach_msg_header_t *msg, mach_msg_option_t option) {
+void xniff_remote_entry_hook(xniff_ctx_frame_t *ctx) {
     printf("::: xniff_remote_entry_hook: intercepted call :::\n");
+
+    if (!ctx) {
+        printf("  (null ctx)\n");
+        return;
+    }
+
+    mach_msg_header_t *msg = (mach_msg_header_t *)(uintptr_t)ctx->x[0];
+    mach_msg_option_t option = (mach_msg_option_t)ctx->x[1];
 
     write_dump_files(msg, "entry");
 
@@ -449,7 +457,7 @@ void xniff_remote_entry_hook(mach_msg_header_t *msg, mach_msg_option_t option) {
 }
 
 __attribute__((used, noinline, visibility("default")))
-void xniff_remote_exit_hook(uint64_t ret, const xniff_ctx_frame_t* ctx) {
+void xniff_remote_exit_hook(uint64_t ret, xniff_ctx_frame_t* ctx) {
     printf("::: xniff_remote_exit_hook: intercepted return :::\n");
 
     if (ctx) {
@@ -681,16 +689,23 @@ static void print_msg_options64(mach_msg_option64_t opt)
 #endif /* XNIFF_MSG2_HELPERS_INCLUDED */
 
 __attribute__((used, noinline, visibility("default")))
-void xniff_msg2_entry_hook(
-    void*                 data,
-    mach_msg_option64_t   option64,
-    uint64_t              msgh_bits_and_send_size,
-    uint64_t              msgh_remote_and_local_port,
-    uint64_t              msgh_voucher_and_id,
-    uint64_t              desc_count_and_rcv_name,
-    uint64_t              rcv_size_and_priority,
-    uint64_t              timeout)
+void xniff_msg2_entry_hook(xniff_ctx_frame_t *ctx)
 {
+    if (!ctx) {
+        printf("::: xniff_msg2_entry_hook: intercepted call :::\n");
+        printf("  (null ctx)\n");
+        return;
+    }
+
+    void *data = (void *)(uintptr_t)ctx->x[0];
+    mach_msg_option64_t option64 = (mach_msg_option64_t)ctx->x[1];
+    uint64_t msgh_bits_and_send_size = ctx->x[2];
+    uint64_t msgh_remote_and_local_port = ctx->x[3];
+    uint64_t msgh_voucher_and_id = ctx->x[4];
+    uint64_t desc_count_and_rcv_name = ctx->x[5];
+    uint64_t rcv_size_and_priority = ctx->x[6];
+    uint64_t timeout = ctx->x[7];
+
     xniff_msg2_parsed_t p;
     xniff_parse_msg2_args(
         data, option64,
@@ -735,7 +750,7 @@ void xniff_msg2_entry_hook(
 
 /* Exit hook for mach_msg2_internal */
 __attribute__((used, noinline, visibility("default")))
-void xniff_msg2_exit_hook(uint64_t ret, const xniff_ctx_frame_t* ctx)
+void xniff_msg2_exit_hook(uint64_t ret, xniff_ctx_frame_t* ctx)
 {
     printf("::: xniff_msg2_exit_hook: intercepted return :::\n");
     printf("  return value: 0x%llx\n", (unsigned long long)ret);

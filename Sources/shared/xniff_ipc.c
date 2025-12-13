@@ -1,29 +1,39 @@
 #include "xniff_ipc.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 
 #ifndef SUN_LEN
 #define SUN_LEN(su) (offsetof(struct sockaddr_un, sun_path) + strlen((su)->sun_path))
 #endif
 
+static void set_nosigpipe(int fd) {
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#else
+    (void)fd;
+#endif
+}
+
+static void set_send_timeout_ms(int fd, int ms) {
+    if (ms <= 0) return;
+    struct timeval tv = {0};
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 int xniff_ipc_path_for_pid(pid_t pid, char *out, size_t outsz) {
     if (!out || outsz == 0) return -1;
     int n = snprintf(out, outsz, "/tmp/xniff-%d.sock", (int)pid);
     if (n <= 0 || (size_t)n >= outsz) return -1;
-    return 0;
-}
-
-static int set_nonblock(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) return -1;
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
     return 0;
 }
 
@@ -33,6 +43,10 @@ int xniff_ipc_client_connect(pid_t pid) {
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+    set_nosigpipe(fd);
+    // Don't let an instrumented target block forever if the listener stalls.
+    // If this times out, callers should drop the connection and retry later.
+    set_send_timeout_ms(fd, 50);
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -45,8 +59,6 @@ int xniff_ipc_client_connect(pid_t pid) {
         errno = e;
         return -1;
     }
-    // Make client non-blocking best-effort
-    (void)set_nonblock(fd);
     return fd;
 }
 
@@ -87,7 +99,9 @@ int xniff_ipc_server_listen(pid_t pid) {
 }
 
 int xniff_ipc_accept(int server_fd) {
-    return accept(server_fd, NULL, NULL);
+    int fd = accept(server_fd, NULL, NULL);
+    if (fd >= 0) set_nosigpipe(fd);
+    return fd;
 }
 
 int xniff_ipc_send_all_nb(int fd, const void *buf, size_t len) {

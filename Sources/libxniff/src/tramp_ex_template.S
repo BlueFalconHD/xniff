@@ -1,5 +1,6 @@
 .text
 #include "xniff_ctx_config.h"
+#include "../../shared/xniff_ctx.h"
 .align 2
 // Ensure valid landing pads for indirect branches/returns on BTI-enabled systems
 // (harmless NOPs where BTI is not enforced).
@@ -85,57 +86,93 @@ _XTRAMP_CTX_ADD:
     EOR     X10, X10, X10, LSR #15
     EOR     X10, X10, X10, LSR #30
     // Derive per-thread index from mixed value and scale by slot size.
-    // Configurable via XNIFF_CTX_IDX_BITS and XNIFF_CTX_SLOT_SHIFT.
+    // Configurable via XNIFF_CTX_IDX_BITS and XNIFF_CTX_SLOT_SIZE.
     // Use AArch64 form (UBFM) rather than UBFX alias for broad assembler compatibility.
     UBFM    X10, X10, #0, #(XNIFF_CTX_IDX_BITS - 1) // idx in [0, 2^bits)
-    LSL     X10, X10, #XNIFF_CTX_SLOT_SHIFT    // bytes per thread-slot
+    MOV     X12, #XNIFF_CTX_SLOT_SIZE
+    MUL     X10, X10, X12                      // bytes per thread-slot
     ADD     X9, X9, X10                        // X9 = thread-slot base
+    MOV     X14, X9                            // X14 = slot base (for depth updates)
     // depth at [X9, #0] (32-bit)
-    LDR     W11, [X9, #0]
-    MOV     W13, W11                           // save old depth for gating and frame index
-    // frame = base + 16 + ((depth & 1) << 7) ; frame size = 128 bytes, 2-frame ring
-    AND     W12, W11, #1
+    LDR     W11, [X14, #0]
+    MOV     W13, W11                           // old depth
+    // Re-entrancy guard (Frida-like): if we are already inside this trampoline on
+    // the current thread, bypass completely (do not touch LR, do not update depth,
+    // do not use the per-thread frames). This prevents ring-buffer overflow and
+    // keeps nested calls maximally transparent.
+    CBNZ    W11, _XTRAMP_RESTORE_AND_CONTINUE
+    // frame = base + header + ((depth & (COUNT-1)) * frame_size)
+    AND     W12, W11, #(XNIFF_CTX_FRAME_COUNT - 1)
     UXTW    X12, W12
-    LSL     X12, X12, #7
-    ADD     X9,  X9,  #16
+    LSL     X12, X12, #XNIFF_CTX_FRAME_SHIFT
+    ADD     X9,  X9,  #XNIFF_CTX_SLOT_HEADER_BYTES
     ADD     X9,  X9,  X12                      // X9 = frame ptr
+
+    // Capture entry SP and NZCV into frame so hooks can inspect stack arguments and flags.
+    // At this point SP has been lowered by: 0x120 (GPR save) + 0x220 (SIMD save) = 0x340.
+    ADD     X17, SP, #(0x120 + 0x220)          // original SP at function entry
+    STR     X17, [X9, #XNIFF_CTX_OFF_SP]
+    LDR     X17, [SP, #0x210]                  // NZCV saved in SIMD-save block
+    STR     X17, [X9, #XNIFF_CTX_OFF_NZCV]
+    STR     X8,  [X9, #XNIFF_CTX_OFF_X8]
 
     // Save resume PC into frame
 _XTRAMP_RESUME_ADRP:
     ADRP    X15, _dummy_patch_hook@PAGE        // patched to resume address
 _XTRAMP_RESUME_ADD:
     ADD     X15, X15, _dummy_patch_hook@PAGEOFF
-    STR     X15, [X9, #8]
+    STR     X15, [X9, #XNIFF_CTX_OFF_RESUME_PC]
 
     // Save original LR register (incoming return address) into our frame.
     // We will later replace X30 (LR) with our exit stub *before* executing the
     // relocated prologue, so the callee's own prologue will save/sign it as usual.
     MOV     X16, X30
-    STR     X16, [X9,  #0]                     // frame->lr_orig
+    STR     X16, [X9,  #XNIFF_CTX_OFF_LR_ORIG] // frame->lr_orig
 
     // Snapshot argument registers into frame (x0..x7)
-    STR     X0,  [X9, #16]
-    STR     X1,  [X9, #24]
-    STR     X2,  [X9, #32]
-    STR     X3,  [X9, #40]
-    STR     X4,  [X9, #48]
-    STR     X5,  [X9, #56]
-    STR     X6,  [X9, #64]
-    STR     X7,  [X9, #72]
+    STR     X0,  [X9, #XNIFF_CTX_OFF_X0]
+    STR     X1,  [X9, #XNIFF_CTX_OFF_X1]
+    STR     X2,  [X9, #XNIFF_CTX_OFF_X2]
+    STR     X3,  [X9, #XNIFF_CTX_OFF_X3]
+    STR     X4,  [X9, #XNIFF_CTX_OFF_X4]
+    STR     X5,  [X9, #XNIFF_CTX_OFF_X5]
+    STR     X6,  [X9, #XNIFF_CTX_OFF_X6]
+    STR     X7,  [X9, #XNIFF_CTX_OFF_X7]
     // Increment depth and write back
-    // Keep old depth in W13 intact for gating below; use X14 as header ptr
+    // Keep old depth in W13 intact for gating below; X14 holds slot base
     ADD     W11, W11, #1
-    SUB     X14, X9,  #16                      // slot header address
-    STR     W11, [X14]
+    STR     W11, [X14, #0]
 
 _XTRAMP_HOOK_ADRP:
     ADRP    X16, _dummy_patch_hook@PAGE        // patched to entry hook
 _XTRAMP_HOOK_ADD:
     ADD     X16, X16, _dummy_patch_hook@PAGEOFF
-    // Call entry hook only for outermost depth
-    // old depth in W13: if zero, call; else skip
-    CBNZ    W13, 1f
+    // Call entry hook, passing x0 = ctx_frame.
+    // The hook may modify ctx->x[0..7] / ctx->x8 to rewrite arguments.
+    STR     X9,  [SP, #0x218]                  // preserve frame ptr across call
+    MOV     X0,  X9
     BLR     X16
+    LDR     X9,  [SP, #0x218]
+    // Apply any rewritten arguments by updating our saved GPR block.
+    // GPR-save block begins at SP + 0x220 (SIMD-save size).
+    LDR     X10, [X9, #XNIFF_CTX_OFF_X0]
+    STR     X10, [SP, #(0x220 + 0x00)]
+    LDR     X10, [X9, #XNIFF_CTX_OFF_X1]
+    STR     X10, [SP, #(0x220 + 0x08)]
+    LDR     X10, [X9, #XNIFF_CTX_OFF_X2]
+    STR     X10, [SP, #(0x220 + 0x10)]
+    LDR     X10, [X9, #XNIFF_CTX_OFF_X3]
+    STR     X10, [SP, #(0x220 + 0x18)]
+    LDR     X10, [X9, #XNIFF_CTX_OFF_X4]
+    STR     X10, [SP, #(0x220 + 0x20)]
+    LDR     X10, [X9, #XNIFF_CTX_OFF_X5]
+    STR     X10, [SP, #(0x220 + 0x28)]
+    LDR     X10, [X9, #XNIFF_CTX_OFF_X6]
+    STR     X10, [SP, #(0x220 + 0x30)]
+    LDR     X10, [X9, #XNIFF_CTX_OFF_X7]
+    STR     X10, [SP, #(0x220 + 0x38)]
+    LDR     X10, [X9, #XNIFF_CTX_OFF_X8]
+    STR     X10, [SP, #(0x220 + 0x40)]         // x8 is at (x8,x9) pair slot
 1:
 
     // Redirect return to our exit stub by updating X30 (LR).
@@ -148,6 +185,7 @@ _XTRAMP_EXITLR_ADD:
     ADD     X16, X16, _XTRAMP_EXIT_STUB@PAGEOFF
     MOV     X30, X16
 
+_XTRAMP_RESTORE_AND_CONTINUE:
     // Restore FP/SIMD state and NZCV first to minimize side-effects
     LDP     Q0,  Q1,  [SP, #0x000]
     LDP     Q2,  Q3,  [SP, #0x020]
@@ -214,23 +252,28 @@ _XTRAMP_EXIT_CTX_ADD:
     EOR     X10, X10, X10, LSR #15
     EOR     X10, X10, X10, LSR #30
     UBFM    X10, X10, #0, #(XNIFF_CTX_IDX_BITS - 1)
-    LSL     X10, X10, #XNIFF_CTX_SLOT_SHIFT
+    MOV     X12, #XNIFF_CTX_SLOT_SIZE
+    MUL     X10, X10, X12
     ADD     X9,  X9,  X10                      // thread-slot base
-    LDR     W11, [X9, #0]                      // current depth
-    MOV     W13, W11                           // save old depth (matches entry)
-    // frame = base + 16 + ((old_depth & 1) << 7) ; use same ring as entry
-    AND     W12, W13, #1
+    MOV     X14, X9                            // X14 = slot base (for depth updates)
+    LDR     W11, [X14, #0]                     // current depth (>= 1)
+    // Select the same frame used at entry:
+    // entry frame index = depth_before_increment
+    // exit sees depth_after_increment, so frame index = (depth - 1)
+    SUB     W13, W11, #1                       // W13 = frame index for this invocation
+    // frame = base + header + ((frame_index & (COUNT-1)) * frame_size)
+    AND     W12, W13, #(XNIFF_CTX_FRAME_COUNT - 1)
     UXTW    X12, W12
-    LSL     X12, X12, #7
-    ADD     X12, X12, #16
+    LSL     X12, X12, #XNIFF_CTX_FRAME_SHIFT
+    ADD     X9,  X9,  #XNIFF_CTX_SLOT_HEADER_BYTES
     ADD     X9,  X9,  X12                      // X9 = frame ptr
-    // Save return value into frame at offset 80
-    STR     X0,  [X9, #80]
+    // Save return value into frame (x0 + v0/q0)
+    STR     X0,  [X9, #XNIFF_CTX_OFF_RET_X0]
+    STR     Q0,  [X9, #XNIFF_CTX_OFF_RET_Q0]
     // Now decrement depth (after selecting frame based on old depth)
     SUB     W11, W11, #1
     // Write back new depth to slot header
-    SUB     X12, X9, #16
-    STR     W11, [X12]
+    STR     W11, [X14, #0]
     // Call exit hook: x0 is ret, x1 = ctx
 _XTRAMP_EXIT_HOOK_ADRP:
     ADRP    X16, _dummy_patch_hook@PAGE
@@ -270,7 +313,10 @@ _XTRAMP_EXIT_HOOK_ADD:
     LDP     Q4,  Q5,  [SP, #0x040]
     LDP     Q6,  Q7,  [SP, #0x060]
     ADD     SP, SP, #0xB0
-    LDR     X16, [X9, #0]
+    // Apply any rewritten return value from ctx frame.
+    LDR     X0,  [X9, #XNIFF_CTX_OFF_RET_X0]
+    LDR     Q0,  [X9, #XNIFF_CTX_OFF_RET_Q0]
+    LDR     X16, [X9, #XNIFF_CTX_OFF_LR_ORIG]
     MOV     X30, X16
     RET
 

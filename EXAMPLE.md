@@ -269,8 +269,16 @@ static void dump_message_body(const mach_msg_header_t *msg)
 }
 
 __attribute__((used, noinline, visibility("default")))
-void xniff_remote_entry_hook(mach_msg_header_t *msg, mach_msg_option_t option) {
+void xniff_remote_entry_hook(xniff_ctx_frame_t *ctx) {
     printf("::: xniff_remote_entry_hook: intercepted call :::\n");
+
+    if (!ctx) {
+        printf("  (null ctx)\n");
+        return;
+    }
+
+    mach_msg_header_t *msg = (mach_msg_header_t *)(uintptr_t)ctx->x[0];
+    mach_msg_option_t option = (mach_msg_option_t)ctx->x[1];
 
     if (!msg) {
         printf("  (null mach_msg_header_t *)\n");
@@ -294,7 +302,7 @@ void xniff_remote_entry_hook(mach_msg_header_t *msg, mach_msg_option_t option) {
 }
 
 __attribute__((used, noinline, visibility("default")))
-void xniff_remote_exit_hook(uint64_t ret, const xniff_ctx_frame_t* ctx) {
+void xniff_remote_exit_hook(uint64_t ret, xniff_ctx_frame_t* ctx) {
     printf("::: xniff_remote_exit_hook: intercepted return :::\n");
     printf("  return value: 0x%llx\n", ret);
 

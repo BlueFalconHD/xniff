@@ -78,8 +78,10 @@ file(GLOB XNIFF_TEST_SOURCES CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/Sources/xniff-tests/*.S"
 )
 
-add_executable(xniff-test ${XNIFF_TEST_SOURCES})
+add_executable(xniff-test ${XNIFF_TEST_SOURCES} ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_ipc.c)
 target_link_libraries(xniff-test PRIVATE)
+target_include_directories(xniff-test PRIVATE
+    ${PROJECT_SOURCE_DIR}/Sources/shared)
 
 # xpcdesert shared library + CLI
 set(XPCDESERT_DIR "${PROJECT_SOURCE_DIR}/Sources/xpcdesert")

@@ -891,8 +891,8 @@ int trampoline_bank_install_task_with_exit(trampoline_bank_t *bank,
     // Allocate per-slot context region (RW).
     // Context region layout per trampoline slot:
     // - XNIFF_CTX_INDEX_COUNT per-thread slots (derived from TPIDRRO_EL0)
-    // - XNIFF_CTX_SLOT_SIZE bytes per thread slot (2 frames × 128B = 256B)
-    // Total = XNIFF_CTX_TOTAL_BYTES (defaults to 4096 * 256 = 1 MiB)
+    // - XNIFF_CTX_SLOT_SIZE bytes per thread slot (header + N frames)
+    // Total = XNIFF_CTX_TOTAL_BYTES
     const size_t ctx_per_slot = (size_t)XNIFF_CTX_TOTAL_BYTES;
     vm_address_t ctx_addr = 0;
     if (vm_allocate(bank->task, &ctx_addr, (vm_size_t)ctx_per_slot, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {

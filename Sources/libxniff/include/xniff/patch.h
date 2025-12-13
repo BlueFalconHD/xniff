@@ -119,7 +119,10 @@ void assemble_trampoline_at(uint8_t *tramp_base, uint64_t hook_address,
 
 // Extended: entry + exit (position-independent helper code embedded in trampoline).
 // Assembles and installs a trampoline that saves args, redirects LR to an exit stub,
-// and calls an exit hook on return. Context memory base is provided per trampoline slot.
+// and calls an exit hook on return.
+// The entry hook is called as: entry_hook(xniff_ctx_frame_t * ctx)
+// The exit hook is called as:  exit_hook(uint64_t ret_x0, xniff_ctx_frame_t * ctx)
+// Context memory base is provided per trampoline slot.
 int patch_function_with_exit_trampoline_task(mach_port_t task,
                                              mach_vm_address_t target_function,
                                              mach_vm_address_t trampoline_buffer,
