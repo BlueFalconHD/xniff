@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/Users/hayes/Stores/repos/bluefalconhd/xniff/_deps/frida_gum_devkit-subbuild/CMakeFiles/frida_gum_devkit-populate"
+		},
+		{
+			"file" : "/Users/hayes/Stores/repos/bluefalconhd/xniff/_deps/frida_gum_devkit-subbuild/CMakeFiles/frida_gum_devkit-populate.rule"
+		},
+		{
+			"file" : "/Users/hayes/Stores/repos/bluefalconhd/xniff/_deps/frida_gum_devkit-subbuild/CMakeFiles/frida_gum_devkit-populate-complete.rule"
+		},
+		{
+			"file" : "/Users/hayes/Stores/repos/bluefalconhd/xniff/_deps/frida_gum_devkit-subbuild/frida_gum_devkit-populate-prefix/src/frida_gum_devkit-populate-stamp/frida_gum_devkit-populate-build.rule"
+		},
+		{
+			"file" : "/Users/hayes/Stores/repos/bluefalconhd/xniff/_deps/frida_gum_devkit-subbuild/frida_gum_devkit-populate-prefix/src/frida_gum_devkit-populate-stamp/frida_gum_devkit-populate-configure.rule"
+		},
+		{
+			"file" : "/Users/hayes/Stores/repos/bluefalconhd/xniff/_deps/frida_gum_devkit-subbuild/frida_gum_devkit-populate-prefix/src/frida_gum_devkit-populate-stamp/frida_gum_devkit-populate-download.rule"
+		},
+		{
+			"file" : "/Users/hayes/Stores/repos/bluefalconhd/xniff/_deps/frida_gum_devkit-subbuild/frida_gum_devkit-populate-prefix/src/frida_gum_devkit-populate-stamp/frida_gum_devkit-populate-install.rule"
+		},
+		{
+			"file" : "/Users/hayes/Stores/repos/bluefalconhd/xniff/_deps/frida_gum_devkit-subbuild/frida_gum_devkit-populate-prefix/src/frida_gum_devkit-populate-stamp/frida_gum_devkit-populate-mkdir.rule"
+		},
+		{
+			"file" : "/Users/hayes/Stores/repos/bluefalconhd/xniff/_deps/frida_gum_devkit-subbuild/frida_gum_devkit-populate-prefix/src/frida_gum_devkit-populate-stamp/frida_gum_devkit-populate-patch.rule"
+		},
+		{
+			"file" : "/Users/hayes/Stores/repos/bluefalconhd/xniff/_deps/frida_gum_devkit-subbuild/frida_gum_devkit-populate-prefix/src/frida_gum_devkit-populate-stamp/frida_gum_devkit-populate-test.rule"
+		},
+		{
+			"file" : "/Users/hayes/Stores/repos/bluefalconhd/xniff/_deps/frida_gum_devkit-subbuild/frida_gum_devkit-populate-prefix/src/frida_gum_devkit-populate-stamp/frida_gum_devkit-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"frida_gum_devkit-populate"
+		],
+		"name" : "frida_gum_devkit-populate"
+	}
+}

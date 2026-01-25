@@ -1,0 +1,1 @@
+/opt/homebrew/opt/llvm/bin/clang  -arch arm64 -mmacosx-version-min=26.0 -Wl,-search_paths_first -Wl,-headerpad_max_install_names "CMakeFiles/xniff-test.dir/Sources/xniff-tests/main.c.o" "CMakeFiles/xniff-test.dir/Sources/shared/xniff_ipc.c.o" -o xniff-test
