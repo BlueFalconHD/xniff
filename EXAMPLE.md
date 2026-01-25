@@ -489,9 +489,7 @@ Also, the following entitlements should be applied:
 After you run, you have a window of about 30 seconds to run xniff-cli on the target process to see the intercepted XPC messages.
 
 ```
-sudo build/xniff-cli hook-exit <PID> _mach_msg_overwrite _xniff_remote_entry_hook _xniff_remote_exit_hook
+sudo build/xniff-cli sniff-xpc <PID> build/libxniff-hooks.dylib --mach
 ```
 
-This will output intercepted XPC messages to STDOUT of the victim process.
-
-This is merely a proof of concept. Xniff will soon embed the sniffing logic directly, so xniff can be run on any process without needing access to source.
+This will inject `xniff-hooks` into the target and stream intercepted messages back to `xniff-cli`.

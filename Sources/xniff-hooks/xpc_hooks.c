@@ -1,6 +1,6 @@
-// xniff-xpc-hooks: exported entry/exit hooks for Mach message tracing
-// This library is intended to be injected into a running process so that
-// xniff-cli can install trampolines targeting these hooks.
+// xniff-hooks: in-process Frida Gum hooks for Mach message tracing.
+// This library is intended to be injected into a running process. It installs
+// interceptors and streams events back to xniff-cli via the existing IPC protocol.
 
 #include <stdio.h>
 #include <stdint.h>
@@ -14,6 +14,7 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <time.h>
 
@@ -23,11 +24,47 @@
 #include <mach/mach.h>
 #include <mach/message.h>
 
-#include "../shared/xniff_ctx.h"
+#include "xniff_hooks_emit.h"
 
 static int g_ipc_fd = -1; // lazily connect per-process
 static uint64_t g_next_connect_ns = 0;
 static pthread_mutex_t g_ipc_lock = PTHREAD_MUTEX_INITIALIZER;
+
+typedef struct {
+    uint32_t max_msg_copy;       // max inline bytes copied per event
+    uint32_t max_ool_total;      // max total OOL bytes per event (0 = unlimited)
+    uint32_t max_ool_per_desc;   // max OOL bytes per descriptor (0 = unlimited)
+    uint32_t max_desc;           // max descriptors walked
+    uint32_t max_payload;        // max total IPC payload (excluding 20-byte header)
+} xniff_hook_limits_t;
+
+static xniff_hook_limits_t g_limits;
+static pthread_once_t g_limits_once = PTHREAD_ONCE_INIT;
+
+static uint32_t env_u32(const char *name, uint32_t defv) {
+    const char *s = getenv(name);
+    if (!s || !*s) return defv;
+    errno = 0;
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 0);
+    if (errno != 0 || end == s) return defv;
+    if (v > UINT32_MAX) return UINT32_MAX;
+    return (uint32_t)v;
+}
+
+static void limits_init_once(void) {
+    // Keep these conservative by default; tune via env vars when needed.
+    g_limits.max_msg_copy     = env_u32("XNIFF_MAX_MSG_COPY",     256u * 1024u);
+    g_limits.max_ool_total    = env_u32("XNIFF_MAX_OOL_TOTAL",    1024u * 1024u);
+    g_limits.max_ool_per_desc = env_u32("XNIFF_MAX_OOL_PER_DESC", 256u * 1024u);
+    g_limits.max_desc         = env_u32("XNIFF_MAX_DESCRIPTORS",  64u);
+    g_limits.max_payload      = env_u32("XNIFF_MAX_IPC_PAYLOAD",  4u * 1024u * 1024u);
+}
+
+static const xniff_hook_limits_t *limits(void) {
+    (void)pthread_once(&g_limits_once, limits_init_once);
+    return &g_limits;
+}
 
 static uint64_t now_monotonic_ns(void) {
     struct timespec ts;
@@ -55,26 +92,73 @@ static int ensure_ipc_fd_locked(void) {
     return g_ipc_fd;
 }
 
-static size_t attachments_size_for_msg(const mach_msg_header_t *msg) {
+static inline uint32_t min_u32(uint32_t a, uint32_t b) { return a < b ? a : b; }
+
+static uint32_t clamp_ool_bytes(uint64_t want, uint32_t elem_size, uint32_t *total_left_io) {
+    uint32_t max_u32 = UINT32_MAX;
+    uint32_t n = (want > (uint64_t)max_u32) ? max_u32 : (uint32_t)want;
+
+    const xniff_hook_limits_t *lim = limits();
+    if (lim->max_ool_per_desc != 0) n = min_u32(n, lim->max_ool_per_desc);
+
+    if (total_left_io && *total_left_io != 0) n = min_u32(n, *total_left_io);
+
+    if (elem_size != 0 && n >= elem_size) n -= (n % elem_size);
+    if (total_left_io && *total_left_io != 0) *total_left_io -= n;
+    return n;
+}
+
+static mach_msg_size_t safe_descriptor_count(const mach_msg_header_t *msg, uint32_t msg_bound, const uint8_t **out_base, const mach_msg_body_t **out_body, mach_msg_descriptor_t **out_desc) {
     if (!msg) return 0;
     if (!(msg->msgh_bits & MACH_MSGH_BITS_COMPLEX)) return 0;
-    const uint8_t *base = (const uint8_t *)msg;
+
     mach_msg_size_t total = msg->msgh_size;
+    if (msg_bound != 0 && total > msg_bound) total = (mach_msg_size_t)msg_bound;
     if (total < sizeof(*msg) + sizeof(mach_msg_body_t)) return 0;
+
+    const uint8_t *base = (const uint8_t *)msg;
     const mach_msg_body_t *body = (const mach_msg_body_t *)(base + sizeof(*msg));
     mach_msg_descriptor_t *desc = (mach_msg_descriptor_t *)((uint8_t *)body + sizeof(*body));
+
     mach_msg_size_t dcount = body->msgh_descriptor_count;
+    mach_msg_size_t desc_bytes_avail = total - (mach_msg_size_t)(sizeof(*msg) + sizeof(*body));
+    mach_msg_size_t max_by_size = desc_bytes_avail / (mach_msg_size_t)sizeof(mach_msg_descriptor_t);
+    if (dcount > max_by_size) dcount = max_by_size;
+
+    const xniff_hook_limits_t *lim = limits();
+    if (lim->max_desc != 0 && dcount > (mach_msg_size_t)lim->max_desc) dcount = (mach_msg_size_t)lim->max_desc;
+
+    if (out_base) *out_base = base;
+    if (out_body) *out_body = body;
+    if (out_desc) *out_desc = desc;
+    return dcount;
+}
+
+static size_t attachments_size_for_msg_limited(const mach_msg_header_t *msg, uint32_t msg_bound) {
+    if (!msg) return 0;
+
+    mach_msg_descriptor_t *desc = NULL;
+    mach_msg_size_t dcount = safe_descriptor_count(msg, msg_bound, NULL, NULL, &desc);
+    if (dcount == 0) return 0;
+
+    const xniff_hook_limits_t *lim = limits();
+    uint32_t total_left = lim->max_ool_total ? lim->max_ool_total : 0; // 0 == unlimited
+
     size_t sum = 0;
     for (mach_msg_size_t i = 0; i < dcount; i++, desc++) {
         mach_msg_descriptor_type_t t = desc->type.type;
         if (t == MACH_MSG_OOL_DESCRIPTOR) {
             const mach_msg_ool_descriptor_t *ool = &desc->out_of_line;
-            size_t tlv = sizeof(xniff_ipc_tlv_t) + sizeof(xniff_ool_data_t) + (size_t)ool->size;
+            uint32_t n = clamp_ool_bytes((uint64_t)ool->size, 0, &total_left);
+            if (n == 0) continue;
+            size_t tlv = sizeof(xniff_ipc_tlv_t) + sizeof(xniff_ool_data_t) + (size_t)n;
             sum += tlv;
         } else if (t == MACH_MSG_OOL_PORTS_DESCRIPTOR) {
             const mach_msg_ool_ports_descriptor_t *op = &desc->ool_ports;
-            size_t ports_bytes = (size_t)op->count * sizeof(mach_port_t);
-            size_t tlv = sizeof(xniff_ipc_tlv_t) + sizeof(xniff_ool_ports_t) + ports_bytes;
+            uint64_t ports_bytes64 = (uint64_t)op->count * (uint64_t)sizeof(mach_port_t);
+            uint32_t n = clamp_ool_bytes(ports_bytes64, (uint32_t)sizeof(mach_port_t), &total_left);
+            if (n == 0) continue;
+            size_t tlv = sizeof(xniff_ipc_tlv_t) + sizeof(xniff_ool_ports_t) + (size_t)n;
             sum += tlv;
         }
     }
@@ -82,16 +166,33 @@ static size_t attachments_size_for_msg(const mach_msg_header_t *msg) {
 }
 
 static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
-                              const mach_msg_header_t *msg) {
+                              const mach_msg_header_t *msg,
+                              uint32_t buf_size_hint) {
     if (!msg || !pl_in) return;
     pthread_mutex_lock(&g_ipc_lock);
     if (ensure_ipc_fd_locked() < 0) { pthread_mutex_unlock(&g_ipc_lock); return; }
 
-    uint32_t copy_len = msg->msgh_size;
+    const xniff_hook_limits_t *lim = limits();
     const uint8_t *base = (const uint8_t *)msg;
 
+    uint32_t raw_msgh_size = (uint32_t)msg->msgh_size;
+    bool msgh_size_ok = (raw_msgh_size >= (uint32_t)sizeof(*msg)) &&
+                        (buf_size_hint != 0 ? (raw_msgh_size <= buf_size_hint)
+                                            : (lim->max_msg_copy == 0 || raw_msgh_size <= lim->max_msg_copy));
+
+    // If msgh_size looks bogus (common on receive-only entry or on error exits),
+    // fall back to the caller-provided buffer size hint. Avoid reading past what
+    // the caller said they allocated.
+    uint32_t copy_bound = msgh_size_ok ? raw_msgh_size : buf_size_hint;
+    if (copy_bound == 0) copy_bound = raw_msgh_size;
+
+    uint32_t copy_len = copy_bound;
+    if (lim->max_msg_copy != 0 && copy_len > lim->max_msg_copy) copy_len = lim->max_msg_copy;
+
     // Compute attachment TLVs size in advance
-    size_t att_sz = attachments_size_for_msg(msg);
+    uint32_t msg_bound = msgh_size_ok ? raw_msgh_size : 0;
+    if (msg_bound != 0 && buf_size_hint != 0 && msg_bound > buf_size_hint) msg_bound = buf_size_hint;
+    size_t att_sz = msgh_size_ok ? attachments_size_for_msg_limited(msg, msg_bound) : 0;
 
     xniff_ipc_hdr_t hdr = {0};
     hdr.magic = XNIFF_IPC_MAGIC;
@@ -99,67 +200,117 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
     hdr.kind = (uint16_t)kind;
     hdr.pid = (uint32_t)getpid();
     hdr.tid_low = (uint32_t)(uintptr_t)pthread_self();
-    hdr.payload_len = (uint32_t)(sizeof(xniff_ipc_mach_payload_t) + copy_len + att_sz);
+
+    uint64_t payload_len64 = (uint64_t)sizeof(xniff_ipc_mach_payload_t) + (uint64_t)copy_len + (uint64_t)att_sz;
+    if (lim->max_payload != 0 && payload_len64 > lim->max_payload) {
+        // Prefer truncating attachments first, then inline bytes.
+        uint64_t over = payload_len64 - lim->max_payload;
+        if (att_sz >= over) {
+            att_sz -= (size_t)over;
+        } else {
+            over -= att_sz;
+            att_sz = 0;
+            if (over >= copy_len) copy_len = 0;
+            else copy_len -= (uint32_t)over;
+        }
+        payload_len64 = (uint64_t)sizeof(xniff_ipc_mach_payload_t) + (uint64_t)copy_len + (uint64_t)att_sz;
+    }
+    if (payload_len64 > UINT32_MAX) {
+        // Hard fail-safe: keep within the wire format.
+        uint64_t max = UINT32_MAX;
+        if (payload_len64 > max) {
+            uint64_t keep = (uint64_t)sizeof(xniff_ipc_mach_payload_t);
+            if (keep > max) { pthread_mutex_unlock(&g_ipc_lock); return; }
+            uint64_t left = max - keep;
+            uint64_t keep_inline = (copy_len > left) ? left : copy_len;
+            left -= keep_inline;
+            uint64_t keep_att = ((uint64_t)att_sz > left) ? left : (uint64_t)att_sz;
+            copy_len = (uint32_t)keep_inline;
+            att_sz = (size_t)keep_att;
+            payload_len64 = keep + keep_inline + keep_att;
+        }
+    }
+    hdr.payload_len = (uint32_t)payload_len64;
 
     xniff_ipc_mach_payload_t pl = *pl_in;
-    pl.msgh_size = msg->msgh_size;
+    pl.msgh_size = msgh_size_ok ? raw_msgh_size : 0;
     pl.copy_len = copy_len;
     pl.msg_addr = (uint64_t)(uintptr_t)msg;
 
     // Send header, payload, and inline bytes (blocking to ensure ordering)
     if (xniff_ipc_send_all(g_ipc_fd, &hdr, sizeof(hdr)) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
     if (xniff_ipc_send_all(g_ipc_fd, &pl, sizeof(pl)) != 0)  { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
-    if (xniff_ipc_send_all(g_ipc_fd, base, copy_len) != 0)   { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
+    if (copy_len && xniff_ipc_send_all(g_ipc_fd, base, copy_len) != 0)   { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
 
     // Send attachments
-    if (msg->msgh_bits & MACH_MSGH_BITS_COMPLEX) {
-        if (copy_len >= sizeof(*msg) + sizeof(mach_msg_body_t)) {
-            const mach_msg_body_t *body = (const mach_msg_body_t *)(base + sizeof(*msg));
-            mach_msg_descriptor_t *desc = (mach_msg_descriptor_t *)((uint8_t *)body + sizeof(*body));
-            mach_msg_size_t dcount = body->msgh_descriptor_count;
-            for (mach_msg_size_t i = 0; i < dcount; i++, desc++) {
-                mach_msg_descriptor_type_t t = desc->type.type;
-                if (t == MACH_MSG_OOL_DESCRIPTOR) {
-                    const mach_msg_ool_descriptor_t *ool = &desc->out_of_line;
-                    xniff_ipc_tlv_t h = { .type = XNIFF_TLV_OOL_DATA, .length = (uint32_t)(sizeof(xniff_ool_data_t) + ool->size) };
-                    xniff_ool_data_t md = {0};
-                    md.index = (uint32_t)i;
-                    md.flags = (ool->deallocate ? 1u : 0u) | (ool->copy ? 2u : 0u);
-                    md.address = (uint64_t)(uintptr_t)ool->address;
-                    md.size = (uint32_t)ool->size;
-                    if (xniff_ipc_send_all(g_ipc_fd, &h, sizeof(h)) != 0)  { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
-                    if (xniff_ipc_send_all(g_ipc_fd, &md, sizeof(md)) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
-                    if (ool->address && ool->size) {
-                        if (xniff_ipc_send_all(g_ipc_fd, ool->address, ool->size) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
-                    }
-                } else if (t == MACH_MSG_OOL_PORTS_DESCRIPTOR) {
-                    const mach_msg_ool_ports_descriptor_t *op = &desc->ool_ports;
-                    size_t ports_bytes = (size_t)op->count * sizeof(mach_port_t);
-                    xniff_ipc_tlv_t h = { .type = XNIFF_TLV_OOL_PORTS, .length = (uint32_t)(sizeof(xniff_ool_ports_t) + ports_bytes) };
-                    xniff_ool_ports_t md = {0};
-                    md.index = (uint32_t)i;
-                    md.count = (uint32_t)op->count;
-                    md.address = (uint64_t)(uintptr_t)op->address;
-                    md.elem_size = (uint32_t)sizeof(mach_port_t);
-                    if (xniff_ipc_send_all(g_ipc_fd, &h, sizeof(h)) != 0)  { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
-                    if (xniff_ipc_send_all(g_ipc_fd, &md, sizeof(md)) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
-                    if (op->address && ports_bytes) {
-                        if (xniff_ipc_send_all(g_ipc_fd, op->address, ports_bytes) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
-                    }
+    if (att_sz != 0 && msgh_size_ok) {
+        mach_msg_descriptor_t *desc2 = NULL;
+        mach_msg_size_t dcount = safe_descriptor_count(msg, msg_bound, NULL, NULL, &desc2);
+        uint32_t total_left = lim->max_ool_total ? lim->max_ool_total : 0;
+        size_t att_left = att_sz;
+        for (mach_msg_size_t i = 0; i < dcount; i++, desc2++) {
+            if (att_left < sizeof(xniff_ipc_tlv_t)) break;
+            mach_msg_descriptor_type_t t = desc2->type.type;
+            if (t == MACH_MSG_OOL_DESCRIPTOR) {
+                const mach_msg_ool_descriptor_t *ool = &desc2->out_of_line;
+                uint32_t n = clamp_ool_bytes((uint64_t)ool->size, 0, &total_left);
+                size_t overhead = sizeof(xniff_ipc_tlv_t) + sizeof(xniff_ool_data_t);
+                if (att_left <= overhead) break;
+                size_t max_data_sz = att_left - overhead;
+                if (max_data_sz < n) n = (uint32_t)max_data_sz;
+                if (n == 0) break;
+                if ((uint64_t)sizeof(xniff_ool_data_t) + (uint64_t)n > UINT32_MAX) continue;
+                xniff_ipc_tlv_t h = { .type = XNIFF_TLV_OOL_DATA, .length = (uint32_t)(sizeof(xniff_ool_data_t) + n) };
+                xniff_ool_data_t md = {0};
+                md.index = (uint32_t)i;
+                md.flags = (ool->deallocate ? 1u : 0u) | (ool->copy ? 2u : 0u);
+                md.address = (uint64_t)(uintptr_t)ool->address;
+                md.size = n;
+                if (xniff_ipc_send_all(g_ipc_fd, &h, sizeof(h)) != 0)  { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
+                if (xniff_ipc_send_all(g_ipc_fd, &md, sizeof(md)) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
+                if (ool->address && n) {
+                    if (xniff_ipc_send_all(g_ipc_fd, ool->address, n) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
                 }
+                att_left -= (overhead + (size_t)n);
+            } else if (t == MACH_MSG_OOL_PORTS_DESCRIPTOR) {
+                const mach_msg_ool_ports_descriptor_t *op = &desc2->ool_ports;
+                uint64_t ports_bytes64 = (uint64_t)op->count * (uint64_t)sizeof(mach_port_t);
+                uint32_t n = clamp_ool_bytes(ports_bytes64, (uint32_t)sizeof(mach_port_t), &total_left);
+                size_t overhead = sizeof(xniff_ipc_tlv_t) + sizeof(xniff_ool_ports_t);
+                if (att_left <= overhead) break;
+                size_t max_data_sz = att_left - overhead;
+                if (max_data_sz < n) n = (uint32_t)max_data_sz;
+                n -= (n % (uint32_t)sizeof(mach_port_t));
+                if (n == 0) break;
+                uint32_t send_count = n / (uint32_t)sizeof(mach_port_t);
+                if ((uint64_t)sizeof(xniff_ool_ports_t) + (uint64_t)n > UINT32_MAX) continue;
+                xniff_ipc_tlv_t h = { .type = XNIFF_TLV_OOL_PORTS, .length = (uint32_t)(sizeof(xniff_ool_ports_t) + n) };
+                xniff_ool_ports_t md = {0};
+                md.index = (uint32_t)i;
+                md.count = send_count;
+                md.address = (uint64_t)(uintptr_t)op->address;
+                md.elem_size = (uint32_t)sizeof(mach_port_t);
+                if (xniff_ipc_send_all(g_ipc_fd, &h, sizeof(h)) != 0)  { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
+                if (xniff_ipc_send_all(g_ipc_fd, &md, sizeof(md)) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
+                if (op->address && n) {
+                    if (xniff_ipc_send_all(g_ipc_fd, op->address, n) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
+                }
+                att_left -= (overhead + (size_t)n);
             }
-            (void)0;
         }
     }
     pthread_mutex_unlock(&g_ipc_lock);
 }
 
-
-__attribute__((used, noinline, visibility("default")))
-void xniff_remote_entry_hook(xniff_ctx_frame_t *ctx) {
-    if (!ctx) return;
-    mach_msg_header_t *msg = (mach_msg_header_t *)(uintptr_t)ctx->x[0];
-    mach_msg_option_t option = (mach_msg_option_t)ctx->x[1];
+void xniff_emit_mach_msg_entry(const uint64_t args[8]) {
+    if (!args) return;
+    mach_msg_header_t *msg = (mach_msg_header_t *)(uintptr_t)args[0];
+    mach_msg_option_t option = (mach_msg_option_t)args[1];
+    uint32_t send_size = (uint32_t)args[2];
+    uint32_t rcv_size  = (uint32_t)args[3];
+    uint32_t buf_hint = 0;
+    if (option & MACH_SEND_MSG) buf_hint = send_size;
+    else if (option & MACH_RCV_MSG) buf_hint = rcv_size;
     xniff_ipc_mach_payload_t pl = {0};
     pl.api = XNIFF_API_MACH_MSG;
     pl.direction = XNIFF_DIR_ENTRY;
@@ -168,36 +319,34 @@ void xniff_remote_entry_hook(xniff_ctx_frame_t *ctx) {
     pl.ret_value = 0;
     pl.desc_count = 0;
     pl.priority = 0;
-    pl.timeout = ctx->x[5];
-    pl.args[0] = (uint64_t)(uintptr_t)msg;
-    pl.args[1] = (uint64_t)option;
-    pl.args[2] = ctx->x[2];
-    pl.args[3] = ctx->x[3];
-    pl.args[4] = ctx->x[4];
-    pl.args[5] = ctx->x[5];
-    pl.args[6] = ctx->x[6];
-    pl.args[7] = ctx->x[7];
-    ipc_send_msg_full(XNIFF_EVT_MACH_ENTRY, &pl, msg);
+    pl.timeout = args[5];
+    for (int i = 0; i < 8; i++) pl.args[i] = args[i];
+    ipc_send_msg_full(XNIFF_EVT_MACH_ENTRY, &pl, msg, buf_hint);
 }
 
-__attribute__((used, noinline, visibility("default")))
-void xniff_remote_exit_hook(uint64_t ret, xniff_ctx_frame_t *ctx) {
-    mach_msg_option_t option = 0;
-    if (ctx) option = (mach_msg_option_t)ctx->x[1];
-    if (ctx) {
-        mach_msg_header_t* reply = (mach_msg_header_t*)(ctx->x[7] ? ctx->x[7] : ctx->x[0]);
-        if (reply) {
-            xniff_ipc_mach_payload_t pl = {0};
-            pl.api = XNIFF_API_MACH_MSG;
-            pl.direction = XNIFF_DIR_EXIT;
-            pl.option_lo = (uint32_t)option;
-            pl.ret_value = ret;
-            for (int i = 0; i < 8; i++) pl.args[i] = ctx->x[i];
-            pl.timeout = ctx->x[5];
-            ipc_send_msg_full(XNIFF_EVT_MACH_EXIT, &pl, reply);
-        }
-    }
+void xniff_emit_mach_msg_exit(uint64_t ret, const uint64_t args[8]) {
+    if (!args) return;
+    mach_msg_option_t option = (mach_msg_option_t)args[1];
+    uint32_t send_size = (uint32_t)args[2];
+    uint32_t rcv_size  = (uint32_t)args[3];
+
+    // Only trust the receive buffer on success. Otherwise, fall back to the send buffer
+    // to avoid walking uninitialized memory (common with rcv errors).
+    bool have_rcv = (option & MACH_RCV_MSG) && (ret == MACH_MSG_SUCCESS) && args[7];
+    mach_msg_header_t* msg = (mach_msg_header_t *)(uintptr_t)(have_rcv ? args[7] : args[0]);
+    if (!msg) return;
+    uint32_t buf_hint = have_rcv ? rcv_size : send_size;
+
+    xniff_ipc_mach_payload_t pl = {0};
+    pl.api = XNIFF_API_MACH_MSG;
+    pl.direction = XNIFF_DIR_EXIT;
+    pl.option_lo = (uint32_t)option;
+    pl.ret_value = ret;
+    for (int i = 0; i < 8; i++) pl.args[i] = args[i];
+    pl.timeout = args[5];
+    ipc_send_msg_full(XNIFF_EVT_MACH_EXIT, &pl, msg, buf_hint);
 }
+
 
 typedef struct {
     mach_msg_header_t* send_msg;
@@ -281,19 +430,17 @@ static inline void xniff_parse_msg2_args(
     }
 }
 
-__attribute__((used, noinline, visibility("default")))
-void xniff_msg2_entry_hook(xniff_ctx_frame_t *ctx)
-{
-    if (!ctx) return;
+void xniff_emit_mach_msg2_entry(const uint64_t args[8]) {
+    if (!args) return;
 
-    void *data = (void *)(uintptr_t)ctx->x[0];
-    mach_msg_option64_t option64 = (mach_msg_option64_t)ctx->x[1];
-    uint64_t msgh_bits_and_send_size = ctx->x[2];
-    uint64_t msgh_remote_and_local_port = ctx->x[3];
-    uint64_t msgh_voucher_and_id = ctx->x[4];
-    uint64_t desc_count_and_rcv_name = ctx->x[5];
-    uint64_t rcv_size_and_priority = ctx->x[6];
-    uint64_t timeout = ctx->x[7];
+    void *data = (void *)(uintptr_t)args[0];
+    mach_msg_option64_t option64 = (mach_msg_option64_t)args[1];
+    uint64_t msgh_bits_and_send_size = args[2];
+    uint64_t msgh_remote_and_local_port = args[3];
+    uint64_t msgh_voucher_and_id = args[4];
+    uint64_t desc_count_and_rcv_name = args[5];
+    uint64_t rcv_size_and_priority = args[6];
+    uint64_t timeout = args[7];
 
     xniff_msg2_parsed_t p;
     xniff_parse_msg2_args(
@@ -305,7 +452,10 @@ void xniff_msg2_entry_hook(xniff_ctx_frame_t *ctx)
         rcv_size_and_priority,
         timeout, &p);
 
-    if (!p.send_msg) { return; }
+    if (!p.send_msg) return;
+    uint32_t buf_hint = 0;
+    if (p.option64 & MACH64_SEND_MSG) buf_hint = p.send_size;
+    else if (p.option64 & MACH64_RCV_MSG) buf_hint = p.rcv_size;
 
     xniff_ipc_mach_payload_t pl = {0};
     pl.api = XNIFF_API_MACH_MSG2;
@@ -316,44 +466,37 @@ void xniff_msg2_entry_hook(xniff_ctx_frame_t *ctx)
     pl.priority = p.priority;
     pl.desc_count = p.desc_count;
     pl.aux_addr = (uint64_t)(uintptr_t)p.aux;
-    pl.args[0] = (uint64_t)(uintptr_t)data;
-    pl.args[1] = (uint64_t)option64;
-    pl.args[2] = msgh_bits_and_send_size;
-    pl.args[3] = msgh_remote_and_local_port;
-    pl.args[4] = msgh_voucher_and_id;
-    pl.args[5] = desc_count_and_rcv_name;
-    pl.args[6] = rcv_size_and_priority;
-    pl.args[7] = timeout;
-    ipc_send_msg_full(XNIFF_EVT_MACH2_ENTRY, &pl, p.send_msg);
+    for (int i = 0; i < 8; i++) pl.args[i] = args[i];
+    ipc_send_msg_full(XNIFF_EVT_MACH2_ENTRY, &pl, p.send_msg, buf_hint);
 }
 
-__attribute__((used, noinline, visibility("default")))
-void xniff_msg2_exit_hook(uint64_t ret, xniff_ctx_frame_t *ctx)
-{
-    if (!ctx) { return; }
+void xniff_emit_mach_msg2_exit(uint64_t ret, const uint64_t args[8]) {
+    if (!args) return;
 
-    void*               data     = (void*)ctx->x[0];
-    mach_msg_option64_t option64 = (mach_msg_option64_t)ctx->x[1];
-    uint64_t            bits_send= ctx->x[2];
-    uint64_t            r_l      = ctx->x[3];
-    uint64_t            v_id     = ctx->x[4];
-    uint64_t            d_name   = ctx->x[5];
-    uint64_t            r_p      = ctx->x[6];
-    uint64_t            timeout  = ctx->x[7];
+    void*               data     = (void *)(uintptr_t)args[0];
+    mach_msg_option64_t option64 = (mach_msg_option64_t)args[1];
+    uint64_t            bits_send= args[2];
+    uint64_t            r_l      = args[3];
+    uint64_t            v_id     = args[4];
+    uint64_t            d_name   = args[5];
+    uint64_t            r_p      = args[6];
+    uint64_t            timeout  = args[7];
 
     xniff_msg2_parsed_t p;
     xniff_parse_msg2_args(
         data, option64, bits_send, r_l, v_id, d_name, r_p, timeout, &p);
 
     mach_msg_header_t *out_msg = NULL;
+    uint32_t out_hint = 0;
     if ((p.option64 & MACH64_RCV_MSG) && p.rcv_msg && ret == MACH_MSG_SUCCESS) {
-        // Successful receive: dump the response buffer.
         out_msg = p.rcv_msg;
+        out_hint = p.rcv_size;
     } else if (p.send_msg) {
-        // No receive (or receive failed): still emit an exit event so the listener can correlate.
         out_msg = p.send_msg;
+        out_hint = p.send_size;
     } else if (p.rcv_msg) {
         out_msg = p.rcv_msg;
+        out_hint = p.rcv_size;
     } else {
         return;
     }
@@ -368,6 +511,8 @@ void xniff_msg2_exit_hook(uint64_t ret, xniff_ctx_frame_t *ctx)
     pl.desc_count = p.desc_count;
     pl.aux_addr = (uint64_t)(uintptr_t)p.aux;
     pl.ret_value = ret;
-    for (int i = 0; i < 8; i++) pl.args[i] = ctx->x[i];
-    ipc_send_msg_full(XNIFF_EVT_MACH2_EXIT, &pl, out_msg);
+    for (int i = 0; i < 8; i++) pl.args[i] = args[i];
+    ipc_send_msg_full(XNIFF_EVT_MACH2_EXIT, &pl, out_msg, out_hint);
 }
+
+// Legacy trampoline hook entrypoints removed (Frida Gum handles interception).

@@ -19,6 +19,9 @@ enum {
     XNIFF_EVT_MACH_EXIT   = 2,
     XNIFF_EVT_MACH2_ENTRY = 3,
     XNIFF_EVT_MACH2_EXIT  = 4,
+    // High-level libxpc hooks
+    XNIFF_EVT_XPC_ENTRY   = 5,
+    XNIFF_EVT_XPC_EXIT    = 6,
 };
 
 typedef struct {
@@ -46,6 +49,7 @@ _Static_assert(offsetof(xniff_ipc_hdr_t, payload_len) == 16, "xniff_ipc_hdr_t.pa
 enum {
     XNIFF_API_MACH_MSG  = 1,
     XNIFF_API_MACH_MSG2 = 2,
+    XNIFF_API_XPC_HL    = 3,
 };
 
 // Direction: entry or exit
@@ -72,6 +76,29 @@ typedef struct {
     uint64_t timeout;      // timeout value if provided (0 otherwise)
     uint64_t args[8];      // raw X0..X7 if available; else 0
 } xniff_ipc_mach_payload_t;
+
+// High-level XPC hook payload. Followed by up to 4 byte strings (not NUL-terminated)
+// in this order: str0, str1, str2, str3 (lengths below). Interpretation depends on func.
+typedef struct {
+    uint32_t api;          // XNIFF_API_XPC_HL
+    uint32_t direction;    // XNIFF_DIR_*
+    uint32_t func;         // XNIFF_XPC_FUNC_*
+    uint32_t conn_pid;     // xpc_connection_get_pid(connection) when available
+    uint64_t ret_value;    // return value on exit; 0 on entry
+    uint64_t args[8];      // raw X0..X7 snapshot
+    uint32_t str0_len;     // bytes of str0
+    uint32_t str1_len;     // bytes of str1
+    uint32_t str2_len;     // bytes of str2
+    uint32_t str3_len;     // bytes of str3
+} xniff_ipc_xpc_payload_t;
+
+enum {
+    XNIFF_XPC_FUNC_CONNECTION_CREATE                = 1,
+    XNIFF_XPC_FUNC_PIPE_ROUTINE                     = 2,
+    XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE          = 3,
+    XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY = 4,
+    XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC = 5,
+};
 
 // TLV framing for attachments following the message bytes
 typedef struct {

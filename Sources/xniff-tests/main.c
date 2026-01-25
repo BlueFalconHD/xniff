@@ -8,7 +8,6 @@
 #include <pthread.h>
 #include <sys/socket.h>
 
-#include "xniff_ctx.h"
 #include "xniff_ipc.h"
 
 static volatile sig_atomic_t g_got_sigpipe = 0;
@@ -102,33 +101,6 @@ static int selftest_ipc_sigpipe(void) {
 #endif
 }
 
-// Exported, noinline function we can patch remotely.
-__attribute__((used, noinline, visibility("default")))
-int do_something_useful(int count) {
-    // Force a few instructions before the ADRP/ADD used for the printf string,
-    // so the entry patch can safely resume after 12 bytes without skipping it.
-#if defined(__aarch64__) || defined(__arm64__)
-    // __asm__ volatile("nop\n\t"
-    //                  "nop\n\t"
-    //                  "nop\n\t"
-    //                  "nop\n\t");
-#endif
-    printf("do_something_useful: doing some work with the secret counter\n\n");
-    return count * 2;
-}
-
-// Exported remote hook that the CLI will call via a trampoline.
-__attribute__((used, noinline, visibility("default")))
-void xniff_remote_entry_hook(xniff_ctx_frame_t *ctx) {
-    int count = (ctx != NULL) ? (int)ctx->x[0] : -1;
-    printf("::: passed secret counter value: %d\n", count);
-}
-
-__attribute__((used, noinline, visibility("default")))
-void xniff_remote_exit_hook(uint64_t ret, xniff_ctx_frame_t* ctx) {
-    printf("::: function returned %llu", (unsigned long long)ret);
-}
-
 int main(int argc, char **argv) {
     // Lightweight self-tests (no remote patching).
     // Example: ./xniff-test --ipc-sigpipe
@@ -141,17 +113,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("xniff-test: waiting for patch...\n");
-    fflush(stdout);
-    sleep(2);
-
-    int counter = 0;
-
-    while (1) {
-        counter++;
-        do_something_useful(counter);
-        fflush(stdout);
-        sleep(1);
-    }
+    printf("xniff-test: no tests selected (try --ipc-sigpipe)\n");
     return 0;
 }

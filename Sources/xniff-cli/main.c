@@ -1,5 +1,4 @@
-// xniff-cli: attach to a target process, find symbols, and patch
-// a function with a trampoline that calls our hook.
+// xniff-cli: attach to a target process, inject xniff-hooks, and stream events.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,7 +24,6 @@
 #include "../shared/xniff_ipc.h"
 #include "../shared/mach_private.h"
 
-#include <xniff/patch.h>
 #include <xniff/macho.h>
 #include <xniff/inject.h>
 
@@ -40,6 +38,11 @@ typedef struct {
     bool parse_xpc;
     size_t hex_preview_len;
 } listener_opts_t;
+
+enum {
+    XNIFF_HOOK_MODE_MACH = 1,
+    XNIFF_HOOK_MODE_XPC  = 2,
+};
 
 static listener_opts_t g_listener_opts = {
     .jsonl = false,
@@ -59,6 +62,10 @@ static int parse_listener_flags(listener_opts_t *opts, int argc, char **argv, in
     for (int i = start_idx; i < argc; i++) {
         const char *a = argv[i];
         if (!a) continue;
+        // hook-xpc/sniff-xpc mode flags (not listener flags)
+        if (strcmp(a, "--mach") == 0 || strcmp(a, "--xpc") == 0) {
+            continue;
+        }
         if (strcmp(a, "--jsonl") == 0 || strcmp(a, "--format=jsonl") == 0) {
             opts->jsonl = true;
         } else if (strcmp(a, "--text") == 0 || strcmp(a, "--format=text") == 0) {
@@ -119,106 +126,13 @@ static int detach_process(pid_t pid) {
     return 0;
 }
 
-static int patch_symbol_in_task(pid_t pid, const char *symbol_name) {
-    mach_port_t task;
-    if (attach_and_get_task(pid, &task) != 0) return -1;
-
-    bool did_suspend = false;
-    kern_return_t kr_suspend = task_suspend(task);
-    if (kr_suspend == KERN_SUCCESS) {
-        did_suspend = true;
-    } else {
-        fprintf(stderr, "warning: task_suspend failed (%d); proceeding without suspend\n", kr_suspend);
-    }
-
-    // Find our hook symbol via library helper (main image only to avoid global scans).
-    mach_vm_address_t hook_addr = 0;
-    if (xniff_find_symbol_in_main_image(task, "_xniff_remote_hook", &hook_addr) != 0 &&
-        xniff_find_symbol_in_main_image(task, "xniff_remote_hook", &hook_addr) != 0) {
-        fprintf(stderr, "hook symbol _xniff_remote_hook not found in main image; inject hooks or provide a different hook.\n");
-        if (did_suspend) task_resume(task);
-        detach_process(pid);
-        return -1;
-    }
-
-    // Find target symbol in libsystem_kernel to avoid global scan
-    mach_vm_address_t target_addr = 0;
-    if (xniff_find_symbol_in_image_path_contains(task, "libsystem_kernel", symbol_name, &target_addr) != 0) {
-        fprintf(stderr, "could not locate %s in target\n", symbol_name);
-        if (did_suspend) task_resume(task);
-        detach_process(pid);
-        return -1;
-    }
-
-    XNIFF_DIAGF("found hook at 0x%llx, target %s at 0x%llx\n",
-           (unsigned long long)hook_addr, symbol_name, (unsigned long long)target_addr);
-
-    trampoline_bank_t bank;
-    // Extended (entry+exit) trampoline is larger; request a bigger per-slot size.
-    // 512 bytes comfortably covers copied prologue + extended tail.
-    if (trampoline_bank_init_task(&bank, task, 8, 512) != 0) {
-        fprintf(stderr, "failed to init remote trampoline bank\n");
-        if (did_suspend) task_resume(task); detach_process(pid); return -1;
-    }
-
-    size_t idx = 0;
-    if (trampoline_bank_install_task(&bank, target_addr, hook_addr, &idx) != 0) {
-        fprintf(stderr, "failed to install remote trampoline\n");
-    // Keep remote trampoline memory alive after installation so the patched
-    // function can continue to branch to it without crashing.
-    if (bank.is_remote) {
-        if (bank.infos) free(bank.infos);
-        memset(&bank, 0, sizeof(bank));
-    } else {
-        trampoline_bank_deinit(&bank);
-    }
-        if (did_suspend) task_resume(task); detach_process(pid); return -1;
-    }
-    XNIFF_DIAGF("installed remote trampoline at slot %zu\n", idx);
-    // Provide helpful addresses for debugging in LLDB
-    if (idx < bank.capacity) {
-        trampoline_info_t *info = &bank.infos[idx];
-        uint64_t resume_addr = (uint64_t)target_addr + (uint64_t)info->prologue_bytes;
-        uint64_t tramp_base = (uint64_t)(uintptr_t)info->trampoline;
-        uint64_t stub_entry = tramp_base + (uint64_t)XNIFF_TRAMPOLINE_PRELUDE_BYTES + (uint64_t)info->prologue_bytes;
-        uint64_t after_restore_off = (uint64_t)(uintptr_t)(TRAMPOLINE_AFTER_RESTORE - TRAMPOLINE_START_AFTER_PROLOGUE);
-        uint64_t stub_after_restore = stub_entry + after_restore_off;
-        XNIFF_DIAGF("  trampoline slot @ 0x%llx, resume @ 0x%llx, hook @ 0x%llx\n",
-               (unsigned long long)tramp_base,
-               (unsigned long long)resume_addr,
-               (unsigned long long)hook_addr);
-        XNIFF_DIAGF("  stub entry(after stolen) @ 0x%llx, stub after_restore @ 0x%llx\n",
-               (unsigned long long)stub_entry,
-               (unsigned long long)stub_after_restore);
-        XNIFF_DIAGF("  lldb: command script import lldb/xniff_regcheck.py ; xniff-regcheck --entry 0x%llx --exit 0x%llx --once --stop-on-mismatch\n",
-               (unsigned long long)stub_entry,
-               (unsigned long long)stub_after_restore);
-        XNIFF_DIAGF("  debug: set XNIFF_TRAMP_BRK=1 when running xniff-cli to write a BRK at stub entry\n");
-    }
-
-    // Keep remote trampoline mapping alive; free local bookkeeping only.
-    if (bank.is_remote) {
-        if (bank.infos) free(bank.infos);
-        memset(&bank, 0, sizeof(bank));
-    } else {
-        trampoline_bank_deinit(&bank);
-    }
-    // Detach and let process run
-    if (did_suspend) task_resume(task);
-    detach_process(pid);
-    return 0;
-}
-
 static void usage(const char *prog) {
     fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  %s <pid> [symbol]              Patch a function entry with trampoline.\n", prog);
-    fprintf(stderr, "  %s hook-exit <pid> [symbol] [entry_hook] [exit_hook]\n", prog);
-    fprintf(stderr, "  %s hook-xpc <pid> <hooks.dylib>  Inject hooks and patch mach_msg_overwrite + mach_msg2_internal.\n", prog);
+    fprintf(stderr, "  %s hook-xpc <pid> <hooks.dylib> [--mach|--xpc]  Inject hooks and install either mach_msg* or libxpc XPC APIs.\n", prog);
     fprintf(stderr, "  %s listen <pid> [flags]          Listen for events from target via Unix socket.\n", prog);
-    fprintf(stderr, "  %s sniff-xpc <pid> <hooks.dylib> [flags] Start listener, inject hooks, and patch automatically.\n", prog);
+    fprintf(stderr, "  %s sniff-xpc <pid> <hooks.dylib> [--mach|--xpc] [flags] Start listener, inject hooks, and install automatically.\n", prog);
     fprintf(stderr, "\nNotes:\n");
-    fprintf(stderr, "- For patching: if [symbol] is omitted, defaults to _mach_msg_overwrite.\n");
-    fprintf(stderr, "- Provide Mach-O symbol (with or without leading underscore).\n");
+    fprintf(stderr, "- Hooks are installed in-process via frida-gum after injection.\n");
     fprintf(stderr, "\nListen flags:\n");
     fprintf(stderr, "  --jsonl           Emit JSON Lines (one event per line)\n");
     fprintf(stderr, "  --text            Human-readable output (default)\n");
@@ -227,9 +141,23 @@ static void usage(const char *prog) {
 }
 
 // Forward declare subcommand implementation
-static int cmd_hook_exit(pid_t pid, const char *symbol_name, const char *entry_sym, const char *exit_sym);
-static int cmd_hook_xpc(pid_t pid, const char *dylib_path);
+static int cmd_hook_xpc(pid_t pid, const char *dylib_path, int mode);
 static int cmd_listen(pid_t pid);
+
+static int parse_hook_mode_flags(int argc, char **argv, int start_idx, int *mode_out) {
+    bool saw_mach = false, saw_xpc = false;
+    for (int i = start_idx; i < argc; i++) {
+        const char *a = argv[i];
+        if (!a) continue;
+        if (strcmp(a, "--mach") == 0) saw_mach = true;
+        else if (strcmp(a, "--xpc") == 0) saw_xpc = true;
+    }
+    if (saw_mach && saw_xpc) return -1;
+    int mode = XNIFF_HOOK_MODE_MACH;
+    if (saw_xpc) mode = XNIFF_HOOK_MODE_XPC;
+    if (mode_out) *mode_out = mode;
+    return 0;
+}
 
 int main(int argc, char **argv) {
     if (argc < 2) { usage(argv[0]); return 2; }
@@ -251,137 +179,34 @@ int main(int argc, char **argv) {
         pid_t pid = (pid_t)strtol(argv[2], NULL, 10);
         if (pid <= 0) { usage(argv[0]); return 2; }
         const char *path = argv[3];
+        int mode = XNIFF_HOOK_MODE_MACH;
+        if (parse_hook_mode_flags(argc, argv, 4, &mode) != 0) {
+            fprintf(stderr, "sniff-xpc: choose exactly one of --mach or --xpc\n");
+            return 2;
+        }
         int prc = parse_listener_flags(&g_listener_opts, argc, argv, 4);
         if (prc != 0) { usage(argv[0]); return prc > 0 ? 0 : 2; }
-        int rc = cmd_sniff_xpc(pid, path);
-        return (rc == 0) ? 0 : 1;
-    }
-
-    // Subcommand: hook-exit <pid> [symbol] [entry_hook] [exit_hook]
-    if (strcmp(argv[1], "hook-exit") == 0) {
-        if (argc < 3 || argc > 6) { usage(argv[0]); return 2; }
-        pid_t pid = (pid_t)strtol(argv[2], NULL, 10);
-        if (pid <= 0) { usage(argv[0]); return 2; }
-        char symbuf[256] = {0};
-        const char *user_sym = (argc >= 4) ? argv[3] : "_mach_msg_overwrite";
-        if (user_sym[0] == '_') strncpy(symbuf, user_sym, sizeof(symbuf)-1);
-        else { symbuf[0] = '_'; strncat(symbuf, user_sym, sizeof(symbuf)-2); }
-        const char *entry_sym = (argc >= 5) ? argv[4] : NULL;
-        const char *exit_sym  = (argc >= 6) ? argv[5] : NULL;
-        int rc = cmd_hook_exit(pid, symbuf, entry_sym, exit_sym);
+        int rc = cmd_sniff_xpc(pid, path, mode);
         return (rc == 0) ? 0 : 1;
     }
 
     // Subcommand: hook-xpc <pid> <hooks.dylib>
     if (strcmp(argv[1], "hook-xpc") == 0) {
-        if (argc != 4) { usage(argv[0]); return 2; }
+        if (argc < 4) { usage(argv[0]); return 2; }
         pid_t pid = (pid_t)strtol(argv[2], NULL, 10);
         if (pid <= 0) { usage(argv[0]); return 2; }
         const char *path = argv[3];
-        int rc = cmd_hook_xpc(pid, path);
+        int mode = XNIFF_HOOK_MODE_MACH;
+        if (parse_hook_mode_flags(argc, argv, 4, &mode) != 0) {
+            fprintf(stderr, "hook-xpc: choose exactly one of --mach or --xpc\n");
+            return 2;
+        }
+        int rc = cmd_hook_xpc(pid, path, mode);
         return (rc == 0) ? 0 : 1;
     }
 
-    // Default mode: patch a symbol
-    if (argc < 2 || argc > 3) { usage(argv[0]); return 2; }
-    pid_t pid = (pid_t)strtol(argv[1], NULL, 10);
-    if (pid <= 0) { usage(argv[0]); return 2; }
-
-    char symbuf[256] = {0};
-    const char *user_sym = (argc == 3) ? argv[2] : "_mach_msg_overwrite";
-    if (user_sym[0] == '_') {
-        strncpy(symbuf, user_sym, sizeof(symbuf) - 1);
-    } else {
-        symbuf[0] = '_';
-        strncat(symbuf, user_sym, sizeof(symbuf) - 2);
-    }
-
-    int rc = patch_symbol_in_task(pid, symbuf);
-    return (rc == 0) ? 0 : 1;
-}
-static int cmd_hook_exit(pid_t pid, const char *symbol_name, const char *entry_sym, const char *exit_sym) {
-    mach_port_t task;
-    if (attach_and_get_task(pid, &task) != 0) return -1;
-
-    bool did_suspend = false;
-    kern_return_t kr_suspend = task_suspend(task);
-    if (kr_suspend == KERN_SUCCESS) did_suspend = true;
-
-    mach_vm_address_t entry_hook = 0;
-    mach_vm_address_t exit_hook  = 0;
-    char entry_name[256] = {0};
-    char exit_name[256]  = {0};
-    const char *default_entry = "_xniff_remote_entry_hook";
-    const char *default_exit  = "_xniff_remote_exit_hook";
-    const char *en = entry_sym ? entry_sym : default_entry;
-    const char *ex = exit_sym  ? exit_sym  : default_exit;
-    if (en[0] == '_') strncpy(entry_name, en, sizeof(entry_name)-1);
-    else { entry_name[0] = '_'; strncat(entry_name, en, sizeof(entry_name)-2); }
-    if (ex[0] == '_') strncpy(exit_name, ex, sizeof(exit_name)-1);
-    else { exit_name[0] = '_'; strncat(exit_name, ex, sizeof(exit_name)-2); }
-    if (xniff_find_symbol_in_main_image(task, entry_name, &entry_hook) != 0 &&
-        xniff_find_symbol_in_main_image(task, "_xniff_remote_hook", &entry_hook) != 0 &&
-        xniff_find_symbol_in_main_image(task, "xniff_remote_hook", &entry_hook) != 0) {
-        fprintf(stderr, "error: entry hook %s not found in main image; avoid global scan by injecting a dylib first.\n", entry_name);
-        if (did_suspend) task_resume(task);
-        detach_process(pid);
-        return -1;
-    }
-    if (xniff_find_symbol_in_main_image(task, exit_name, &exit_hook) != 0) {
-        fprintf(stderr, "warning: exit hook %s not found in main image; proceeding with no-op exit hook\n", exit_name);
-        exit_hook = 0;
-    }
-
-    // Locate target symbol
-    mach_vm_address_t target_addr = 0;
-    if (xniff_find_symbol_in_image_path_contains(task, "libsystem_kernel", symbol_name, &target_addr) != 0) {
-        fprintf(stderr, "could not locate %s in target\n", symbol_name);
-        if (did_suspend) task_resume(task);
-        detach_process(pid);
-        return -1;
-    }
-
-    XNIFF_DIAGF("found target %s at 0x%llx, entry_hook 0x%llx, exit_hook 0x%llx\n",
-           symbol_name, (unsigned long long)target_addr,
-           (unsigned long long)entry_hook, (unsigned long long)exit_hook);
-
-    trampoline_bank_t bank;
-    // Extended trampoline requires a larger per-slot size; use 512 bytes per trampoline slot.
-    if (trampoline_bank_init_task(&bank, task, 8, 512) != 0) {
-        fprintf(stderr, "failed to init remote trampoline bank\n");
-        if (did_suspend) task_resume(task); detach_process(pid); return -1;
-    }
-
-    size_t idx = 0;
-    // exit_hook_function = 0 => no-op
-    if (trampoline_bank_install_task_with_exit(&bank, target_addr, entry_hook, exit_hook, &idx) != 0) {
-        fprintf(stderr, "failed to install entry+exit trampoline\n");
-        if (bank.is_remote) { if (bank.infos) free(bank.infos); memset(&bank, 0, sizeof(bank)); }
-        if (did_suspend) task_resume(task); detach_process(pid); return -1;
-    }
-    XNIFF_DIAGF("installed entry+exit trampoline at slot %zu\n", idx);
-    if (idx < bank.capacity) {
-        trampoline_info_t *info = &bank.infos[idx];
-        uint64_t resume_addr = (uint64_t)target_addr + (uint64_t)info->prologue_bytes;
-        // Compute exit stub address to help set LLDB breakpoints
-        size_t ex_off = (size_t)(XTRAMP_EXIT_STUB - XTRAMP_START_AFTER_PROLOGUE);
-        uint64_t exit_stub_addr = (uint64_t)(uintptr_t)info->trampoline + (uint64_t)info->prologue_bytes + (uint64_t)ex_off;
-        XNIFF_DIAGF("  trampoline slot @ 0x%llx, resume @ 0x%llx, exit_stub @ 0x%llx\n",
-               (unsigned long long)(uintptr_t)info->trampoline,
-               (unsigned long long)resume_addr,
-               (unsigned long long)exit_stub_addr);
-        if (info->ctx_base) {
-            XNIFF_DIAGF("  ctx_base @ 0x%llx size %zu bytes\n",
-                   (unsigned long long)(uintptr_t)info->ctx_base, info->ctx_size);
-        }
-    }
-
-    if (bank.is_remote) { if (bank.infos) free(bank.infos); memset(&bank, 0, sizeof(bank)); }
-    else { trampoline_bank_deinit(&bank); }
-
-    if (did_suspend) task_resume(task);
-    detach_process(pid);
-    return 0;
+    usage(argv[0]);
+    return 2;
 }
 
 static ssize_t read_fully(int fd, void *buf, size_t len) {
@@ -418,8 +243,12 @@ typedef enum {
     XNIFF_HDR_WIRE_LEGACY_24 = 24,
 } xniff_hdr_wire_kind_t;
 
+static bool api_is_known(uint32_t api) {
+    return api == XNIFF_API_MACH_MSG || api == XNIFF_API_MACH_MSG2 || api == XNIFF_API_XPC_HL;
+}
+
 static bool payload_len_sane(uint32_t payload_len) {
-    if (payload_len < sizeof(xniff_ipc_mach_payload_t)) return false;
+    if (payload_len < sizeof(uint32_t)) return false;
     if (payload_len > (64u * 1024u * 1024u)) return false;
     return true;
 }
@@ -464,7 +293,7 @@ static int read_ipc_header_compat(int fd, xniff_ipc_hdr_t *out_hdr, xniff_hdr_wi
     if (h1_ok && avail >= sizeof(xniff_ipc_hdr_t) + sizeof(uint32_t)) {
         uint32_t api = 0;
         if (peek_u32(peek, avail, sizeof(xniff_ipc_hdr_t), &api)) {
-            if (api != XNIFF_API_MACH_MSG && api != XNIFF_API_MACH_MSG2) h1_ok = false;
+            if (!api_is_known(api)) h1_ok = false;
         }
     }
 
@@ -478,7 +307,7 @@ static int read_ipc_header_compat(int fd, xniff_ipc_hdr_t *out_hdr, xniff_hdr_wi
         if (h0_ok) {
             uint32_t api = 0;
             if (peek_u32(peek, avail, sizeof(h0), &api)) {
-                if (api != XNIFF_API_MACH_MSG && api != XNIFF_API_MACH_MSG2) h0_ok = false;
+                if (!api_is_known(api)) h0_ok = false;
             }
         }
     }
@@ -559,6 +388,8 @@ static const char* kind_to_tag(int kind) {
         case XNIFF_EVT_MACH_EXIT:   return "exit";
         case XNIFF_EVT_MACH2_ENTRY: return "entry2";
         case XNIFF_EVT_MACH2_EXIT:  return "exit2";
+        case XNIFF_EVT_XPC_ENTRY:   return "xpc_entry";
+        case XNIFF_EVT_XPC_EXIT:    return "xpc_exit";
     }
     return "unknown";
 }
@@ -567,6 +398,7 @@ typedef struct pending_call {
     uint32_t pid;
     uint32_t tid_low;
     uint32_t api;
+    uint32_t sub;
     uint64_t call_id;
     unsigned long long entry_event_id;
     struct pending_call *next;
@@ -588,11 +420,11 @@ static void pending_calls_clear_pid(uint32_t pid) {
     }
 }
 
-static void pending_calls_drop_one(uint32_t pid, uint32_t tid_low, uint32_t api) {
+static void pending_calls_drop_one(uint32_t pid, uint32_t tid_low, uint32_t api, uint32_t sub) {
     pending_call_t **pp = &g_pending_calls;
     while (*pp) {
         pending_call_t *c = *pp;
-        if (c->pid == pid && c->tid_low == tid_low && c->api == api) {
+        if (c->pid == pid && c->tid_low == tid_low && c->api == api && c->sub == sub) {
             *pp = c->next;
             free(c);
             return;
@@ -601,13 +433,14 @@ static void pending_calls_drop_one(uint32_t pid, uint32_t tid_low, uint32_t api)
     }
 }
 
-static uint64_t pending_calls_push(uint32_t pid, uint32_t tid_low, uint32_t api, unsigned long long entry_event_id) {
-    pending_calls_drop_one(pid, tid_low, api); // avoid unbounded growth if an exit event is dropped
+static uint64_t pending_calls_push(uint32_t pid, uint32_t tid_low, uint32_t api, uint32_t sub, unsigned long long entry_event_id) {
+    pending_calls_drop_one(pid, tid_low, api, sub); // avoid unbounded growth if an exit event is dropped
     pending_call_t *c = (pending_call_t *)calloc(1, sizeof(*c));
     if (!c) return 0;
     c->pid = pid;
     c->tid_low = tid_low;
     c->api = api;
+    c->sub = sub;
     c->call_id = g_next_call_id++;
     if (c->call_id == 0) c->call_id = g_next_call_id++;
     c->entry_event_id = entry_event_id;
@@ -616,11 +449,11 @@ static uint64_t pending_calls_push(uint32_t pid, uint32_t tid_low, uint32_t api,
     return c->call_id;
 }
 
-static bool pending_calls_pop(uint32_t pid, uint32_t tid_low, uint32_t api, uint64_t *call_id_out, unsigned long long *entry_event_id_out) {
+static bool pending_calls_pop(uint32_t pid, uint32_t tid_low, uint32_t api, uint32_t sub, uint64_t *call_id_out, unsigned long long *entry_event_id_out) {
     pending_call_t **pp = &g_pending_calls;
     while (*pp) {
         pending_call_t *c = *pp;
-        if (c->pid == pid && c->tid_low == tid_low && c->api == api) {
+        if (c->pid == pid && c->tid_low == tid_low && c->api == api && c->sub == sub) {
             *pp = c->next;
             if (call_id_out) *call_id_out = c->call_id;
             if (entry_event_id_out) *entry_event_id_out = c->entry_event_id;
@@ -788,6 +621,102 @@ static void jsonl_print_event(
     if (xpc_pretty) free(xpc_pretty);
 }
 
+static const char *xpc_func_to_name(uint32_t func) {
+    switch (func) {
+        case XNIFF_XPC_FUNC_CONNECTION_CREATE: return "xpc_connection_create";
+        case XNIFF_XPC_FUNC_PIPE_ROUTINE: return "xpc_pipe_routine";
+        case XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE: return "xpc_connection_send_message";
+        case XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY: return "xpc_connection_send_message_with_reply";
+        case XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC: return "xpc_connection_send_message_with_reply_sync";
+    }
+    return "unknown";
+}
+
+static char *wire_copy_str(const uint8_t *buf, size_t total, size_t *off_io, uint32_t slen) {
+    if (!buf || !off_io) return NULL;
+    size_t off = *off_io;
+    if (slen == 0) return NULL;
+    if (off > total || (size_t)slen > total - off) return NULL;
+    char *s = (char *)malloc((size_t)slen + 1);
+    if (!s) return NULL;
+    memcpy(s, buf + off, slen);
+    s[slen] = '\0';
+    *off_io = off + (size_t)slen;
+    return s;
+}
+
+static void jsonl_print_xpc_event(
+    unsigned long long event_id,
+    uint64_t call_id,
+    unsigned long long entry_event_id,
+    const xniff_ipc_hdr_t *ihdr,
+    const xniff_ipc_xpc_payload_t *pl,
+    const char *s0,
+    const char *s1,
+    const char *s2,
+    const char *s3,
+    const char *tbuf,
+    double mono_s)
+{
+    fputc('{', stdout);
+    fputs("\"schema\":\"xniff.event.v1\",", stdout);
+    fputs("\"event_id\":", stdout); fprintf(stdout, "%llu,", event_id);
+    fputs("\"call_id\":", stdout); fprintf(stdout, "%llu,", (unsigned long long)call_id);
+    fputs("\"entry_event_id\":", stdout); fprintf(stdout, "%llu,", entry_event_id);
+    fputs("\"kind\":", stdout); json_write_escaped(stdout, kind_to_tag((int)ihdr->kind)); fputc(',', stdout);
+    fputs("\"pid\":", stdout); fprintf(stdout, "%u,", ihdr->pid);
+    fputs("\"tid_low\":", stdout); fprintf(stdout, "%u,", ihdr->tid_low);
+    fputs("\"ts_real\":", stdout); json_write_escaped(stdout, tbuf); fputc(',', stdout);
+    fputs("\"ts_mono_s\":", stdout); fprintf(stdout, "%.9f,", mono_s);
+
+    fputs("\"xpc\":{", stdout);
+    fputs("\"direction\":", stdout); fprintf(stdout, "%u,", pl->direction);
+    fputs("\"func\":", stdout); fprintf(stdout, "%u,", pl->func);
+    fputs("\"func_name\":", stdout); json_write_escaped(stdout, xpc_func_to_name(pl->func)); fputc(',', stdout);
+    fputs("\"conn_pid\":", stdout); fprintf(stdout, "%u,", pl->conn_pid);
+    fputs("\"ret\":", stdout); json_write_hex_u64(stdout, pl->ret_value); fputc(',', stdout);
+    fputs("\"args\":[", stdout);
+    for (int i = 0; i < 8; i++) {
+        if (i) fputc(',', stdout);
+        json_write_hex_u64(stdout, pl->args[i]);
+    }
+    fputs("],", stdout);
+    fputs("\"str0\":", stdout); if (s0) json_write_escaped(stdout, s0); else fputs("null", stdout);
+    fputs(",\"str1\":", stdout); if (s1) json_write_escaped(stdout, s1); else fputs("null", stdout);
+    fputs(",\"str2\":", stdout); if (s2) json_write_escaped(stdout, s2); else fputs("null", stdout);
+    fputs(",\"str3\":", stdout); if (s3) json_write_escaped(stdout, s3); else fputs("null", stdout);
+    fputc('}', stdout);
+
+    fputs("}\n", stdout);
+    fflush(stdout);
+}
+
+static void print_xpc_event(
+    const xniff_ipc_hdr_t *ihdr,
+    const xniff_ipc_xpc_payload_t *pl,
+    const char *s0,
+    const char *s1,
+    const char *s2,
+    const char *s3)
+{
+    char tbuf[64];
+    double mono_s = 0.0;
+    format_time(tbuf, sizeof(tbuf), &mono_s);
+
+    const char *kstr = "?";
+    if (ihdr->kind == XNIFF_EVT_XPC_ENTRY) kstr = "xpc entry";
+    else if (ihdr->kind == XNIFF_EVT_XPC_EXIT) kstr = "xpc exit";
+
+    printf("[%s][+%0.6fs] %s: func=%s(%u) conn_pid=%u ret=0x%llx\n",
+           tbuf, mono_s, kstr,
+           xpc_func_to_name(pl->func), pl->func,
+           pl->conn_pid, (unsigned long long)pl->ret_value);
+    if (s0) printf("  str0: %s\n", s0);
+    if (s1) printf("  str1: %s\n", s1);
+    if (s2) printf("  str2: %s\n", s2);
+    if (s3) printf("  str3: %s\n", s3);
+}
+
 static void print_event(int kind, const xniff_ipc_mach_payload_t *pl, const uint8_t *msg_bytes, size_t msg_len) {
     const mach_msg_header_t *hdr = (const mach_msg_header_t *)msg_bytes;
     const char *kstr = "?";
@@ -883,7 +812,7 @@ static int cmd_listen(pid_t pid) {
                 pending_calls_clear_pid((uint32_t)pid);
                 break;
             }
-            if (hdr.payload_len < sizeof(xniff_ipc_mach_payload_t)) { fprintf(stderr, "short payload len %u\n", hdr.payload_len); close(cfd); break; }
+            if (hdr.payload_len < sizeof(uint32_t)) { fprintf(stderr, "short payload len %u\n", hdr.payload_len); close(cfd); break; }
             if (hdr.payload_len > (64u * 1024u * 1024u)) {
                 // Compatibility: some older/mismatched hook builds appear to scribble the upper 16 bits of
                 // payload_len (often 0xAAAAxxxx). If the low 16 bits look sane and the payload begins with
@@ -897,7 +826,7 @@ static int cmd_listen(pid_t pid) {
                     do {
                         pk = recv(cfd, &api, sizeof(api), MSG_PEEK | MSG_WAITALL);
                     } while (pk < 0 && errno == EINTR);
-                    if (pk == (ssize_t)sizeof(api) && (api == XNIFF_API_MACH_MSG || api == XNIFF_API_MACH_MSG2)) {
+                    if (pk == (ssize_t)sizeof(api) && api_is_known(api)) {
                         XNIFF_DIAGF("warning: salvaging scribbled payload_len 0x%08x -> %u (likely old/mismatched xniff-hooks)\n",
                                     hdr.payload_len, lo);
                         hdr.payload_len = lo;
@@ -922,6 +851,60 @@ static int cmd_listen(pid_t pid) {
                 break;
             }
 
+            uint32_t api = 0;
+            memcpy(&api, buf, sizeof(api));
+
+            unsigned long long cur_evt_id = evt_idx;
+            uint64_t call_id = 0;
+            unsigned long long entry_evt_id = 0;
+
+            if (api == XNIFF_API_XPC_HL) {
+                if (hdr.payload_len < sizeof(xniff_ipc_xpc_payload_t)) {
+                    fprintf(stderr, "short xpc payload len %u\n", hdr.payload_len);
+                    free(buf);
+                    close(cfd);
+                    pending_calls_clear_pid((uint32_t)pid);
+                    break;
+                }
+
+                xniff_ipc_xpc_payload_t *pl = (xniff_ipc_xpc_payload_t *)buf;
+                size_t off = sizeof(*pl);
+                char *s0 = wire_copy_str(buf, hdr.payload_len, &off, pl->str0_len);
+                char *s1 = wire_copy_str(buf, hdr.payload_len, &off, pl->str1_len);
+                char *s2 = wire_copy_str(buf, hdr.payload_len, &off, pl->str2_len);
+                char *s3 = wire_copy_str(buf, hdr.payload_len, &off, pl->str3_len);
+
+                bool is_entry = (hdr.kind == XNIFF_EVT_XPC_ENTRY);
+                bool is_exit  = (hdr.kind == XNIFF_EVT_XPC_EXIT);
+                if (is_entry) {
+                    call_id = pending_calls_push(hdr.pid, hdr.tid_low, pl->api, pl->func, cur_evt_id);
+                } else if (is_exit) {
+                    (void)pending_calls_pop(hdr.pid, hdr.tid_low, pl->api, pl->func, &call_id, &entry_evt_id);
+                }
+
+                if (g_listener_opts.jsonl) {
+                    char tbuf[64];
+                    double mono_s = 0.0;
+                    format_time(tbuf, sizeof(tbuf), &mono_s);
+                    jsonl_print_xpc_event(cur_evt_id, call_id, entry_evt_id, &hdr, pl, s0, s1, s2, s3, tbuf, mono_s);
+                } else {
+                    print_xpc_event(&hdr, pl, s0, s1, s2, s3);
+                }
+
+                free(s0); free(s1); free(s2); free(s3);
+                evt_idx++;
+                free(buf);
+                continue;
+            }
+
+            if (hdr.payload_len < sizeof(xniff_ipc_mach_payload_t)) {
+                fprintf(stderr, "short mach payload len %u\n", hdr.payload_len);
+                free(buf);
+                close(cfd);
+                pending_calls_clear_pid((uint32_t)pid);
+                break;
+            }
+
             xniff_ipc_mach_payload_t *pl = (xniff_ipc_mach_payload_t *)buf;
             uint8_t *msg_bytes = buf + sizeof(*pl);
             size_t msg_avail = 0;
@@ -929,15 +912,12 @@ static int cmd_listen(pid_t pid) {
             size_t msg_len = pl->copy_len;
             if (msg_len > msg_avail) msg_len = msg_avail;
 
-            unsigned long long cur_evt_id = evt_idx;
-            uint64_t call_id = 0;
-            unsigned long long entry_evt_id = 0;
             bool is_entry = (hdr.kind == XNIFF_EVT_MACH_ENTRY || hdr.kind == XNIFF_EVT_MACH2_ENTRY);
             bool is_exit  = (hdr.kind == XNIFF_EVT_MACH_EXIT  || hdr.kind == XNIFF_EVT_MACH2_EXIT);
             if (is_entry) {
-                call_id = pending_calls_push(hdr.pid, hdr.tid_low, pl->api, cur_evt_id);
+                call_id = pending_calls_push(hdr.pid, hdr.tid_low, pl->api, 0, cur_evt_id);
             } else if (is_exit) {
-                (void)pending_calls_pop(hdr.pid, hdr.tid_low, pl->api, &call_id, &entry_evt_id);
+                (void)pending_calls_pop(hdr.pid, hdr.tid_low, pl->api, 0, &call_id, &entry_evt_id);
             }
 
             // Dump inline message bytes + attachments to files (optional), and collect metadata for JSONL.
@@ -1029,17 +1009,15 @@ static int cmd_listen(pid_t pid) {
     return 0;
 }
 
-static int cmd_hook_xpc(pid_t pid, const char *dylib_path) {
+static int cmd_hook_xpc(pid_t pid, const char *dylib_path, int mode) {
     mach_port_t task;
     if (attach_and_get_task(pid, &task) != 0) return -1;
-
-    bool did_suspend = false; // will suspend only around patching
+    (void)mode;
 
     // Resolve absolute path so dlopen() in the remote process finds the library
     char abs_path[PATH_MAX] = {0};
     if (!realpath(dylib_path, abs_path)) {
         perror("realpath");
-        if (did_suspend) task_resume(task);
         detach_process(pid);
         return -1;
     }
@@ -1048,115 +1026,28 @@ static int cmd_hook_xpc(pid_t pid, const char *dylib_path) {
     (void)xniff_dump_task_images(task);
     if (xniff_inject_dylib_task(task, abs_path, NULL) != 0) {
         fprintf(stderr, "failed to inject hooks dylib into pid %d\n", pid);
-        if (did_suspend) task_resume(task);
         detach_process(pid);
         return -1;
     }
     // Wait for dyld to finish loading the injected image; poll for up to ~2s
     for (int i = 0; i < 40; i++) {
         mach_vm_address_t tmp = 0;
-        // Try to resolve any one of our exported symbols to confirm load
-        if (xniff_find_symbol_in_image_exact_path(task, abs_path, "_xniff_remote_entry_hook", &tmp) == 0 ||
-            xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "_xniff_remote_entry_hook", &tmp) == 0 ||
-            xniff_find_symbol_in_image_exact_path(task, abs_path, "xniff_remote_entry_hook", &tmp) == 0 ||
-            xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "xniff_remote_entry_hook", &tmp) == 0) {
+        // Try to resolve our exported ABI marker to confirm load
+        if (xniff_find_symbol_in_image_exact_path(task, abs_path, "_xniff_hooks_abi_version", &tmp) == 0 ||
+            xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "_xniff_hooks_abi_version", &tmp) == 0 ||
+            xniff_find_symbol_in_image_exact_path(task, abs_path, "xniff_hooks_abi_version", &tmp) == 0 ||
+            xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "xniff_hooks_abi_version", &tmp) == 0) {
             break;
         }
         usleep(50 * 1000);
     }
-
-    // Resolve hooks; prefer image-scoped lookups; print images again to show any changes.
-    (void)xniff_dump_task_images(task);
-    mach_vm_address_t entry_hook_v1 = 0, exit_hook_v1 = 0;
-    mach_vm_address_t entry_hook_v2 = 0, exit_hook_v2 = 0;
-    // Image-scoped only
-    (void)xniff_find_symbol_in_image_exact_path(task, abs_path, "_xniff_remote_entry_hook", &entry_hook_v1);
-    if (!entry_hook_v1) (void)xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "_xniff_remote_entry_hook", &entry_hook_v1);
-    if (!entry_hook_v1) (void)xniff_find_symbol_in_image_exact_path(task, abs_path, "xniff_remote_entry_hook", &entry_hook_v1);
-    if (!entry_hook_v1) (void)xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "xniff_remote_entry_hook", &entry_hook_v1);
-    if (!entry_hook_v1) fprintf(stderr, "warning: can’t find xniff_remote_entry_hook; mach_msg* entry logs will be disabled\n");
-    (void)xniff_find_symbol_in_image_exact_path(task, abs_path, "_xniff_remote_exit_hook", &exit_hook_v1);
-    if (!exit_hook_v1) (void)xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "_xniff_remote_exit_hook", &exit_hook_v1);
-    if (!exit_hook_v1) (void)xniff_find_symbol_in_image_exact_path(task, abs_path, "xniff_remote_exit_hook", &exit_hook_v1);
-    if (!exit_hook_v1) (void)xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "xniff_remote_exit_hook", &exit_hook_v1);
-    if (!exit_hook_v1) fprintf(stderr, "warning: can’t find xniff_remote_exit_hook; mach_msg* exit logs will be disabled\n");
-    (void)xniff_find_symbol_in_image_exact_path(task, abs_path, "_xniff_msg2_entry_hook", &entry_hook_v2);
-    if (!entry_hook_v2) (void)xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "_xniff_msg2_entry_hook", &entry_hook_v2);
-    if (!entry_hook_v2) (void)xniff_find_symbol_in_image_exact_path(task, abs_path, "xniff_msg2_entry_hook", &entry_hook_v2);
-    if (!entry_hook_v2) (void)xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "xniff_msg2_entry_hook", &entry_hook_v2);
-    if (!entry_hook_v2) fprintf(stderr, "warning: can’t find xniff_msg2_entry_hook; mach_msg2 entry logs will be disabled\n");
-    (void)xniff_find_symbol_in_image_exact_path(task, abs_path, "_xniff_msg2_exit_hook", &exit_hook_v2);
-    if (!exit_hook_v2) (void)xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "_xniff_msg2_exit_hook", &exit_hook_v2);
-    if (!exit_hook_v2) (void)xniff_find_symbol_in_image_exact_path(task, abs_path, "xniff_msg2_exit_hook", &exit_hook_v2);
-    if (!exit_hook_v2) (void)xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "xniff_msg2_exit_hook", &exit_hook_v2);
-    if (!exit_hook_v2) fprintf(stderr, "warning: can’t find xniff_msg2_exit_hook; mach_msg2 exit logs will be disabled\n");
-
-    // Suspend before patching to avoid racing with live calls
-    if (!did_suspend) {
-        if (task_suspend(task) == KERN_SUCCESS) did_suspend = true;
-        else fprintf(stderr, "warning: task_suspend failed; proceeding anyway\n");
-    }
-
-    trampoline_bank_t bank;
-    if (trampoline_bank_init_task(&bank, task, 8, 512) != 0) {
-        fprintf(stderr, "failed to init remote trampoline bank\n");
-        if (did_suspend) task_resume(task);
-        detach_process(pid);
-        return -1;
-    }
-
-    // Candidate symbols to patch (resolve in libsystem_kernel only to reduce scanning)
-    // Policy: hook mach_msg_overwrite for non-vector messages and mach_msg2_internal for vector.
-    // No fallback to legacy _mach_msg or _mach_msg2.
-    const char *candidates[] = { "_mach_msg_overwrite", "_mach_msg2_internal" };
-    const int n = (int)(sizeof(candidates)/sizeof(candidates[0]));
-    int patched = 0;
-    for (int i = 0; i < n; i++) {
-        mach_vm_address_t target = 0;
-        if (xniff_find_symbol_in_image_path_contains(task, "libsystem_kernel", candidates[i], &target) != 0) continue;
-
-        // Choose appropriate hook pair for each symbol
-        mach_vm_address_t eh = entry_hook_v1;
-        mach_vm_address_t xh = exit_hook_v1;
-        if (strcmp(candidates[i], "_mach_msg2_internal") == 0) { eh = entry_hook_v2; xh = exit_hook_v2; }
-        // If we cannot resolve the entry hook for this symbol, skip patching to avoid branching to 0
-        if (eh == 0) {
-            fprintf(stderr, "warning: skipping patch for %s because entry hook not resolved\n", candidates[i]);
-            continue;
-        }
-        size_t idx = 0;
-        int rc = trampoline_bank_install_task_with_exit(&bank, target, eh, xh, &idx);
-        if (rc == 0) {
-            patched++;
-            if (idx < bank.capacity) {
-                trampoline_info_t *info = &bank.infos[idx];
-                uint64_t resume_addr = (uint64_t)target + (uint64_t)info->prologue_bytes;
-                size_t ex_off = (size_t)(XTRAMP_EXIT_STUB - XTRAMP_START_AFTER_PROLOGUE);
-                uint64_t exit_stub_addr = (uint64_t)(uintptr_t)info->trampoline + (uint64_t)info->prologue_bytes + (uint64_t)ex_off;
-                XNIFF_DIAGF("patched %s: slot @ 0x%llx, resume @ 0x%llx, exit_stub @ 0x%llx\n",
-                       candidates[i],
-                       (unsigned long long)(uintptr_t)info->trampoline,
-                       (unsigned long long)resume_addr,
-                       (unsigned long long)exit_stub_addr);
-            } else {
-                XNIFF_DIAGF("patched %s\n", candidates[i]);
-            }
-        } else {
-            fprintf(stderr, "failed to patch %s\n", candidates[i]);
-        }
-    }
-
-    if (bank.is_remote) { if (bank.infos) free(bank.infos); memset(&bank, 0, sizeof(bank)); }
-    else { trampoline_bank_deinit(&bank); }
-
-    if (did_suspend) task_resume(task);
     detach_process(pid);
-    XNIFF_DIAGF("patched %d symbols\n", patched);
-    return patched > 0 ? 0 : -1;
+    XNIFF_DIAGF("hook-xpc: injected %s; xniff-hooks installs interceptors via frida-gum\n", abs_path);
+    return 0;
 }
 
-// Combined workflow: start listener, then inject hooks and patch mach_msg*.
-int cmd_sniff_xpc(pid_t pid, const char *dylib_path) {
+// Combined workflow: start listener, then inject hooks.
+int cmd_sniff_xpc(pid_t pid, const char *dylib_path, int mode) {
     pid_t child = fork();
     if (child == 0) {
         int rc = cmd_listen(pid);
@@ -1181,7 +1072,7 @@ int cmd_sniff_xpc(pid_t pid, const char *dylib_path) {
         }
     }
 
-    int rc = cmd_hook_xpc(pid, dylib_path);
+    int rc = cmd_hook_xpc(pid, dylib_path, mode);
     if (rc != 0) {
         fprintf(stderr, "sniff-xpc: hook-xpc failed; terminating listener (pid %d)\n", (int)child);
         kill(child, SIGTERM);
