@@ -208,7 +208,8 @@ int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path,
   // set stack/program counter through SDK accessors so arm64e opaque thread
   // state layouts are handled correctly.
   arm_thread_state64_set_sp(st, sp);
-  arm_thread_state64_set_pc_fptr(st, (void (*)(void))(uintptr_t)code_addr);
+  arm_thread_state64_set_pc_presigned_fptr(
+      st, (void (*)(void))(uintptr_t)code_addr);
 
   // create the thread
   thread_act_t th = MACH_PORT_NULL;
