@@ -13,3 +13,4 @@ build/
 reference
 
 compile_commands.json
+_deps

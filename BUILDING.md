@@ -14,8 +14,15 @@ cmake --preset default
 ```
 
 `xniff-hooks` statically links Frida Gum (downloaded as a devkit during configure).
+To build an arm64e `xniff-hooks` with the matching Frida Gum devkit, enable the option at configure time:
+
+```
+cmake --preset default -DXNIFF_ENABLE_ARM64E=ON
+```
 
 This generates the build tree and a `compile_commands.json` database under `build/` for editor tooling.
+
+If you change compiler settings (like toggling arm64e or switching toolchains), delete `build/` or remove `build/CMakeCache.txt` before reconfiguring.
 
 ## Build
 

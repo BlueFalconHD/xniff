@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import signal
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -117,21 +118,46 @@ class CallBucket:
 
 
 def _has_xpc_pretty(ev: Dict[str, Any]) -> bool:
+    # Back-compat: prefer mach-level xpc.pretty when present.
     p = _get(ev, "xpc", "pretty", default=None)
     return isinstance(p, str) and len(p) > 0
 
 
+def _xpc_text(ev: Dict[str, Any], *, use_mach_pretty: bool, use_hl_strings: bool) -> Optional[str]:
+    if use_mach_pretty:
+        p = _get(ev, "xpc", "pretty", default=None)
+        if isinstance(p, str) and p:
+            return p
+
+    if use_hl_strings:
+        xpc = ev.get("xpc")
+        if not isinstance(xpc, dict):
+            return None
+        parts: List[str] = []
+        for k in ("str0", "str1", "str2", "str3"):
+            v = xpc.get(k)
+            if not isinstance(v, str) or not v:
+                continue
+            if "\n" in v:
+                parts.append(f"{k}:\n{v}")
+            else:
+                parts.append(f"{k}: {v}")
+        if parts:
+            return "\n".join(parts)
+    return None
+
+
 def _is_entry_kind(kind: str) -> bool:
-    return kind.startswith("entry")
+    return kind.startswith("entry") or kind == "xpc_entry"
 
 
 def _is_exit_kind(kind: str) -> bool:
-    return kind.startswith("exit")
+    return kind.startswith("exit") or kind == "xpc_exit"
 
 
-def _choose_entry_exit(bucket: CallBucket, ev: Dict[str, Any]) -> None:
+def _choose_entry_exit(bucket: CallBucket, ev: Dict[str, Any], *, use_mach_pretty: bool, use_hl_strings: bool) -> None:
     kind = str(ev.get("kind") or "")
-    if not _has_xpc_pretty(ev):
+    if _xpc_text(ev, use_mach_pretty=use_mach_pretty, use_hl_strings=use_hl_strings) is None:
         return
     if _is_entry_kind(kind) and bucket.entry_xpc is None:
         bucket.entry_xpc = ev
@@ -152,7 +178,14 @@ def _ports(ev: Dict[str, Any]) -> Tuple[int, int]:
     return remote, local
 
 
-def _render_event(ev: Optional[Dict[str, Any]], label: str, extra: str = "") -> str:
+def _render_event(
+    ev: Optional[Dict[str, Any]],
+    label: str,
+    *,
+    use_mach_pretty: bool,
+    use_hl_strings: bool,
+    extra: str = "",
+) -> str:
     if not ev:
         return f"{label}: <missing>\n"
     eid = _as_int(ev.get("event_id"), 0)
@@ -161,19 +194,45 @@ def _render_event(ev: Optional[Dict[str, Any]], label: str, extra: str = "") -> 
     is_recv = bool(_get(ev, "mach", "is_recv", default=False))
     remote, local = _ports(ev)
     ret = _fmt_ret(_get(ev, "mach", "ret", default=0))
-    pretty = _get(ev, "xpc", "pretty", default=None)
+    pretty = _xpc_text(ev, use_mach_pretty=use_mach_pretty, use_hl_strings=use_hl_strings)
+
+    peer_role = _get(ev, "mach", "peer_role", default=None)
+    peer_pid = _get(ev, "mach", "peer_pid", default=None)
+    peer_name = _get(ev, "mach", "peer_name", default=None)
+    if isinstance(peer_role, str) and peer_role and peer_role != "unknown":
+        extra += f" peer_role={peer_role}"
+    if isinstance(peer_pid, int) and peer_pid:
+        extra += f" peer_pid={peer_pid}"
+    if isinstance(peer_name, str) and peer_name:
+        extra += f" peer_name={peer_name}"
+
+    # High-level XPC events include useful metadata in the xpc section; surface it inline.
+    xpc_func = _get(ev, "xpc", "func_name", default=None)
+    if isinstance(xpc_func, str) and xpc_func:
+        conn_pid = _as_int(_get(ev, "xpc", "conn_pid", default=0), 0)
+        conn_name = _get(ev, "xpc", "conn_name", default=None)
+        extra += f" func={xpc_func}"
+        if conn_pid:
+            extra += f" conn_pid={conn_pid}"
+        if isinstance(conn_name, str) and conn_name:
+            extra += f" conn_name={conn_name}"
+
     hdr = (
         f"{label}: event_id={eid} ts={ts} send={str(is_send).lower()} recv={str(is_recv).lower()}"
         f" remote=0x{remote:x} local=0x{local:x} ret={ret}{extra}\n"
     )
     if isinstance(pretty, str) and pretty:
         return hdr + pretty.rstrip() + "\n"
-    return hdr + "<no xpc.pretty in this event>\n"
+    return hdr + "<no XPC payload in this event>\n"
 
 
 def main(argv: List[str]) -> int:
     ap = argparse.ArgumentParser(
-        description="Print XPC request/response bodies from xniff --jsonl output (schema xniff.event.v1)."
+        description=(
+            "Print XPC request/response bodies from xniff output (schema xniff.event.v1).\n"
+            "This can print either mach-level decoded XPC payloads (xpc.pretty), high-level libxpc descriptions\n"
+            "(xpc.str0..str3 from xpc_copy_description), or both."
+        )
     )
     ap.add_argument("events_path", help="Path to events.jsonl (or JSON array) captured from xniff-cli listen --jsonl")
     ap.add_argument("--all", action="store_true", help="Also print other XPC-bearing events not chosen as request/response")
@@ -184,9 +243,17 @@ def main(argv: List[str]) -> int:
         action="store_true",
         help="Only print calls where both an XPC entry and an XPC exit were captured (non-missing).",
     )
+    ap.add_argument("--mach-only", action="store_true", help="Only print mach-level decoded XPC payloads (xpc.pretty).")
+    ap.add_argument("--hl-only", action="store_true", help="Only print high-level libxpc descriptions (xpc.str0..str3).")
     ap.add_argument("--min-call-id", type=int, default=None, help="Only include call_id >= N")
     ap.add_argument("--max-call-id", type=int, default=None, help="Only include call_id <= N")
     args = ap.parse_args(argv)
+
+    if args.mach_only and args.hl_only:
+        print("error: --mach-only and --hl-only are mutually exclusive", file=sys.stderr)
+        return 2
+    use_mach_pretty = not args.hl_only
+    use_hl_strings = not args.mach_only
 
     buckets: Dict[int, CallBucket] = {}
     total = 0
@@ -210,16 +277,25 @@ def main(argv: List[str]) -> int:
             b = CallBucket(call_id=call_id)
             buckets[call_id] = b
         b.note_event(ev)
-        if _has_xpc_pretty(ev):
+        if _xpc_text(ev, use_mach_pretty=use_mach_pretty, use_hl_strings=use_hl_strings) is not None:
             total_with_xpc += 1
-            _choose_entry_exit(b, ev)
+            _choose_entry_exit(b, ev, use_mach_pretty=use_mach_pretty, use_hl_strings=use_hl_strings)
             kind = str(ev.get("kind") or "")
             if _is_exit_kind(kind) and bool(_get(ev, "mach", "is_recv", default=False)):
                 recv_xpc_exits.append(ev)
 
     if not buckets:
         print("No xniff.event.v1 events found.", file=sys.stderr)
-        print("Tip: capture with: xniff-cli listen <pid> --jsonl (and don't pass --no-xpc).", file=sys.stderr)
+        print("Tip: capture with: xniff-cli listen <pid> --jsonl", file=sys.stderr)
+        return 2
+    if total_with_xpc == 0:
+        print("No XPC-bearing events found in this capture.", file=sys.stderr)
+        if args.mach_only:
+            print("Tip: you used --mach-only; ensure you didn't capture with --no-xpc, or try --hl-only.", file=sys.stderr)
+        elif args.hl_only:
+            print("Tip: you used --hl-only; ensure high-level libxpc hooks are installed in the target.", file=sys.stderr)
+        else:
+            print("Tip: for mach-level decoding, don't use --no-xpc; for high-level, try --hl-only.", file=sys.stderr)
         return 2
 
     ordered: List[Tuple[int, CallBucket]] = sorted(buckets.items(), key=lambda kv: (kv[1].first_event_id, kv[0]))
@@ -279,6 +355,9 @@ def main(argv: List[str]) -> int:
         entry = b.entry_xpc
         exit_ev = b.exit_xpc
 
+        if entry is None and exit_ev is None and not b.other_xpc:
+            continue
+
         if args.require_entry_exit and (entry is None or exit_ev is None):
             continue
 
@@ -297,17 +376,35 @@ def main(argv: List[str]) -> int:
         if entry_send and (entry_recv or exit_recv):
             if args.only_pairs and (entry is None or exit_ev is None):
                 continue
-            sys.stdout.write(_render_event(entry, "REQUEST"))
-            sys.stdout.write(_render_event(exit_ev, "RESPONSE", extra=paired_from))
+            sys.stdout.write(
+                _render_event(entry, "REQUEST", use_mach_pretty=use_mach_pretty, use_hl_strings=use_hl_strings)
+            )
+            sys.stdout.write(
+                _render_event(
+                    exit_ev,
+                    "RESPONSE",
+                    use_mach_pretty=use_mach_pretty,
+                    use_hl_strings=use_hl_strings,
+                    extra=paired_from,
+                )
+            )
         else:
             if args.only_pairs:
                 continue
-            sys.stdout.write(_render_event(entry, "ENTRY"))
-            sys.stdout.write(_render_event(exit_ev, "EXIT", extra=paired_from))
+            sys.stdout.write(_render_event(entry, "ENTRY", use_mach_pretty=use_mach_pretty, use_hl_strings=use_hl_strings))
+            sys.stdout.write(
+                _render_event(
+                    exit_ev,
+                    "EXIT",
+                    use_mach_pretty=use_mach_pretty,
+                    use_hl_strings=use_hl_strings,
+                    extra=paired_from,
+                )
+            )
 
         if args.all and b.other_xpc:
             for ev in b.other_xpc:
-                sys.stdout.write(_render_event(ev, "OTHER"))
+                sys.stdout.write(_render_event(ev, "OTHER", use_mach_pretty=use_mach_pretty, use_hl_strings=use_hl_strings))
         print()
 
     print(f"read_events={total} xpc_events={total_with_xpc} calls={len(buckets)}", file=sys.stderr)
@@ -315,4 +412,12 @@ def main(argv: List[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    # Allow piping to tools like `head` without noisy BrokenPipeError traces.
+    try:
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except Exception:
+        pass
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        raise SystemExit(0)

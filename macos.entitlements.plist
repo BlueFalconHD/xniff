@@ -13,6 +13,24 @@
     <!-- Development convenience: allow debugger attach -->
     <key>com.apple.security.get-task-allow</key>
     <true/>
+
+    <!-- Debugger entitlements -->
+    <key>com.apple.private.cs.debugger</key>
+    <true/>
+
+    <key>com.apple.system-task-ports</key>
+    <true/>
+
+    <key>com.apple.system-task-ports.control</key>
+    <true/>
+
+   	<key>get-task-allow</key>
+	<true/>
+	<key>run-unsigned-code</key>
+	<true/>
+	<key>task_for_pid-allow</key>
+	<true/>
+	<key>com.apple.private.skip-library-validation</key>
+	<true/>
 </dict>
 </plist>
-

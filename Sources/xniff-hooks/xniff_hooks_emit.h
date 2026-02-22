@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 void xniff_emit_mach_msg_entry(const uint64_t args[8]);
-void xniff_emit_mach_msg_exit(uint64_t ret, const uint64_t args[8]);
+void xniff_emit_mach_msg_exit(uint64_t ret, const uint64_t args[8], int has_separate_rcv_msg);
 
 void xniff_emit_mach_msg2_entry(const uint64_t args[8]);
 void xniff_emit_mach_msg2_exit(uint64_t ret, const uint64_t args[8]);
@@ -26,4 +26,3 @@ void xniff_emit_xpc_connection_send_message_with_reply_sync_exit(uint64_t ret, c
 #ifdef __cplusplus
 }
 #endif
-

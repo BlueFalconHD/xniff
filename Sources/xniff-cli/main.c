@@ -12,6 +12,7 @@
 #include <sys/ptrace.h>
 #include <unistd.h>
 #include <limits.h>
+#include <libproc.h>
 
 #include <mach/mach.h>
 #include <mach/task_info.h>
@@ -31,6 +32,9 @@
 #include "sniff_xpc_cmd.h"
 // XPC wire parser (shared library)
 #include "../xpcdesert/xpcdesert.h"
+
+// for sleeping
+#include <unistd.h>
 
 typedef struct {
     bool jsonl;
@@ -90,9 +94,13 @@ static int attach_and_get_task(pid_t pid, mach_port_t *out_task) {
     kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
     if (kr == KERN_SUCCESS) {
         XNIFF_DIAGF("got task port for pid %d without attach\n", pid);
+        sleep(10);
         *out_task = task;
         return 0;
     }
+
+    // sleep 10s
+    sleep(10);
 
     XNIFF_DIAGF("attaching to pid %d\n", pid);
     if (ptrace(PT_ATTACHEXC, pid, 0, 0) != 0) {
@@ -501,6 +509,64 @@ static void json_write_hex_u64(FILE *out, uint64_t v) {
 }
 
 typedef struct {
+    pid_t pid;
+    char name[128];
+} pid_name_cache_entry_t;
+
+static pid_name_cache_entry_t g_pid_name_cache[128];
+static size_t g_pid_name_cache_next = 0;
+
+static const char *proc_name_cached(pid_t pid) {
+    if (pid <= 0) return NULL;
+
+    for (size_t i = 0; i < sizeof(g_pid_name_cache) / sizeof(g_pid_name_cache[0]); i++) {
+        if (g_pid_name_cache[i].pid == pid && g_pid_name_cache[i].name[0] != '\0') {
+            return g_pid_name_cache[i].name;
+        }
+    }
+
+    char tmp[128];
+    memset(tmp, 0, sizeof(tmp));
+    int n = proc_name(pid, tmp, (uint32_t)sizeof(tmp));
+    if (n <= 0) return NULL;
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    pid_name_cache_entry_t *e =
+        &g_pid_name_cache[g_pid_name_cache_next++ % (sizeof(g_pid_name_cache) / sizeof(g_pid_name_cache[0]))];
+    e->pid = pid;
+    strncpy(e->name, tmp, sizeof(e->name) - 1);
+    e->name[sizeof(e->name) - 1] = '\0';
+    return e->name;
+}
+
+static bool mach_extract_sender_pid_from_trailer(const uint8_t *msg, size_t msg_len, uint32_t msgh_size, uint32_t *pid_out) {
+    if (!pid_out) return false;
+    *pid_out = 0;
+    if (!msg || msg_len < sizeof(mach_msg_header_t)) return false;
+    if (msgh_size < (uint32_t)sizeof(mach_msg_header_t)) return false;
+
+    size_t off = (size_t)round_msg(msgh_size);
+    if (off + sizeof(mach_msg_trailer_t) > msg_len) return false;
+
+    mach_msg_trailer_t t;
+    memcpy(&t, msg + off, sizeof(t));
+    if (t.msgh_trailer_size < sizeof(mach_msg_trailer_t)) return false;
+    if (off + (size_t)t.msgh_trailer_size > msg_len) return false;
+
+    // Audit trailer (or larger) includes an audit_token_t with the sender pid.
+    if ((size_t)t.msgh_trailer_size < sizeof(mach_msg_audit_trailer_t)) return false;
+
+    mach_msg_audit_trailer_t at;
+    memcpy(&at, msg + off, sizeof(at));
+
+    // audit_token_t is opaque; pid is commonly stored in val[5].
+    uint32_t pid = at.msgh_audit.val[5];
+    if (pid == 0 || pid == UINT32_MAX) return false;
+    *pid_out = pid;
+    return true;
+}
+
+typedef struct {
     uint16_t type;
     uint32_t index;
     uint64_t address;
@@ -569,6 +635,23 @@ static void jsonl_print_event(
     fputs("\"msgh_bits\":", stdout); fprintf(stdout, "%u,", mh ? (unsigned)mh->msgh_bits : 0u);
     fputs("\"remote\":", stdout); fprintf(stdout, "%u,", mh ? (unsigned)mh->msgh_remote_port : 0u);
     fputs("\"local\":", stdout); fprintf(stdout, "%u,", mh ? (unsigned)mh->msgh_local_port : 0u);
+
+    uint32_t peer_pid = 0;
+    const char *peer_role = "unknown";
+    if (pl->direction == XNIFF_DIR_EXIT && is_recv && pl->ret_value == 0) {
+        peer_role = "sender";
+        uint32_t sz = pl->msgh_size;
+        if (sz == 0 && mh) sz = (uint32_t)mh->msgh_size;
+        if (sz != 0) (void)mach_extract_sender_pid_from_trailer(msg_bytes, msg_len, sz, &peer_pid);
+    } else if (is_send) {
+        peer_role = "recipient";
+    }
+    const char *peer_name = (peer_pid != 0) ? proc_name_cached((pid_t)peer_pid) : NULL;
+    fputs("\"peer_role\":", stdout); json_write_escaped(stdout, peer_role); fputc(',', stdout);
+    fputs("\"peer_pid\":", stdout); if (peer_pid) fprintf(stdout, "%u,", peer_pid); else fputs("null,", stdout);
+    fputs("\"peer_name\":", stdout); if (peer_name) json_write_escaped(stdout, peer_name); else fputs("null", stdout);
+    fputc(',', stdout);
+
     fputs("\"msg_addr\":", stdout); json_write_hex_u64(stdout, pl->msg_addr); fputc(',', stdout);
     fputs("\"aux_addr\":", stdout); json_write_hex_u64(stdout, pl->aux_addr); fputc(',', stdout);
     fputs("\"option64\":", stdout); json_write_hex_u64(stdout, option64); fputc(',', stdout);
@@ -674,6 +757,8 @@ static void jsonl_print_xpc_event(
     fputs("\"func\":", stdout); fprintf(stdout, "%u,", pl->func);
     fputs("\"func_name\":", stdout); json_write_escaped(stdout, xpc_func_to_name(pl->func)); fputc(',', stdout);
     fputs("\"conn_pid\":", stdout); fprintf(stdout, "%u,", pl->conn_pid);
+    const char *conn_name = (pl->conn_pid != 0) ? proc_name_cached((pid_t)pl->conn_pid) : NULL;
+    fputs("\"conn_name\":", stdout); if (conn_name) json_write_escaped(stdout, conn_name); else fputs("null", stdout); fputc(',', stdout);
     fputs("\"ret\":", stdout); json_write_hex_u64(stdout, pl->ret_value); fputc(',', stdout);
     fputs("\"args\":[", stdout);
     for (int i = 0; i < 8; i++) {
@@ -711,6 +796,8 @@ static void print_xpc_event(
            tbuf, mono_s, kstr,
            xpc_func_to_name(pl->func), pl->func,
            pl->conn_pid, (unsigned long long)pl->ret_value);
+    const char *conn_name = (pl->conn_pid != 0) ? proc_name_cached((pid_t)pl->conn_pid) : NULL;
+    if (conn_name) printf("  conn_name: %s\n", conn_name);
     if (s0) printf("  str0: %s\n", s0);
     if (s1) printf("  str1: %s\n", s1);
     if (s2) printf("  str2: %s\n", s2);
@@ -744,6 +831,15 @@ static void print_event(int kind, const xniff_ipc_mach_payload_t *pl, const uint
            (unsigned long long)pl->ret_value,
            pl->desc_count, pl->priority, (unsigned long long)pl->timeout,
            remote, local);
+
+    uint32_t sender_pid = 0;
+    if (pl->direction == XNIFF_DIR_EXIT && (opt32 & MACH_RCV_MSG) != 0 && pl->ret_value == 0) {
+        uint32_t sz = pl->msgh_size;
+        if (sz == 0 && hdr) sz = (uint32_t)hdr->msgh_size;
+        if (sz != 0) (void)mach_extract_sender_pid_from_trailer(msg_bytes, msg_len, sz, &sender_pid);
+    }
+    const char *sender_name = (sender_pid != 0) ? proc_name_cached((pid_t)sender_pid) : NULL;
+    if (sender_pid) printf("  sender: pid=%u%s%s\n", sender_pid, sender_name ? " name=" : "", sender_name ? sender_name : "");
 
     // Optionally, print a short hexdump of the first 64 bytes of the message
     size_t dump_len = msg_len < g_listener_opts.hex_preview_len ? msg_len : g_listener_opts.hex_preview_len;

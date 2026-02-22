@@ -64,6 +64,29 @@ static peer_info_t *peers_find_by_id_locked(peer_set_t *ps, uint32_t id) {
     return NULL;
 }
 
+static peer_info_t *peers_upsert_id(peer_set_t *ps, uint32_t id) {
+    pthread_mutex_lock(&ps->mu);
+    peer_info_t *p = peers_find_by_id_locked(ps, id);
+    if (!p) {
+        if (ps->count == ps->cap) {
+            size_t nc = ps->cap ? ps->cap * 2 : 8;
+            peer_info_t *np = (peer_info_t *)realloc(ps->peers, nc * sizeof(*np));
+            if (!np) {
+                pthread_mutex_unlock(&ps->mu);
+                return NULL;
+            }
+            ps->peers = np;
+            ps->cap = nc;
+        }
+        p = &ps->peers[ps->count++];
+        memset(p, 0, sizeof(*p));
+        p->pid = 0;
+        p->id = id;
+    }
+    pthread_mutex_unlock(&ps->mu);
+    return p;
+}
+
 static peer_info_t *peers_upsert_meta(peer_set_t *ps, pid_t pid, uint32_t id) {
     pthread_mutex_lock(&ps->mu);
     peer_info_t *p = peers_find_by_pid_locked(ps, pid);
@@ -105,6 +128,32 @@ static void peers_set_conn(peer_set_t *ps, pid_t pid, xpc_connection_t conn) {
         memset(p, 0, sizeof(*p));
         p->pid = pid;
         p->id = 0;
+    }
+    if (p->conn) xpc_release(p->conn);
+    p->conn = conn;
+    if (p->conn) xpc_retain(p->conn);
+    pthread_mutex_unlock(&ps->mu);
+}
+
+static void peers_set_conn_for_id(peer_set_t *ps, uint32_t id, xpc_connection_t conn) {
+    if (!ps || id == 0) return;
+    pthread_mutex_lock(&ps->mu);
+    peer_info_t *p = peers_find_by_id_locked(ps, id);
+    if (!p) {
+        if (ps->count == ps->cap) {
+            size_t nc = ps->cap ? ps->cap * 2 : 8;
+            peer_info_t *np = (peer_info_t *)realloc(ps->peers, nc * sizeof(*np));
+            if (!np) {
+                pthread_mutex_unlock(&ps->mu);
+                return;
+            }
+            ps->peers = np;
+            ps->cap = nc;
+        }
+        p = &ps->peers[ps->count++];
+        memset(p, 0, sizeof(*p));
+        p->pid = 0;
+        p->id = id;
     }
     if (p->conn) xpc_release(p->conn);
     p->conn = conn;
@@ -265,7 +314,15 @@ static void install_peer_handlers(peer_set_t *peers, xpc_connection_t c) {
     xpc_connection_activate(c);
 
     pid_t pid = xpc_connection_get_pid(c);
-    if (pid > 0) peers_set_conn(peers, pid, c);
+    if (pid > 0) {
+        uint32_t id = 0;
+        pthread_mutex_lock(&peers->mu);
+        peer_info_t *p = peers_find_by_pid_locked(peers, pid);
+        if (p) id = p->id;
+        pthread_mutex_unlock(&peers->mu);
+        if (id != 0) peers_set_conn_for_id(peers, id, c);
+        else peers_set_conn(peers, pid, c);
+    }
 }
 
 static int run_worker(const char *service, uint32_t self_id, uint32_t workers, uint32_t threads, uint32_t duration_s, uint32_t min_ms, uint32_t max_ms) {
@@ -294,11 +351,16 @@ static int run_worker(const char *service, uint32_t self_id, uint32_t workers, u
                 pid_t pid = (pid_t)xpc_dictionary_get_int64(event, "pid");
                 uint32_t id = (uint32_t)xpc_dictionary_get_uint64(event, "id");
                 (void)peers_upsert_meta(&peers, pid, id);
+                (void)peers_upsert_id(&peers, id);
 
                 // Deterministic rule to avoid double-connect: lower id initiates.
                 if (self_id < id) {
                     xpc_connection_t pc = xpc_dictionary_create_connection(event, "listener");
-                    if (pc) install_peer_handlers(&peers, pc);
+                    if (pc) {
+                        peers_set_conn_for_id(&peers, id, pc);
+                        install_peer_handlers(&peers, pc);
+                        xpc_release(pc);
+                    }
                 }
             }
         }

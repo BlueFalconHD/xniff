@@ -1,0 +1,206 @@
+Process:             Hex Fiend [44165]
+Path:                /Applications/Hex Fiend.app/Contents/MacOS/Hex Fiend
+Identifier:          com.ridiculousfish.HexFiend
+Version:             2.18 (1728621576)
+Code Type:           ARM-64 (Native)
+Role:                Foreground
+Parent Process:      launchd [1]
+Coalition:           com.ridiculousfish.HexFiend [90193]
+User ID:             501
+
+Date/Time:           2026-01-25 22:15:06.8796 -0600
+Launch Time:         2026-01-25 22:14:57.9255 -0600
+Hardware Model:      Mac14,7
+OS Version:          macOS 26.2 (25C5048a)
+Release Type:        User
+
+Crash Reporter Key:  D47B5DCD-7CC1-4E84-BCF0-D762B8B7E566
+Incident Identifier: BDEA95DF-7B79-433C-A402-5E46CA7FA176
+
+Sleep/Wake UUID:       ED3F083C-9958-475B-A793-F0C9EEDF41BD
+
+Time Awake Since Boot: 630000 seconds
+Time Since Wake:       13981 seconds
+
+System Integrity Protection: disabled
+
+Triggered by Thread: 0, Dispatch Queue: com.apple.main-thread
+
+Exception Type:    EXC_BAD_ACCESS (SIGSEGV)
+Exception Subtype: KERN_INVALID_ADDRESS at 0x0000000010004007
+Exception Codes:   0x0000000000000001, 0x0000000010004007
+
+Termination Reason:  Namespace SIGNAL, Code 11, Segmentation fault: 11
+Terminating Process: exc handler [44165]
+
+
+External Modification Warnings:
+Thread creation by external task.
+
+VM Region Info: 0x10004007 is not in any region.  Bytes before following region: 4069965817
+      REGION TYPE                    START - END         [ VSIZE] PRT/MAX SHRMOD  REGION DETAIL
+      UNUSED SPACE AT START
+--->  
+      __TEXT                      102970000-1029c4000    [  336K] r-x/r-x SM=COW  /Applications/Hex Fiend.app/Contents/MacOS/Hex Fiend
+
+Thread 0 Crashed::  Dispatch queue: com.apple.main-thread
+0   libxniff-hooks.dylib          	       0x151305be4 ipc_send_msg_full + 112 (xpc_hooks.c:150)
+1   libxniff-hooks.dylib          	       0x151306750 xniff_emit_mach_msg_exit + 512 (xpc_hooks.c:318)
+2   libxniff-hooks.dylib          	       0x1513048ec xniff_listener_on_leave + 396 (frida_gum_interceptor.c:135)
+3   libxniff-hooks.dylib          	       0x151310ad4 _gum_function_context_end_invocation + 272 (guminterceptor.c:1738)
+4   ???                           	       0x1509bc1ec ???
+5   ???                           	       0x1509c400c ???
+6   ???                           	     0x3e094068a13 ???
+
+Thread 1:
+
+Thread 2:
+
+Thread 3:: com.apple.NSEventThread
+0   libsystem_kernel.dylib        	       0x1820119c8 __psynch_mutexwait + 8
+1   libsystem_pthread.dylib       	       0x18204ee3c _pthread_mutex_firstfit_lock_wait + 84
+2   libsystem_pthread.dylib       	       0x18204c868 _pthread_mutex_firstfit_lock_slow + 220
+3   libxniff-hooks.dylib          	       0x151304c54 xniff_hooks_ipc_lock + 20 (xniff_hooks_ipc.c:21)
+4   libxniff-hooks.dylib          	       0x151305bb4 ipc_send_msg_full + 64 (xpc_hooks.c:143)
+5   libxniff-hooks.dylib          	       0x151305b64 xniff_emit_mach_msg_entry + 316 (xpc_hooks.c:296)
+6   libxniff-hooks.dylib          	       0x1513046e8 xniff_listener_on_enter + 376 (frida_gum_interceptor.c:94)
+7   libxniff-hooks.dylib          	       0x151310880 _gum_function_context_begin_invocation + 496 (guminterceptor.c:1625)
+8   ???                           	       0x1509bc0b0 ???
+9   CoreFoundation                	       0x1820f0ba0 __CFRunLoopServiceMachPort + 160
+10  CoreFoundation                	       0x1820ef4f8 __CFRunLoopRun + 1188
+11  CoreFoundation                	       0x1821a9e34 _CFRunLoopRunSpecificWithOptions + 532
+12  AppKit                        	       0x186592a34 _NSEventThread + 184
+13  libsystem_pthread.dylib       	       0x182051c08 _pthread_start + 136
+14  libsystem_pthread.dylib       	       0x18204cba8 thread_start + 8
+
+Thread 4:
+0   libsystem_kernel.dylib        	       0x18200ec34 mach_msg2_trap + 8
+1   libsystem_kernel.dylib        	       0x182021028 mach_msg2_internal + 76
+2   libsystem_kernel.dylib        	       0x18201798c mach_msg_overwrite + 484
+3   libsystem_kernel.dylib        	       0x18200efb4 mach_msg + 24
+4   CoreFoundation                	       0x1820f0ba0 __CFRunLoopServiceMachPort + 160
+5   CoreFoundation                	       0x1820ef4f8 __CFRunLoopRun + 1188
+6   CoreFoundation                	       0x1821a9e34 _CFRunLoopRunSpecificWithOptions + 532
+7   CoreFoundation                	       0x182142a40 CFRunLoopRun + 64
+8   Hex Fiend                     	       0x10299ab0c -[OpenDriveWindowController refreshDriveList] + 148
+9   Foundation                    	       0x1839097a0 __NSThread__start__ + 732
+10  libsystem_pthread.dylib       	       0x182051c08 _pthread_start + 136
+11  libsystem_pthread.dylib       	       0x18204cba8 thread_start + 8
+
+Thread 5::  Dispatch queue: com.apple.runningboardservices.connection.incoming
+0   CoreFoundation                	       0x18209434c __CFSearchStringROM + 56
+1   CoreFoundation                	       0x182093dd4 __CFStringCreateImmutableFunnel3 + 2080
+2   RunningBoardServices          	       0x18a2b1ad0 RBSCreateDeserializedStringFromXPCDictionaryWithKey + 76
+3   RunningBoardServices          	       0x18a2c251c _BSXPCDecodeObjectFromContext + 1872
+4   RunningBoardServices          	       0x18a2c1038 _BSXPCDecodeObjectForKey + 152
+5   RunningBoardServices          	       0x18a2e7f64 -[RBSXPCMessage decodeArgumentCollection:withClass:atIndex:allowNil:error:] + 328
+6   RunningBoardServices          	       0x18a2cfa20 __32-[RBSConnection _handleMessage:]_block_invoke_2 + 84
+7   libsystem_trace.dylib         	       0x181d80fc4 _os_activity_initiate_impl + 64
+8   RunningBoardServices          	       0x18a2cf5ec -[RBSConnection _handleMessage:] + 768
+9   RunningBoardServices          	       0x18a2d0220 __37-[RBSConnection _lock_setConnection:]_block_invoke + 84
+10  libxpc.dylib                  	       0x181d326f0 _xpc_connection_call_event_handler + 112
+11  libxpc.dylib                  	       0x181d30f80 _xpc_connection_mach_event + 1488
+12  libdispatch.dylib             	       0x181eaeb1c _dispatch_client_callout4 + 16
+13  libdispatch.dylib             	       0x181eb139c _dispatch_mach_msg_invoke + 464
+14  libdispatch.dylib             	       0x181e9d350 _dispatch_lane_serial_drain + 332
+15  libdispatch.dylib             	       0x181eb2104 _dispatch_mach_invoke + 472
+16  libdispatch.dylib             	       0x181e9d350 _dispatch_lane_serial_drain + 332
+17  libdispatch.dylib             	       0x181e9dff8 _dispatch_lane_invoke + 440
+18  libdispatch.dylib             	       0x181ea8474 _dispatch_root_queue_drain_deferred_wlh + 292
+19  libdispatch.dylib             	       0x181ea7d6c _dispatch_workloop_worker_thread + 692
+20  libsystem_pthread.dylib       	       0x18204de4c _pthread_wqthread + 292
+21  libsystem_pthread.dylib       	       0x18204cb9c start_wqthread + 8
+
+Thread 6:
+0   ???                           	       0x116ac4028 ???
+
+
+Thread 0 crashed with ARM Thread State (64-bit):
+    x0: 0x0000000151b696c0   x1: 0x000000016d48d6b0   x2: 0x000000018204db04   x3: 0x0000000000000000
+    x4: 0x000000016d48d9c0   x5: 0x00003b0300000000   x6: 0x0000000000000002   x7: 0x0000000000000000
+    x8: 0x0000000010004003   x9: 0x0000000013933950  x10: 0x0000000151b68888  x11: 0x0000000004b5e7c7
+   x12: 0x0000000000000000  x13: 0x0000000000000000  x14: 0x00000000fffffff0  x15: 0x00000001514344b6
+   x16: 0x0000000182058ae0  x17: 0x00000001f04e6ac0  x18: 0x0000000000000000  x19: 0x000000015097f8d0
+   x20: 0x00000001509800e0  x21: 0x00000001509e8020  x22: 0x000000015096bca0  x23: 0x0000000000000000
+   x24: 0x0000000151b69000  x25: 0x00000001509e8010  x26: 0x0000000000000001  x27: 0x000000016d48db00
+   x28: 0x0000000010004004   fp: 0x000000016d48d920   lr: 0x0000000151305bd4
+    sp: 0x000000016d48d700   pc: 0x0000000151305be4 cpsr: 0x20001000
+   far: 0x0000000010004007  esr: 0x92000006 (Data Abort) byte read Translation fault
+
+Binary Images:
+       0x102970000 -        0x1029c3fff com.ridiculousfish.HexFiend (2.18) <f2f0e544-72f8-3d2f-8a32-3a6a2c8c102d> /Applications/Hex Fiend.app/Contents/MacOS/Hex Fiend
+       0x102b44000 -        0x102b8bfff org.sparkle-project.Sparkle (1.26.0) <a7f874b5-389d-3d15-8a0b-33b4be6a235f> /Applications/Hex Fiend.app/Contents/Frameworks/Sparkle.framework/Versions/A/Sparkle
+       0x102a2c000 -        0x102a7ffff com.ridiculousfish.HexFiend-Framework (2.18) <0162527f-692a-3d24-96bd-e91f1298adce> /Applications/Hex Fiend.app/Contents/Frameworks/HexFiend.framework/Versions/A/HexFiend
+       0x102c74000 -        0x102c7ffff libobjc-trampolines.dylib (*) <d4baeab8-b553-3779-a0ff-d8848e7a22df> /usr/lib/libobjc-trampolines.dylib
+       0x117074000 -        0x117837fff com.apple.AGXMetalG14G (342.3) <fd2ac287-d149-309f-a2ec-eb9d375be6ad> /System/Library/Extensions/AGXMetalG14G.bundle/Contents/MacOS/AGXMetalG14G
+       0x116b40000 -        0x116b5ffff com.apple.security.csparser (3.0) <79fadf74-9078-3c3d-a8de-e0abbb74ead4> /System/Library/Frameworks/Security.framework/Versions/A/PlugIns/csparser.bundle/Contents/MacOS/csparser
+       0x151300000 -        0x151a1bfff libxniff-hooks.dylib (*) <21802f51-7d6e-3cff-827b-284b16d782b8> /Users/USER/*/libxniff-hooks.dylib
+               0x0 - 0xffffffffffffffff ??? (*) <00000000-0000-0000-0000-000000000000> ???
+       0x18204b000 -        0x182057abb libsystem_pthread.dylib (*) <d7f1f0bd-f8ee-3e75-b1b8-01a100ff1983> /usr/lib/system/libsystem_pthread.dylib
+       0x182058000 -        0x1820603ef libsystem_platform.dylib (*) <425e1ebc-3bb7-30f0-8ff0-2ade1905e1c0> /usr/lib/system/libsystem_platform.dylib
+       0x18200e000 -        0x18204a49f libsystem_kernel.dylib (*) <982ec9d5-9d7f-37a3-ac3e-02a3d09ef68a> /usr/lib/system/libsystem_kernel.dylib
+       0x182091000 -        0x1825d9c3f com.apple.CoreFoundation (6.9) <f5ca1f87-bd89-31be-aade-4fd2e4ec946a> /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
+       0x1864e3000 -        0x187c1211f com.apple.AppKit (6.9) <e9ce2e7a-e175-3c39-9892-78acd111e009> /System/Library/Frameworks/AppKit.framework/Versions/C/AppKit
+       0x1838e3000 -        0x1848864df com.apple.Foundation (6.9) <d9e062ee-2e67-3140-a452-07f8961e80d1> /System/Library/Frameworks/Foundation.framework/Versions/C/Foundation
+       0x18a2ad000 -        0x18a3180df com.apple.RunningBoardServices (1.0) <b01db48e-4adb-398a-9597-234094ad8299> /System/Library/PrivateFrameworks/RunningBoardServices.framework/Versions/A/RunningBoardServices
+       0x181d79000 -        0x181d998df libsystem_trace.dylib (*) <79640959-4a65-33cc-953a-ca2d2e668848> /usr/lib/system/libsystem_trace.dylib
+       0x181d24000 -        0x181d78f7f libxpc.dylib (*) <169f2752-d4c9-3192-a6ec-e071a59e0d1c> /usr/lib/system/libxpc.dylib
+       0x181e93000 -        0x181ed9e5f libdispatch.dylib (*) <1be3b770-1fca-38cf-9c5e-7a0df3119257> /usr/lib/system/libdispatch.dylib
+
+External Modification Summary:
+  Calls made by other processes targeting this process:
+    task_for_pid: 1
+    thread_create: 1
+    thread_set_state: 0
+  Calls made by this process:
+    task_for_pid: 0
+    thread_create: 0
+    thread_set_state: 0
+  Calls made by all processes on this machine:
+    task_for_pid: 106
+    thread_create: 18
+    thread_set_state: 80386
+
+VM Region Summary:
+ReadOnly portion of Libraries: Total=1.8G resident=0K(0%) swapped_out_or_unallocated=1.8G(100%)
+Writable regions: Total=202.2M written=24.5M(12%) resident=977K(0%) swapped_out=23.6M(12%) unallocated=177.6M(88%)
+
+                                VIRTUAL   REGION 
+REGION TYPE                        SIZE    COUNT (non-coalesced) 
+===========                     =======  ======= 
+Accelerate framework               128K        1 
+Activity Tracing                   256K        1 
+ColorSync                           16K        1 
+CoreAnimation                     23.7M       65 
+CoreGraphics                        32K        2 
+CoreUI image data                 1104K        8 
+Foundation                          16K        1 
+Kernel Alloc Once                   32K        1 
+MALLOC                           165.9M       32 
+MALLOC guard page                 3408K        4 
+Memory Tag 255                     272K       11 
+STACK GUARD                       56.1M        6 
+Stack                             10.7M        7 
+VM_ALLOCATE                        800K       16 
+__AUTH                            5751K      633 
+__AUTH_CONST                      86.9M     1014 
+__CTF                               824        1 
+__DATA                            35.0M      966 
+__DATA_CONST                      33.8M     1026 
+__DATA_DIRTY                      8618K      873 
+__FONT_DATA                        2352        1 
+__INFO_FILTER                         8        1 
+__LINKEDIT                       594.0M        8 
+__OBJC_RO                         78.4M        1 
+__OBJC_RW                         2570K        1 
+__TEXT                             1.2G     1058 
+__TPRO_CONST                       128K        2 
+dyld private memory                160K        4 
+mapped file                        1.1G      309 
+page table in kernel               977K        1 
+shared memory                     1440K       15 
+===========                     =======  ======= 
+TOTAL                              3.4G     6070 
+
+
+

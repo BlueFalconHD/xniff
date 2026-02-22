@@ -21,13 +21,15 @@ kern_return_t modify_page_protections_task(mach_port_t task, mach_vm_address_t a
 }
 
 int prepare_protections_for_patching_task(mach_port_t task, mach_vm_address_t address, size_t size) {
-    // Widen maximum protections so WRITE is allowed, then set RW (+COPY for COW text pages).
-    kern_return_t kr = vm_protect_pages_task(task, address, size, TRUE,
-                                             VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS && kr != KERN_INVALID_ARGUMENT) {
-        // Ignore and try current anyway.
+    // Do not mutate maximum protections here: lowering max to RW can make a later
+    // RX transition impossible on some maps. Only request current RW protections.
+    kern_return_t kr = vm_protect_pages_task(task, address, size, FALSE,
+                                             (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY));
+    if (kr != KERN_SUCCESS) {
+        // Some regions reject VM_PROT_COPY; try plain RW as fallback.
+        kr = vm_protect_pages_task(task, address, size, FALSE,
+                                   (VM_PROT_READ | VM_PROT_WRITE));
     }
-    kr = vm_protect_pages_task(task, address, size, FALSE, (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY));
     if (kr != KERN_SUCCESS) {
         fprintf(stderr, "Error: remote make_page_rw failed with %d\n", kr);
         return -1;
@@ -36,11 +38,21 @@ int prepare_protections_for_patching_task(mach_port_t task, mach_vm_address_t ad
 }
 
 int restore_protections_after_patching_task(mach_port_t task, mach_vm_address_t address, size_t size) {
-    kern_return_t kr = modify_page_protections_task(task, address, size, VM_PROT_READ | VM_PROT_EXECUTE);
+    // First try changing current protections only.
+    kern_return_t kr = modify_page_protections_task(task, address, size,
+                                                    (VM_PROT_READ | VM_PROT_EXECUTE));
+    if (kr != KERN_SUCCESS) {
+        // If current RX fails due max-prot constraints, try widening max to RX, then apply RX.
+        kr = vm_protect_pages_task(task, address, size, TRUE,
+                                   (VM_PROT_READ | VM_PROT_EXECUTE));
+        if (kr == KERN_SUCCESS) {
+            kr = modify_page_protections_task(task, address, size,
+                                              (VM_PROT_READ | VM_PROT_EXECUTE));
+        }
+    }
     if (kr != KERN_SUCCESS) {
         fprintf(stderr, "Error: remote make_page_rx failed with %d\n", kr);
         return -1;
     }
     return 0;
 }
-

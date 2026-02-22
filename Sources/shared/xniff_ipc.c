@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -30,6 +31,18 @@ static void set_send_timeout_ms(int fd, int ms) {
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
+static int env_int_ms(const char *name, int defv) {
+    const char *s = getenv(name);
+    if (!s || !*s) return defv;
+    errno = 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 0);
+    if (errno != 0 || end == s) return defv;
+    if (v < 0) return 0;
+    if (v > 60000) return 60000;
+    return (int)v;
+}
+
 int xniff_ipc_path_for_pid(pid_t pid, char *out, size_t outsz) {
     if (!out || outsz == 0) return -1;
     int n = snprintf(out, outsz, "/tmp/xniff-%d.sock", (int)pid);
@@ -46,7 +59,7 @@ int xniff_ipc_client_connect(pid_t pid) {
     set_nosigpipe(fd);
     // Don't let an instrumented target block forever if the listener stalls.
     // If this times out, callers should drop the connection and retry later.
-    set_send_timeout_ms(fd, 50);
+    set_send_timeout_ms(fd, env_int_ms("XNIFF_IPC_SNDTIMEO_MS", 50));
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));

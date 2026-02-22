@@ -194,8 +194,11 @@ int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path,
 
   // this fixes permissions of the code region after patching
   // typically arm64 CPUs require executable pages to be non-writable
-  (void)restore_protections_after_patching_task(
-      task, (mach_vm_address_t)code_addr, blob_size);
+  if (restore_protections_after_patching_task(
+          task, (mach_vm_address_t)code_addr, blob_size) != 0) {
+    fprintf(stderr, "restore_protections_after_patching_task failed\n");
+    goto fail_code;
+  }
 
   // setup the thread state
   // these are the initial register values for the new thread
@@ -216,7 +219,7 @@ int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path,
 
   // check for thread creation error
   if (kr != KERN_SUCCESS) {
-    fprintf(stderr, "thread_create_running failed: %d\n", kr);
+    fprintf(stderr, "thread_create_running: %d (%s)\n", kr, mach_error_string(kr));
     goto fail_code;
   }
 

@@ -13,35 +13,7 @@
 
 #include "../shared/xniff_ipc.h"
 #include "xniff_hooks_emit.h"
-
-static int g_ipc_fd = -1; // lazily connect per-process
-static uint64_t g_next_connect_ns = 0;
-static pthread_mutex_t g_ipc_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static uint64_t now_monotonic_ns(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
-
-static void ipc_drop_connection_locked(void) {
-    if (g_ipc_fd == -1) return;
-    close(g_ipc_fd);
-    g_ipc_fd = -1;
-}
-
-static int ensure_ipc_fd_locked(void) {
-    if (g_ipc_fd != -1) return g_ipc_fd;
-    uint64_t now = now_monotonic_ns();
-    if (now && now < g_next_connect_ns) return -1;
-    int fd = xniff_ipc_client_connect(getpid());
-    if (fd >= 0) {
-        g_ipc_fd = fd;
-    } else {
-        if (now) g_next_connect_ns = now + 250ull * 1000ull * 1000ull;
-    }
-    return g_ipc_fd;
-}
+#include "xniff_hooks_ipc.h"
 
 enum { XNIFF_XPC_STR_MAX = 16384u };
 
@@ -71,8 +43,9 @@ static void ipc_send_xpc_event(
 {
     if (!pl_in) return;
 
-    pthread_mutex_lock(&g_ipc_lock);
-    if (ensure_ipc_fd_locked() < 0) { pthread_mutex_unlock(&g_ipc_lock); return; }
+    xniff_hooks_ipc_lock();
+    int fd = xniff_hooks_ipc_ensure_fd_locked();
+    if (fd < 0) { xniff_hooks_ipc_unlock(); return; }
 
     xniff_ipc_hdr_t hdr = {0};
     hdr.magic = XNIFF_IPC_MAGIC;
@@ -88,15 +61,15 @@ static void ipc_send_xpc_event(
     pl.str2_len = l2;
     pl.str3_len = l3;
 
-    if (xniff_ipc_send_all(g_ipc_fd, &hdr, sizeof(hdr)) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
-    if (xniff_ipc_send_all(g_ipc_fd, &pl, sizeof(pl)) != 0)   { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
+    if (xniff_ipc_send_all(fd, &hdr, sizeof(hdr)) != 0) { xniff_hooks_ipc_drop_locked(); xniff_hooks_ipc_unlock(); return; }
+    if (xniff_ipc_send_all(fd, &pl, sizeof(pl)) != 0)   { xniff_hooks_ipc_drop_locked(); xniff_hooks_ipc_unlock(); return; }
 
-    if (l0 && s0) if (xniff_ipc_send_all(g_ipc_fd, s0, l0) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
-    if (l1 && s1) if (xniff_ipc_send_all(g_ipc_fd, s1, l1) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
-    if (l2 && s2) if (xniff_ipc_send_all(g_ipc_fd, s2, l2) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
-    if (l3 && s3) if (xniff_ipc_send_all(g_ipc_fd, s3, l3) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
+    if (l0 && s0) if (xniff_ipc_send_all(fd, s0, l0) != 0) { xniff_hooks_ipc_drop_locked(); xniff_hooks_ipc_unlock(); return; }
+    if (l1 && s1) if (xniff_ipc_send_all(fd, s1, l1) != 0) { xniff_hooks_ipc_drop_locked(); xniff_hooks_ipc_unlock(); return; }
+    if (l2 && s2) if (xniff_ipc_send_all(fd, s2, l2) != 0) { xniff_hooks_ipc_drop_locked(); xniff_hooks_ipc_unlock(); return; }
+    if (l3 && s3) if (xniff_ipc_send_all(fd, s3, l3) != 0) { xniff_hooks_ipc_drop_locked(); xniff_hooks_ipc_unlock(); return; }
 
-    pthread_mutex_unlock(&g_ipc_lock);
+    xniff_hooks_ipc_unlock();
 }
 
 static inline void pl_init_from_args(xniff_ipc_xpc_payload_t *pl, uint32_t func, uint32_t direction, uint64_t ret, const uint64_t args[8]) {

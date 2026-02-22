@@ -22,13 +22,11 @@
 #include "../shared/mach_private.h"
 
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <mach/message.h>
 
 #include "xniff_hooks_emit.h"
-
-static int g_ipc_fd = -1; // lazily connect per-process
-static uint64_t g_next_connect_ns = 0;
-static pthread_mutex_t g_ipc_lock = PTHREAD_MUTEX_INITIALIZER;
+#include "xniff_hooks_ipc.h"
 
 typedef struct {
     uint32_t max_msg_copy;       // max inline bytes copied per event
@@ -66,30 +64,18 @@ static const xniff_hook_limits_t *limits(void) {
     return &g_limits;
 }
 
-static uint64_t now_monotonic_ns(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
-
-static void ipc_drop_connection_locked(void) {
-    if (g_ipc_fd == -1) return;
-    close(g_ipc_fd);
-    g_ipc_fd = -1;
-}
-
-static int ensure_ipc_fd_locked(void) {
-    if (g_ipc_fd != -1) return g_ipc_fd;
-    uint64_t now = now_monotonic_ns();
-    if (now && now < g_next_connect_ns) return -1;
-    int fd = xniff_ipc_client_connect(getpid());
-    if (fd >= 0) {
-        g_ipc_fd = fd;
-    } else {
-        // Avoid hammering connect() if the listener is gone.
-        if (now) g_next_connect_ns = now + 250ull * 1000ull * 1000ull;
-    }
-    return g_ipc_fd;
+static size_t xniff_safe_copy(const void *src, void *dst, size_t len) {
+    if (!src || !dst || len == 0) return 0;
+    mach_vm_size_t out = 0;
+    kern_return_t kr = mach_vm_read_overwrite(
+        mach_task_self(),
+        (mach_vm_address_t)(uintptr_t)src,
+        (mach_vm_size_t)len,
+        (mach_vm_address_t)(uintptr_t)dst,
+        &out);
+    if (kr != KERN_SUCCESS) return 0;
+    if (out > (mach_vm_size_t)len) out = (mach_vm_size_t)len;
+    return (size_t)out;
 }
 
 static inline uint32_t min_u32(uint32_t a, uint32_t b) { return a < b ? a : b; }
@@ -169,30 +155,75 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
                               const mach_msg_header_t *msg,
                               uint32_t buf_size_hint) {
     if (!msg || !pl_in) return;
-    pthread_mutex_lock(&g_ipc_lock);
-    if (ensure_ipc_fd_locked() < 0) { pthread_mutex_unlock(&g_ipc_lock); return; }
+    uint8_t *msg_copy = NULL;
+    uint8_t *scratch = NULL;
+    size_t scratch_cap = 0;
+
+    xniff_hooks_ipc_lock();
+    int fd = xniff_hooks_ipc_ensure_fd_locked();
+    if (fd < 0) goto out;
 
     const xniff_hook_limits_t *lim = limits();
-    const uint8_t *base = (const uint8_t *)msg;
 
-    uint32_t raw_msgh_size = (uint32_t)msg->msgh_size;
-    bool msgh_size_ok = (raw_msgh_size >= (uint32_t)sizeof(*msg)) &&
-                        (buf_size_hint != 0 ? (raw_msgh_size <= buf_size_hint)
-                                            : (lim->max_msg_copy == 0 || raw_msgh_size <= lim->max_msg_copy));
+    mach_msg_header_t hdr_copy;
+    memset(&hdr_copy, 0, sizeof(hdr_copy));
+    bool header_ok = xniff_safe_copy(msg, &hdr_copy, sizeof(hdr_copy)) == sizeof(hdr_copy);
+    uint32_t raw_msgh_size = header_ok ? (uint32_t)hdr_copy.msgh_size : 0;
 
-    // If msgh_size looks bogus (common on receive-only entry or on error exits),
-    // fall back to the caller-provided buffer size hint. Avoid reading past what
-    // the caller said they allocated.
-    uint32_t copy_bound = msgh_size_ok ? raw_msgh_size : buf_size_hint;
-    if (copy_bound == 0) copy_bound = raw_msgh_size;
+    // Treat msgh_size as "trusted" only when it is plausibly bounded by the caller's
+    // receive buffer size and our configured maximum payload ceiling.
+    bool msgh_size_ok = header_ok &&
+                        (raw_msgh_size >= (uint32_t)sizeof(mach_msg_header_t)) &&
+                        (buf_size_hint != 0 ? (raw_msgh_size <= buf_size_hint) : true) &&
+                        (lim->max_payload == 0 || raw_msgh_size <= lim->max_payload);
+
+    // Decide how many inline bytes to copy. If msgh_size is untrusted, fall back to
+    // the caller-provided buffer size hint (if any).
+    uint32_t copy_bound = 0;
+    if (msgh_size_ok) {
+        copy_bound = raw_msgh_size;
+
+        // On successful receive, a trailer may be present after the rounded message size.
+        // Capture enough bytes to include the requested trailer so the listener can extract
+        // sender identity (audit token) without risking dereferencing invalid memory.
+        mach_msg_option_t opt32 = (mach_msg_option_t)pl_in->option_lo;
+        if ((opt32 & MACH_RCV_MSG) != 0 && buf_size_hint != 0 && buf_size_hint > raw_msgh_size) {
+            mach_msg_trailer_size_t req = REQUESTED_TRAILER_SIZE(opt32);
+            uint64_t want64 = (uint64_t)round_msg(raw_msgh_size) + (uint64_t)req;
+            uint32_t want = (want64 > UINT32_MAX) ? UINT32_MAX : (uint32_t)want64;
+            if (want > buf_size_hint) want = buf_size_hint;
+            if (want > copy_bound) copy_bound = want;
+        }
+    } else if (buf_size_hint != 0) {
+        copy_bound = buf_size_hint;
+    }
 
     uint32_t copy_len = copy_bound;
     if (lim->max_msg_copy != 0 && copy_len > lim->max_msg_copy) copy_len = lim->max_msg_copy;
+    if (!header_ok) copy_len = 0;
 
-    // Compute attachment TLVs size in advance
-    uint32_t msg_bound = msgh_size_ok ? raw_msgh_size : 0;
-    if (msg_bound != 0 && buf_size_hint != 0 && msg_bound > buf_size_hint) msg_bound = buf_size_hint;
-    size_t att_sz = msgh_size_ok ? attachments_size_for_msg_limited(msg, msg_bound) : 0;
+    // Safely copy message bytes out of the target's address space so we never dereference
+    // a potentially-invalid pointer. If we can't read the header, don't attempt to copy.
+    if (copy_len != 0 && header_ok) {
+        msg_copy = (uint8_t *)calloc(1, (size_t)copy_len);
+        if (msg_copy) {
+            memcpy(msg_copy, &hdr_copy, (size_t)min_u32(copy_len, (uint32_t)sizeof(hdr_copy)));
+            (void)xniff_safe_copy(msg, msg_copy, (size_t)copy_len);
+        } else {
+            copy_len = 0;
+        }
+    }
+
+    // Compute attachment TLVs size from the safe message copy (bounded by what we copied).
+    uint32_t msg_bound = 0;
+    if (msgh_size_ok && copy_len != 0) {
+        msg_bound = raw_msgh_size;
+        if (buf_size_hint != 0 && msg_bound > buf_size_hint) msg_bound = buf_size_hint;
+        if (msg_bound > copy_len) msg_bound = copy_len;
+    }
+    size_t att_sz = (msgh_size_ok && msg_bound != 0 && msg_copy != NULL)
+                        ? attachments_size_for_msg_limited((const mach_msg_header_t *)msg_copy, msg_bound)
+                        : 0;
 
     xniff_ipc_hdr_t hdr = {0};
     hdr.magic = XNIFF_IPC_MAGIC;
@@ -220,7 +251,7 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
         uint64_t max = UINT32_MAX;
         if (payload_len64 > max) {
             uint64_t keep = (uint64_t)sizeof(xniff_ipc_mach_payload_t);
-            if (keep > max) { pthread_mutex_unlock(&g_ipc_lock); return; }
+            if (keep > max) { xniff_hooks_ipc_unlock(); return; }
             uint64_t left = max - keep;
             uint64_t keep_inline = (copy_len > left) ? left : copy_len;
             left -= keep_inline;
@@ -233,19 +264,19 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
     hdr.payload_len = (uint32_t)payload_len64;
 
     xniff_ipc_mach_payload_t pl = *pl_in;
-    pl.msgh_size = msgh_size_ok ? raw_msgh_size : 0;
+    pl.msgh_size = header_ok ? raw_msgh_size : 0;
     pl.copy_len = copy_len;
     pl.msg_addr = (uint64_t)(uintptr_t)msg;
 
     // Send header, payload, and inline bytes (blocking to ensure ordering)
-    if (xniff_ipc_send_all(g_ipc_fd, &hdr, sizeof(hdr)) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
-    if (xniff_ipc_send_all(g_ipc_fd, &pl, sizeof(pl)) != 0)  { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
-    if (copy_len && xniff_ipc_send_all(g_ipc_fd, base, copy_len) != 0)   { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
+    if (xniff_ipc_send_all(fd, &hdr, sizeof(hdr)) != 0) { xniff_hooks_ipc_drop_locked(); goto out; }
+    if (xniff_ipc_send_all(fd, &pl, sizeof(pl)) != 0)  { xniff_hooks_ipc_drop_locked(); goto out; }
+    if (copy_len && msg_copy && xniff_ipc_send_all(fd, msg_copy, copy_len) != 0)   { xniff_hooks_ipc_drop_locked(); goto out; }
 
     // Send attachments
-    if (att_sz != 0 && msgh_size_ok) {
+    if (att_sz != 0 && msgh_size_ok && msg_copy) {
         mach_msg_descriptor_t *desc2 = NULL;
-        mach_msg_size_t dcount = safe_descriptor_count(msg, msg_bound, NULL, NULL, &desc2);
+        mach_msg_size_t dcount = safe_descriptor_count((const mach_msg_header_t *)msg_copy, msg_bound, NULL, NULL, &desc2);
         uint32_t total_left = lim->max_ool_total ? lim->max_ool_total : 0;
         size_t att_left = att_sz;
         for (mach_msg_size_t i = 0; i < dcount; i++, desc2++) {
@@ -266,10 +297,18 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
                 md.flags = (ool->deallocate ? 1u : 0u) | (ool->copy ? 2u : 0u);
                 md.address = (uint64_t)(uintptr_t)ool->address;
                 md.size = n;
-                if (xniff_ipc_send_all(g_ipc_fd, &h, sizeof(h)) != 0)  { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
-                if (xniff_ipc_send_all(g_ipc_fd, &md, sizeof(md)) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
-                if (ool->address && n) {
-                    if (xniff_ipc_send_all(g_ipc_fd, ool->address, n) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
+                if (xniff_ipc_send_all(fd, &h, sizeof(h)) != 0)  { xniff_hooks_ipc_drop_locked(); goto out; }
+                if (xniff_ipc_send_all(fd, &md, sizeof(md)) != 0) { xniff_hooks_ipc_drop_locked(); goto out; }
+                if ((size_t)n > scratch_cap) {
+                    uint8_t *ns = (uint8_t *)realloc(scratch, (size_t)n);
+                    if (!ns) { xniff_hooks_ipc_drop_locked(); goto out; }
+                    scratch = ns;
+                    scratch_cap = (size_t)n;
+                }
+                if (scratch && n) {
+                    memset(scratch, 0, (size_t)n);
+                    if (ool->address) (void)xniff_safe_copy(ool->address, scratch, (size_t)n);
+                    if (xniff_ipc_send_all(fd, scratch, (size_t)n) != 0) { xniff_hooks_ipc_drop_locked(); goto out; }
                 }
                 att_left -= (overhead + (size_t)n);
             } else if (t == MACH_MSG_OOL_PORTS_DESCRIPTOR) {
@@ -290,16 +329,27 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
                 md.count = send_count;
                 md.address = (uint64_t)(uintptr_t)op->address;
                 md.elem_size = (uint32_t)sizeof(mach_port_t);
-                if (xniff_ipc_send_all(g_ipc_fd, &h, sizeof(h)) != 0)  { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
-                if (xniff_ipc_send_all(g_ipc_fd, &md, sizeof(md)) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
-                if (op->address && n) {
-                    if (xniff_ipc_send_all(g_ipc_fd, op->address, n) != 0) { ipc_drop_connection_locked(); pthread_mutex_unlock(&g_ipc_lock); return; }
+                if (xniff_ipc_send_all(fd, &h, sizeof(h)) != 0)  { xniff_hooks_ipc_drop_locked(); goto out; }
+                if (xniff_ipc_send_all(fd, &md, sizeof(md)) != 0) { xniff_hooks_ipc_drop_locked(); goto out; }
+                if ((size_t)n > scratch_cap) {
+                    uint8_t *ns = (uint8_t *)realloc(scratch, (size_t)n);
+                    if (!ns) { xniff_hooks_ipc_drop_locked(); goto out; }
+                    scratch = ns;
+                    scratch_cap = (size_t)n;
+                }
+                if (scratch && n) {
+                    memset(scratch, 0, (size_t)n);
+                    if (op->address) (void)xniff_safe_copy(op->address, scratch, (size_t)n);
+                    if (xniff_ipc_send_all(fd, scratch, (size_t)n) != 0) { xniff_hooks_ipc_drop_locked(); goto out; }
                 }
                 att_left -= (overhead + (size_t)n);
             }
         }
     }
-    pthread_mutex_unlock(&g_ipc_lock);
+out:
+    if (scratch) free(scratch);
+    if (msg_copy) free(msg_copy);
+    xniff_hooks_ipc_unlock();
 }
 
 void xniff_emit_mach_msg_entry(const uint64_t args[8]) {
@@ -324,16 +374,15 @@ void xniff_emit_mach_msg_entry(const uint64_t args[8]) {
     ipc_send_msg_full(XNIFF_EVT_MACH_ENTRY, &pl, msg, buf_hint);
 }
 
-void xniff_emit_mach_msg_exit(uint64_t ret, const uint64_t args[8]) {
+void xniff_emit_mach_msg_exit(uint64_t ret, const uint64_t args[8], int has_separate_rcv_msg) {
     if (!args) return;
     mach_msg_option_t option = (mach_msg_option_t)args[1];
     uint32_t send_size = (uint32_t)args[2];
     uint32_t rcv_size  = (uint32_t)args[3];
 
-    // Only trust the receive buffer on success. Otherwise, fall back to the send buffer
-    // to avoid walking uninitialized memory (common with rcv errors).
-    bool have_rcv = (option & MACH_RCV_MSG) && (ret == MACH_MSG_SUCCESS) && args[7];
-    mach_msg_header_t* msg = (mach_msg_header_t *)(uintptr_t)(have_rcv ? args[7] : args[0]);
+    bool have_rcv = (option & MACH_RCV_MSG) && (ret == MACH_MSG_SUCCESS);
+    uint64_t rcv_ptr = (has_separate_rcv_msg && args[7]) ? args[7] : args[0];
+    mach_msg_header_t* msg = (mach_msg_header_t *)(uintptr_t)(have_rcv ? rcv_ptr : args[0]);
     if (!msg) return;
     uint32_t buf_hint = have_rcv ? rcv_size : send_size;
 

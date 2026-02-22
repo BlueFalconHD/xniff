@@ -7,7 +7,9 @@
       "description": "Configure the project in ./build with default settings.",
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug"
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "${sourceDir}/scripts/xcrun-clang.sh",
+        "CMAKE_ASM_COMPILER": "${sourceDir}/scripts/xcrun-clang.sh"
       }
     }
   ],

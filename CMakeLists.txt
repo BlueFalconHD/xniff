@@ -15,13 +15,19 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(XNIFF_FRIDA_GUM_VERSION "16.5.6" CACHE STRING "Frida Gum devkit version")
+option(XNIFF_ENABLE_ARM64E "Download arm64e Frida Gum devkit and build arm64e xniff-hooks" OFF)
 
 # Always use Frida Gum for in-process interception (no custom patcher fallback).
 include(FetchContent)
 if(APPLE)
-    set(_frida_gum_url "https://github.com/frida/frida/releases/download/${XNIFF_FRIDA_GUM_VERSION}/frida-gum-devkit-${XNIFF_FRIDA_GUM_VERSION}-macos-arm64.tar.xz")
+    if(XNIFF_ENABLE_ARM64E)
+        set(_frida_gum_arch "arm64e")
+    else()
+        set(_frida_gum_arch "arm64")
+    endif()
+    set(_frida_gum_url "https://github.com/frida/frida/releases/download/${XNIFF_FRIDA_GUM_VERSION}/frida-gum-devkit-${XNIFF_FRIDA_GUM_VERSION}-macos-${_frida_gum_arch}.tar.xz")
 else()
-    message(FATAL_ERROR "xniff-hooks currently supports Frida Gum only on macOS arm64")
+    message(FATAL_ERROR "xniff-hooks currently supports Frida Gum only on macOS arm64/arm64e")
 endif()
 
 FetchContent_Declare(frida_gum_devkit URL "${_frida_gum_url}")
@@ -78,6 +84,9 @@ if(XNIFF_HOOKS_SOURCES)
     endif()
     target_link_libraries(xniff-hooks PRIVATE frida-gum resolv m)
     set_target_properties(xniff-hooks PROPERTIES OUTPUT_NAME xniff-hooks)
+    if(APPLE AND XNIFF_ENABLE_ARM64E)
+        set_target_properties(xniff-hooks PROPERTIES OSX_ARCHITECTURES "arm64e")
+    endif()
 endif()
 
 file(GLOB XNIFF_CLI_SOURCES CONFIGURE_DEPENDS
