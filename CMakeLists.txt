@@ -15,7 +15,13 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(XNIFF_FRIDA_GUM_VERSION "16.5.6" CACHE STRING "Frida Gum devkit version")
-option(XNIFF_ENABLE_ARM64E "Download arm64e Frida Gum devkit and build arm64e xniff-hooks" OFF)
+option(XNIFF_ENABLE_ARM64E "Download arm64e Frida Gum devkit and build arm64e xniff-hooks/xniff-cli" OFF)
+
+function(xniff_enable_arm64e target_name)
+    if(APPLE AND XNIFF_ENABLE_ARM64E)
+        set_target_properties(${target_name} PROPERTIES OSX_ARCHITECTURES "arm64e")
+    endif()
+endfunction()
 
 # Always use Frida Gum for in-process interception (no custom patcher fallback).
 include(FetchContent)
@@ -62,6 +68,7 @@ set_target_properties(xniff PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}
 )
+xniff_enable_arm64e(xniff)
 
 ## Removed: xniff-rt runtime dylib target
 ## (former target and sources under Sources/xniff-rt)
@@ -84,9 +91,7 @@ if(XNIFF_HOOKS_SOURCES)
     endif()
     target_link_libraries(xniff-hooks PRIVATE frida-gum resolv m)
     set_target_properties(xniff-hooks PROPERTIES OUTPUT_NAME xniff-hooks)
-    if(APPLE AND XNIFF_ENABLE_ARM64E)
-        set_target_properties(xniff-hooks PROPERTIES OSX_ARCHITECTURES "arm64e")
-    endif()
+    xniff_enable_arm64e(xniff-hooks)
 endif()
 
 file(GLOB XNIFF_CLI_SOURCES CONFIGURE_DEPENDS
@@ -101,6 +106,7 @@ target_include_directories(xniff-cli PRIVATE
     ${PROJECT_SOURCE_DIR}/Sources/libxniff/include
     ${PROJECT_SOURCE_DIR}/Sources/shared
     ${PROJECT_SOURCE_DIR}/Sources/xpcdesert)
+xniff_enable_arm64e(xniff-cli)
 
 file(GLOB XNIFF_TEST_SOURCES CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/Sources/xniff-tests/*.c"
@@ -131,11 +137,13 @@ set(XPCDESERT_LIB_SOURCES
 add_library(xpcdesert SHARED ${XPCDESERT_LIB_SOURCES})
 target_include_directories(xpcdesert PUBLIC ${XPCDESERT_DIR})
 set_target_properties(xpcdesert PROPERTIES OUTPUT_NAME xpcdesert)
+xniff_enable_arm64e(xpcdesert)
 
 # CLI builds on the same sources as before but now links against the library
 add_executable(xpcdesert-cli "${XPCDESERT_DIR}/xpcdesert_cli.c")
 target_include_directories(xpcdesert-cli PRIVATE ${XPCDESERT_DIR})
 target_link_libraries(xpcdesert-cli PRIVATE xpcdesert xniff)
+xniff_enable_arm64e(xpcdesert-cli)
 
 # macOS codesigning with JIT entitlements (for testing self-modifying code)
 if(APPLE)

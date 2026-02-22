@@ -205,11 +205,10 @@ int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path,
   arm_thread_state64_t st;
   memset(&st, 0, sizeof(st));
 
-  // the stack pointer is set to our allocated stack
-  st.__sp = sp;
-
-  // the program counter is equal to our allocated code address
-  st.__pc = code_addr;
+  // set stack/program counter through SDK accessors so arm64e opaque thread
+  // state layouts are handled correctly.
+  arm_thread_state64_set_sp(st, sp);
+  arm_thread_state64_set_pc_fptr(st, (void (*)(void))(uintptr_t)code_addr);
 
   // create the thread
   thread_act_t th = MACH_PORT_NULL;
