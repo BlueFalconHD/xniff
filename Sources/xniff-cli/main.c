@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <limits.h>
 #include <libproc.h>
+#include <spawn.h>
 
 #include <mach/mach.h>
 #include <mach/task_info.h>
@@ -32,6 +33,8 @@
 #include "sniff_xpc_cmd.h"
 // XPC wire parser (shared library)
 #include "../xpcdesert/xpcdesert.h"
+
+extern char **environ;
 
 typedef struct {
     bool jsonl;
@@ -227,6 +230,10 @@ static void usage(const char *prog) {
     fprintf(stderr, "  %s hook-xpc <pid> <hooks.dylib> [--mach|--xpc]  Inject hooks and install either mach_msg* or libxpc XPC APIs.\n", prog);
     fprintf(stderr, "  %s listen <pid> [flags]          Listen for events from target via in-memory ring buffer.\n", prog);
     fprintf(stderr, "  %s sniff-xpc <pid> <hooks.dylib> [--mach|--xpc] [flags] Start listener, inject hooks, and install automatically.\n", prog);
+    fprintf(stderr, "  %s sniff-xpc-launch <hooks.dylib> [--mach|--xpc] [flags] -- <program> [args...]\n", prog);
+    fprintf(stderr, "                                   Launch suspended, install hooks before process starts, then resume.\n");
+    fprintf(stderr, "  %s sniff-xpc-wait <process_name> <hooks.dylib> [--mach|--xpc] [flags]\n", prog);
+    fprintf(stderr, "                                   Poll for process name, stop on first match, inject, then resume.\n");
     fprintf(stderr, "\nNotes:\n");
     fprintf(stderr, "- Hooks are installed in-process via frida-gum after injection.\n");
     fprintf(stderr, "\nListen flags:\n");
@@ -239,10 +246,20 @@ static void usage(const char *prog) {
 // Forward declare subcommand implementation
 static int cmd_hook_xpc(pid_t pid, const char *dylib_path, int mode);
 static int cmd_listen(pid_t pid);
+static int cmd_sniff_xpc_launch(const char *dylib_path, int mode, char *const launch_argv[]);
+static int cmd_sniff_xpc_wait(const char *process_name, const char *dylib_path, int mode);
 
-static int parse_hook_mode_flags(int argc, char **argv, int start_idx, int *mode_out) {
-    bool saw_mach = false, saw_xpc = false;
+static int find_double_dash(int argc, char **argv, int start_idx) {
     for (int i = start_idx; i < argc; i++) {
+        if (argv[i] && strcmp(argv[i], "--") == 0) return i;
+    }
+    return -1;
+}
+
+static int parse_hook_mode_flags(int argc, char **argv, int start_idx, int end_idx, int *mode_out) {
+    bool saw_mach = false, saw_xpc = false;
+    if (end_idx < 0 || end_idx > argc) end_idx = argc;
+    for (int i = start_idx; i < end_idx; i++) {
         const char *a = argv[i];
         if (!a) continue;
         if (strcmp(a, "--mach") == 0) saw_mach = true;
@@ -276,13 +293,50 @@ int main(int argc, char **argv) {
         if (pid <= 0) { usage(argv[0]); return 2; }
         const char *path = argv[3];
         int mode = XNIFF_HOOK_MODE_MACH;
-        if (parse_hook_mode_flags(argc, argv, 4, &mode) != 0) {
+        if (parse_hook_mode_flags(argc, argv, 4, argc, &mode) != 0) {
             fprintf(stderr, "sniff-xpc: choose exactly one of --mach or --xpc\n");
             return 2;
         }
         int prc = parse_listener_flags(&g_listener_opts, argc, argv, 4);
         if (prc != 0) { usage(argv[0]); return prc > 0 ? 0 : 2; }
         int rc = cmd_sniff_xpc(pid, path, mode);
+        return (rc == 0) ? 0 : 1;
+    }
+
+    // Subcommand: sniff-xpc-launch <hooks.dylib> [--mach|--xpc] [flags] -- <program> [args...]
+    if (strcmp(argv[1], "sniff-xpc-launch") == 0) {
+        if (argc < 5) { usage(argv[0]); return 2; }
+        const char *path = argv[2];
+        int sep = find_double_dash(argc, argv, 3);
+        if (sep < 0 || (sep + 1) >= argc) {
+            fprintf(stderr, "sniff-xpc-launch: missing target program; use -- <program> [args...]\n");
+            usage(argv[0]);
+            return 2;
+        }
+        int mode = XNIFF_HOOK_MODE_MACH;
+        if (parse_hook_mode_flags(argc, argv, 3, sep, &mode) != 0) {
+            fprintf(stderr, "sniff-xpc-launch: choose exactly one of --mach or --xpc\n");
+            return 2;
+        }
+        int prc = parse_listener_flags(&g_listener_opts, sep, argv, 3);
+        if (prc != 0) { usage(argv[0]); return prc > 0 ? 0 : 2; }
+        int rc = cmd_sniff_xpc_launch(path, mode, &argv[sep + 1]);
+        return (rc == 0) ? 0 : 1;
+    }
+
+    // Subcommand: sniff-xpc-wait <process_name> <hooks.dylib> [--mach|--xpc] [flags]
+    if (strcmp(argv[1], "sniff-xpc-wait") == 0) {
+        if (argc < 4) { usage(argv[0]); return 2; }
+        const char *process_name = argv[2];
+        const char *path = argv[3];
+        int mode = XNIFF_HOOK_MODE_MACH;
+        if (parse_hook_mode_flags(argc, argv, 4, argc, &mode) != 0) {
+            fprintf(stderr, "sniff-xpc-wait: choose exactly one of --mach or --xpc\n");
+            return 2;
+        }
+        int prc = parse_listener_flags(&g_listener_opts, argc, argv, 4);
+        if (prc != 0) { usage(argv[0]); return prc > 0 ? 0 : 2; }
+        int rc = cmd_sniff_xpc_wait(process_name, path, mode);
         return (rc == 0) ? 0 : 1;
     }
 
@@ -293,7 +347,7 @@ int main(int argc, char **argv) {
         if (pid <= 0) { usage(argv[0]); return 2; }
         const char *path = argv[3];
         int mode = XNIFF_HOOK_MODE_MACH;
-        if (parse_hook_mode_flags(argc, argv, 4, &mode) != 0) {
+        if (parse_hook_mode_flags(argc, argv, 4, argc, &mode) != 0) {
             fprintf(stderr, "hook-xpc: choose exactly one of --mach or --xpc\n");
             return 2;
         }
@@ -1173,8 +1227,132 @@ static int cmd_hook_xpc(pid_t pid, const char *dylib_path, int mode) {
     return 0;
 }
 
+static int spawn_suspended_target(char *const launch_argv[], pid_t *out_pid) {
+    if (!launch_argv || !launch_argv[0] || !out_pid) {
+        errno = EINVAL;
+        return -1;
+    }
+#ifdef POSIX_SPAWN_START_SUSPENDED
+    posix_spawnattr_t attr;
+    int src = posix_spawnattr_init(&attr);
+    if (src != 0) {
+        errno = src;
+        return -1;
+    }
+    short flags = POSIX_SPAWN_START_SUSPENDED;
+    src = posix_spawnattr_setflags(&attr, flags);
+    if (src != 0) {
+        errno = src;
+        (void)posix_spawnattr_destroy(&attr);
+        return -1;
+    }
+
+    pid_t pid = 0;
+    src = posix_spawnp(&pid, launch_argv[0], NULL, &attr, launch_argv, environ);
+    (void)posix_spawnattr_destroy(&attr);
+    if (src != 0) {
+        errno = src;
+        return -1;
+    }
+    *out_pid = pid;
+    return 0;
+#else
+    (void)launch_argv;
+    (void)out_pid;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+static const char *xniff_basename(const char *path) {
+    if (!path) return NULL;
+    const char *slash = strrchr(path, '/');
+    return slash ? (slash + 1) : path;
+}
+
+static int find_process_by_name_once(const char *target_name, pid_t *out_pid) {
+    if (!target_name || !*target_name || !out_pid) return -1;
+
+    int bytes = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
+    if (bytes <= 0) return -1;
+    size_t count = (size_t)bytes / sizeof(pid_t);
+    pid_t *pids = (pid_t *)calloc(count ? count : 1, sizeof(pid_t));
+    if (!pids) return -1;
+
+    int got = proc_listpids(PROC_ALL_PIDS, 0, pids, (int)(count * sizeof(pid_t)));
+    if (got <= 0) {
+        free(pids);
+        return -1;
+    }
+    size_t got_count = (size_t)got / sizeof(pid_t);
+
+    pid_t self = getpid();
+    pid_t best_pid = 0;
+    for (size_t i = 0; i < got_count; i++) {
+        pid_t pid = pids[i];
+        if (pid <= 0 || pid == self) continue;
+
+        bool matched = false;
+
+        char name_buf[PROC_PIDPATHINFO_MAXSIZE];
+        int n = proc_name(pid, name_buf, sizeof(name_buf));
+        if (n > 0) {
+            size_t nn = (size_t)n;
+            if (nn >= sizeof(name_buf)) nn = sizeof(name_buf) - 1;
+            name_buf[nn] = '\0';
+            if (strcmp(name_buf, target_name) == 0) matched = true;
+        }
+
+        char path_buf[PROC_PIDPATHINFO_MAXSIZE];
+        if (!matched) {
+            int pn = proc_pidpath(pid, path_buf, sizeof(path_buf));
+            if (pn > 0) {
+                size_t pnn = (size_t)pn;
+                if (pnn >= sizeof(path_buf)) pnn = sizeof(path_buf) - 1;
+                path_buf[pnn] = '\0';
+                if (strcmp(path_buf, target_name) == 0) {
+                    matched = true;
+                } else {
+                    const char *base = xniff_basename(path_buf);
+                    if (base && strcmp(base, target_name) == 0) matched = true;
+                }
+            }
+        }
+
+        if (matched && pid > best_pid) {
+            // Prefer the newest matching pid.
+            best_pid = pid;
+        }
+    }
+
+    free(pids);
+    if (best_pid > 0) {
+        *out_pid = best_pid;
+        return 0;
+    }
+    return 1;
+}
+
+static int wait_for_process_name(const char *target_name, pid_t *out_pid) {
+    if (!target_name || !*target_name || !out_pid) return -1;
+    for (;;) {
+        pid_t pid = 0;
+        int rc = find_process_by_name_once(target_name, &pid);
+        if (rc == 0) {
+            *out_pid = pid;
+            return 0;
+        }
+        usleep(50 * 1000);
+    }
+}
+
 // Combined workflow: start listener, then inject hooks.
-int cmd_sniff_xpc(pid_t pid, const char *dylib_path, int mode) {
+static int cmd_sniff_xpc_impl(pid_t pid,
+                              const char *dylib_path,
+                              int mode,
+                              bool resume_target,
+                              bool target_is_child) {
+    const char *flow = resume_target ? "sniff-xpc-launch" : "sniff-xpc";
     pid_t child = fork();
     if (child == 0) {
         int rc = cmd_listen(pid);
@@ -1199,7 +1377,7 @@ int cmd_sniff_xpc(pid_t pid, const char *dylib_path, int mode) {
         usleep(50 * 1000);
     }
     if (!listener_ready) {
-        fprintf(stderr, "sniff-xpc: listener failed to start for pid %d\n", (int)pid);
+        fprintf(stderr, "%s: listener failed to start for pid %d\n", flow, (int)pid);
         (void)kill(child, SIGTERM);
         (void)waitpid(child, NULL, 0);
         return -1;
@@ -1207,15 +1385,90 @@ int cmd_sniff_xpc(pid_t pid, const char *dylib_path, int mode) {
 
     int rc = cmd_hook_xpc(pid, dylib_path, mode);
     if (rc != 0) {
-        fprintf(stderr, "sniff-xpc: hook-xpc failed; terminating listener (pid %d)\n", (int)child);
+        fprintf(stderr, "%s: hook-xpc failed; terminating listener (pid %d)\n", flow, (int)child);
         kill(child, SIGTERM);
         (void)waitpid(child, NULL, 0);
         return -1;
     }
 
-    XNIFF_DIAGF("sniff-xpc: hooks installed; streaming events (listener pid %d). Press Ctrl-C to stop.\n", (int)child);
-    int status = 0;
-    (void)waitpid(child, &status, 0);
-    if (WIFEXITED(status)) return WEXITSTATUS(status) == 0 ? 0 : -1;
+    if (resume_target) {
+        if (kill(pid, SIGCONT) != 0) {
+            fprintf(stderr, "%s: failed to resume target pid %d: %s\n", flow, (int)pid, strerror(errno));
+            kill(child, SIGTERM);
+            (void)waitpid(child, NULL, 0);
+            return -1;
+        }
+        XNIFF_DIAGF("%s: resumed target pid %d\n", flow, (int)pid);
+    }
+
+    XNIFF_DIAGF("%s: hooks installed; streaming events (listener pid %d). Press Ctrl-C to stop.\n",
+                flow, (int)child);
+    int listener_status = 0;
+    for (;;) {
+        int status = 0;
+        pid_t w = waitpid(-1, &status, 0);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (w == child) {
+            listener_status = status;
+            break;
+        }
+        if (target_is_child && w == pid) {
+            if (WIFEXITED(status)) {
+                XNIFF_DIAGF("%s: target pid %d exited with code %d\n",
+                            flow, (int)pid, WEXITSTATUS(status));
+            } else if (WIFSIGNALED(status)) {
+                XNIFF_DIAGF("%s: target pid %d exited due to signal %d\n",
+                            flow, (int)pid, WTERMSIG(status));
+            }
+            continue;
+        }
+    }
+    if (WIFEXITED(listener_status)) return WEXITSTATUS(listener_status) == 0 ? 0 : -1;
     return -1;
+}
+
+int cmd_sniff_xpc(pid_t pid, const char *dylib_path, int mode) {
+    return cmd_sniff_xpc_impl(pid, dylib_path, mode, false, false);
+}
+
+static int cmd_sniff_xpc_launch(const char *dylib_path, int mode, char *const launch_argv[]) {
+    pid_t pid = 0;
+    if (spawn_suspended_target(launch_argv, &pid) != 0) {
+        fprintf(stderr, "sniff-xpc-launch: failed to spawn suspended target '%s': %s\n",
+                launch_argv && launch_argv[0] ? launch_argv[0] : "(null)", strerror(errno));
+        return -1;
+    }
+
+    XNIFF_DIAGF("sniff-xpc-launch: spawned suspended pid %d (%s)\n", (int)pid, launch_argv[0]);
+    int rc = cmd_sniff_xpc_impl(pid, dylib_path, mode, true, true);
+    if (rc != 0) {
+        (void)kill(pid, SIGKILL);
+        (void)waitpid(pid, NULL, 0);
+    }
+    return rc;
+}
+
+static int cmd_sniff_xpc_wait(const char *process_name, const char *dylib_path, int mode) {
+    pid_t pid = 0;
+    XNIFF_DIAGF("sniff-xpc-wait: waiting for process '%s'\n", process_name);
+    if (wait_for_process_name(process_name, &pid) != 0) {
+        fprintf(stderr, "sniff-xpc-wait: failed waiting for process '%s'\n", process_name);
+        return -1;
+    }
+
+    XNIFF_DIAGF("sniff-xpc-wait: found pid %d for '%s'; stopping target\n", (int)pid, process_name);
+    if (kill(pid, SIGSTOP) != 0) {
+        fprintf(stderr, "sniff-xpc-wait: failed to stop pid %d: %s\n", (int)pid, strerror(errno));
+        return -1;
+    }
+
+    int rc = cmd_sniff_xpc_impl(pid, dylib_path, mode, true, false);
+    if (rc != 0) {
+        // Avoid leaving a process suspended on failure paths.
+        (void)kill(pid, SIGCONT);
+    }
+    return rc;
 }
