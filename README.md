@@ -1,8 +1,24 @@
-See `EXAMPLE.md` for an example of XPC sniffing.
+# xniff
 
-Listener output can be emitted as JSON Lines for later analysis:
+to use, build with
 
-- `xniff-cli listen <pid> --jsonl > events.jsonl`
-- `xniff-cli sniff-xpc <pid> <hooks.dylib> --jsonl > events.jsonl`
+```
+cmake --preset default -DXNIFF_ENABLE_ARM64E=ON
+```
 
-In `--jsonl` mode, each event includes a `call_id`; entry/exit events for the same call share the same `call_id`, so you can associate a request with its return/response.
+to run:
+
+1) ensure SIP is disabled and your boot args look like:
+```
+-arm64e_preview_abi thid_should_crash=0 tss_should_crash=0 amfi_get_out_of_my_way=1
+```
+
+2) build
+```
+./build.sh
+```
+
+3) sniff a process (you might need to swap the path for an absolute one)
+```
+sudo build/xniff-cli sniff-xpc-wait com.apple.Virtualization.VirtualMachine build/libxniff-hooks.dylib --jsonl --xpc > out.json
+```
