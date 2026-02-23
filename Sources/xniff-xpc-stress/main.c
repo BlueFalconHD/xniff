@@ -255,18 +255,94 @@ static xpc_object_t make_complex_payload(uint32_t from_id, uint32_t to_id, uint6
 typedef struct {
     atomic_bool *running;
     peer_set_t *peers;
+    struct worker_stats *stats;
     uint32_t self_id;
     uint32_t min_sleep_ms;
     uint32_t max_sleep_ms;
     atomic_uint_fast64_t *seq;
 } sender_ctx_t;
 
+typedef struct worker_stats {
+    atomic_uint_fast64_t sent_total;
+    atomic_uint_fast64_t sent_oneway;
+    atomic_uint_fast64_t sent_with_reply_async;
+    atomic_uint_fast64_t sent_with_reply_sync;
+    atomic_uint_fast64_t async_reply_callbacks;
+    atomic_uint_fast64_t sync_reply_nonnull;
+    atomic_uint_fast64_t recv_events_total;
+    atomic_uint_fast64_t recv_events_dict;
+    atomic_uint_fast64_t recv_events_error;
+    atomic_uint_fast64_t replies_sent;
+    atomic_uint_fast64_t peer_connections;
+    atomic_uint_fast64_t no_peer_loops;
+} worker_stats_t;
+
+static void worker_stats_init(worker_stats_t *s) {
+    if (!s) return;
+    atomic_init(&s->sent_total, 0);
+    atomic_init(&s->sent_oneway, 0);
+    atomic_init(&s->sent_with_reply_async, 0);
+    atomic_init(&s->sent_with_reply_sync, 0);
+    atomic_init(&s->async_reply_callbacks, 0);
+    atomic_init(&s->sync_reply_nonnull, 0);
+    atomic_init(&s->recv_events_total, 0);
+    atomic_init(&s->recv_events_dict, 0);
+    atomic_init(&s->recv_events_error, 0);
+    atomic_init(&s->replies_sent, 0);
+    atomic_init(&s->peer_connections, 0);
+    atomic_init(&s->no_peer_loops, 0);
+}
+
+static uint64_t worker_stat_load(const atomic_uint_fast64_t *v) {
+    return (uint64_t)atomic_load_explicit(v, memory_order_relaxed);
+}
+
+static atomic_bool g_worker_start_signal = false;
+
+static void worker_start_signal_handler(int signo) {
+    (void)signo;
+    atomic_store_explicit(&g_worker_start_signal, true, memory_order_relaxed);
+}
+
+static void maybe_wait_for_start_signal(bool wait_for_signal) {
+    if (!wait_for_signal) return;
+
+    atomic_store_explicit(&g_worker_start_signal, false, memory_order_relaxed);
+
+    struct sigaction sa_new;
+    memset(&sa_new, 0, sizeof(sa_new));
+    sa_new.sa_handler = worker_start_signal_handler;
+    sigemptyset(&sa_new.sa_mask);
+    sa_new.sa_flags = SA_RESTART;
+
+    struct sigaction sa_old;
+    memset(&sa_old, 0, sizeof(sa_old));
+    if (sigaction(SIGUSR1, &sa_new, &sa_old) != 0) {
+        fprintf(stderr, "worker %d: sigaction(SIGUSR1) failed: %s\n", (int)getpid(), strerror(errno));
+        return;
+    }
+
+    fprintf(stderr, "worker %d: waiting for SIGUSR1 start signal\n", (int)getpid());
+    uint64_t deadline = monotonic_ms() + 30000ull; // failsafe: don't hang forever
+    while (!atomic_load_explicit(&g_worker_start_signal, memory_order_relaxed)) {
+        if (monotonic_ms() >= deadline) {
+            fprintf(stderr, "worker %d: start signal timeout; continuing\n", (int)getpid());
+            break;
+        }
+        usleep(2 * 1000);
+    }
+
+    (void)sigaction(SIGUSR1, &sa_old, NULL);
+}
+
 static void *sender_thread(void *arg) {
     sender_ctx_t *ctx = (sender_ctx_t *)arg;
+    worker_stats_t *stats = (worker_stats_t *)ctx->stats;
     while (atomic_load_explicit(ctx->running, memory_order_relaxed)) {
         uint32_t peer_id = 0;
         xpc_connection_t conn = peers_pick_random_conn(ctx->peers, ctx->self_id, &peer_id);
         if (!conn) {
+            if (stats) atomic_fetch_add_explicit(&stats->no_peer_loops, 1, memory_order_relaxed);
             usleep(10 * 1000);
             continue;
         }
@@ -275,15 +351,23 @@ static void *sender_thread(void *arg) {
         xpc_object_t msg = make_complex_payload(ctx->self_id, peer_id, seq);
 
         uint32_t mode = arc4random_uniform(3);
+        if (stats) atomic_fetch_add_explicit(&stats->sent_total, 1, memory_order_relaxed);
         if (mode == 0) {
+            if (stats) atomic_fetch_add_explicit(&stats->sent_oneway, 1, memory_order_relaxed);
             xpc_connection_send_message(conn, msg);
         } else if (mode == 1) {
+            if (stats) atomic_fetch_add_explicit(&stats->sent_with_reply_async, 1, memory_order_relaxed);
             xpc_connection_send_message_with_reply(conn, msg, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(xpc_object_t reply) {
                 (void)reply;
+                if (stats) atomic_fetch_add_explicit(&stats->async_reply_callbacks, 1, memory_order_relaxed);
             });
         } else {
+            if (stats) atomic_fetch_add_explicit(&stats->sent_with_reply_sync, 1, memory_order_relaxed);
             xpc_object_t reply = xpc_connection_send_message_with_reply_sync(conn, msg);
-            if (reply) xpc_release(reply);
+            if (reply) {
+                if (stats) atomic_fetch_add_explicit(&stats->sync_reply_nonnull, 1, memory_order_relaxed);
+                xpc_release(reply);
+            }
         }
 
         xpc_release(msg);
@@ -296,18 +380,23 @@ static void *sender_thread(void *arg) {
     return NULL;
 }
 
-static void install_peer_handlers(peer_set_t *peers, xpc_connection_t c) {
+static void install_peer_handlers(peer_set_t *peers, xpc_connection_t c, worker_stats_t *stats) {
+    if (stats) atomic_fetch_add_explicit(&stats->peer_connections, 1, memory_order_relaxed);
     // Replies are driven by the receiver; respond when a reply port is present.
     xpc_connection_set_event_handler(c, ^(xpc_object_t event) {
         xpc_type_t t = xpc_get_type(event);
+        if (stats) atomic_fetch_add_explicit(&stats->recv_events_total, 1, memory_order_relaxed);
         if (t == XPC_TYPE_DICTIONARY) {
+            if (stats) atomic_fetch_add_explicit(&stats->recv_events_dict, 1, memory_order_relaxed);
             xpc_object_t reply = xpc_dictionary_create_reply(event);
             if (reply) {
                 xpc_dictionary_set_string(reply, "ok", "1");
                 xpc_connection_send_message(c, reply);
+                if (stats) atomic_fetch_add_explicit(&stats->replies_sent, 1, memory_order_relaxed);
                 xpc_release(reply);
             }
         } else if (t == XPC_TYPE_ERROR) {
+            if (stats) atomic_fetch_add_explicit(&stats->recv_events_error, 1, memory_order_relaxed);
             // Drop on disconnect.
         }
     });
@@ -325,11 +414,26 @@ static void install_peer_handlers(peer_set_t *peers, xpc_connection_t c) {
     }
 }
 
-static int run_worker(const char *service, uint32_t self_id, uint32_t workers, uint32_t threads, uint32_t duration_s, uint32_t min_ms, uint32_t max_ms) {
+static int run_worker(const char *service,
+                      uint32_t self_id,
+                      uint32_t workers,
+                      uint32_t threads,
+                      uint32_t duration_s,
+                      uint32_t min_ms,
+                      uint32_t max_ms,
+                      bool wait_for_signal) {
     (void)workers;
+    maybe_wait_for_start_signal(wait_for_signal);
+
     dispatch_queue_t q = dispatch_queue_create("xniff-xpc-stress.worker", DISPATCH_QUEUE_SERIAL);
     __block peer_set_t peers;
     peers_init(&peers);
+    worker_stats_t *stats = (worker_stats_t *)calloc(1, sizeof(*stats));
+    if (!stats) {
+        peers_destroy(&peers);
+        return 1;
+    }
+    worker_stats_init(stats);
 
     // Listener to accept inbound peer connections.
     xpc_connection_t listener = xpc_connection_create(NULL, q);
@@ -337,7 +441,7 @@ static int run_worker(const char *service, uint32_t self_id, uint32_t workers, u
         xpc_type_t t = xpc_get_type(peer);
         if (t != XPC_TYPE_CONNECTION) return;
         xpc_connection_t pc = (xpc_connection_t)peer;
-        install_peer_handlers(&peers, pc);
+        install_peer_handlers(&peers, pc, stats);
     });
     xpc_connection_activate(listener);
 
@@ -358,7 +462,7 @@ static int run_worker(const char *service, uint32_t self_id, uint32_t workers, u
                     xpc_connection_t pc = xpc_dictionary_create_connection(event, "listener");
                     if (pc) {
                         peers_set_conn_for_id(&peers, id, pc);
-                        install_peer_handlers(&peers, pc);
+                        install_peer_handlers(&peers, pc, stats);
                         xpc_release(pc);
                     }
                 }
@@ -382,6 +486,7 @@ static int run_worker(const char *service, uint32_t self_id, uint32_t workers, u
     sender_ctx_t ctx = {
         .running = &running,
         .peers = &peers,
+        .stats = stats,
         .self_id = self_id,
         .min_sleep_ms = min_ms,
         .max_sleep_ms = max_ms,
@@ -399,9 +504,53 @@ static int run_worker(const char *service, uint32_t self_id, uint32_t workers, u
     for (uint32_t i = 0; i < threads; i++) pthread_join(ths[i], NULL);
     free(ths);
 
+    uint64_t sent_total = worker_stat_load(&stats->sent_total);
+    uint64_t sent_oneway = worker_stat_load(&stats->sent_oneway);
+    uint64_t sent_async = worker_stat_load(&stats->sent_with_reply_async);
+    uint64_t sent_sync = worker_stat_load(&stats->sent_with_reply_sync);
+    uint64_t async_cb = worker_stat_load(&stats->async_reply_callbacks);
+    uint64_t sync_nonnull = worker_stat_load(&stats->sync_reply_nonnull);
+    uint64_t recv_total = worker_stat_load(&stats->recv_events_total);
+    uint64_t recv_dict = worker_stat_load(&stats->recv_events_dict);
+    uint64_t recv_error = worker_stat_load(&stats->recv_events_error);
+    uint64_t replies_sent = worker_stat_load(&stats->replies_sent);
+    uint64_t peer_connections = worker_stat_load(&stats->peer_connections);
+    uint64_t no_peer_loops = worker_stat_load(&stats->no_peer_loops);
+
+    fprintf(stderr,
+            "XNIFF_STRESS_WORKER_STATS "
+            "{\"pid\":%d,\"id\":%u,"
+            "\"sent_total\":%llu,"
+            "\"sent_oneway\":%llu,"
+            "\"sent_with_reply_async\":%llu,"
+            "\"sent_with_reply_sync\":%llu,"
+            "\"async_reply_callbacks\":%llu,"
+            "\"sync_reply_nonnull\":%llu,"
+            "\"recv_events_total\":%llu,"
+            "\"recv_events_dict\":%llu,"
+            "\"recv_events_error\":%llu,"
+            "\"replies_sent\":%llu,"
+            "\"peer_connections\":%llu,"
+            "\"no_peer_loops\":%llu}\n",
+            (int)getpid(), self_id,
+            (unsigned long long)sent_total,
+            (unsigned long long)sent_oneway,
+            (unsigned long long)sent_async,
+            (unsigned long long)sent_sync,
+            (unsigned long long)async_cb,
+            (unsigned long long)sync_nonnull,
+            (unsigned long long)recv_total,
+            (unsigned long long)recv_dict,
+            (unsigned long long)recv_error,
+            (unsigned long long)replies_sent,
+            (unsigned long long)peer_connections,
+            (unsigned long long)no_peer_loops);
+    fflush(stderr);
+
     xpc_release(rv);
     xpc_release(listener);
     peers_destroy(&peers);
+    free(stats);
     return 0;
 }
 
@@ -525,8 +674,8 @@ static void usage(const char *argv0) {
     fprintf(stderr,
             "usage:\n"
             "  %s --server <mach-service-name>\n"
-            "  %s --worker <mach-service-name> --id <n> [--workers N] [--threads T] [--duration S] [--min-ms A] [--max-ms B]\n"
-            "  %s --run [--workers N] [--threads T] [--duration S] [--min-ms A] [--max-ms B]\n",
+            "  %s --worker <mach-service-name> --id <n> [--workers N] [--threads T] [--duration S] [--min-ms A] [--max-ms B] [--wait-signal]\n"
+            "  %s --run [--workers N] [--threads T] [--duration S] [--min-ms A] [--max-ms B] [--wait-signal]\n",
             argv0, argv0, argv0);
 }
 
@@ -580,7 +729,16 @@ static int run_launchctl(const char *cmd, const char *a0, const char *a1, const 
     return 0;
 }
 
-static int spawn_worker(const char *bin_path, const char *service, uint32_t id, uint32_t workers, uint32_t threads, uint32_t duration_s, uint32_t min_ms, uint32_t max_ms, pid_t *out_pid) {
+static int spawn_worker(const char *bin_path,
+                        const char *service,
+                        uint32_t id,
+                        uint32_t workers,
+                        uint32_t threads,
+                        uint32_t duration_s,
+                        uint32_t min_ms,
+                        uint32_t max_ms,
+                        bool wait_for_signal,
+                        pid_t *out_pid) {
     char id_s[32], workers_s[32], threads_s[32], dur_s[32], min_s[32], max_s[32];
     snprintf(id_s, sizeof(id_s), "%u", id);
     snprintf(workers_s, sizeof(workers_s), "%u", workers);
@@ -598,6 +756,7 @@ static int spawn_worker(const char *bin_path, const char *service, uint32_t id, 
         "--duration", dur_s,
         "--min-ms", min_s,
         "--max-ms", max_s,
+        wait_for_signal ? "--wait-signal" : NULL,
         NULL,
     };
     pid_t pid = 0;
@@ -607,7 +766,13 @@ static int spawn_worker(const char *bin_path, const char *service, uint32_t id, 
     return 0;
 }
 
-static int run_orchestrator(const char *argv0, uint32_t workers, uint32_t threads, uint32_t duration_s, uint32_t min_ms, uint32_t max_ms) {
+static int run_orchestrator(const char *argv0,
+                            uint32_t workers,
+                            uint32_t threads,
+                            uint32_t duration_s,
+                            uint32_t min_ms,
+                            uint32_t max_ms,
+                            bool wait_for_signal) {
     char *bin_path = realpath_dup(argv0);
     if (!bin_path) {
         fprintf(stderr, "realpath(%s) failed: %s\n", argv0, strerror(errno));
@@ -648,7 +813,16 @@ static int run_orchestrator(const char *argv0, uint32_t workers, uint32_t thread
     }
 
     for (uint32_t i = 0; i < workers; i++) {
-        if (spawn_worker(bin_path, service, i + 1, workers, threads, duration_s, min_ms, max_ms, &pids[i]) != 0) {
+        if (spawn_worker(bin_path,
+                         service,
+                         i + 1,
+                         workers,
+                         threads,
+                         duration_s,
+                         min_ms,
+                         max_ms,
+                         wait_for_signal,
+                         &pids[i]) != 0) {
             fprintf(stderr, "failed to spawn worker %u\n", i);
         }
     }
@@ -687,6 +861,7 @@ int main(int argc, char **argv) {
     uint32_t duration_s = 10;
     uint32_t min_ms = 10;
     uint32_t max_ms = 250;
+    bool wait_for_signal = false;
 
     for (int i = 1; i < argc; i++) {
         if (arg_eq(argv[i], "--server")) {
@@ -715,6 +890,8 @@ int main(int argc, char **argv) {
         } else if (arg_eq(argv[i], "--max-ms")) {
             const char *v = arg_value(argc, argv, &i);
             if (v) max_ms = (uint32_t)strtoul(v, NULL, 0);
+        } else if (arg_eq(argv[i], "--wait-signal")) {
+            wait_for_signal = true;
         } else if (arg_eq(argv[i], "--help") || arg_eq(argv[i], "-h")) {
             usage(argv[0]);
             return 0;
@@ -738,13 +915,13 @@ int main(int argc, char **argv) {
         if (!service) { usage(argv[0]); return 2; }
         if (threads == 0) threads = 1;
         if (duration_s == 0) duration_s = 1;
-        return run_worker(service, id, workers, threads, duration_s, min_ms, max_ms);
+        return run_worker(service, id, workers, threads, duration_s, min_ms, max_ms, wait_for_signal);
     }
     if (arg_eq(mode, "run")) {
         if (workers == 0) workers = 1;
         if (threads == 0) threads = 1;
         if (duration_s == 0) duration_s = 1;
-        return run_orchestrator(argv[0], workers, threads, duration_s, min_ms, max_ms);
+        return run_orchestrator(argv[0], workers, threads, duration_s, min_ms, max_ms, wait_for_signal);
     }
 
     return 2;

@@ -233,6 +233,16 @@ __attribute__((constructor)) static void xniff_frida_gum_ctor(void) {
 }
 
 __attribute__((destructor)) static void xniff_frida_gum_dtor(void) {
+  // During process shutdown, explicit detach/deinit can race active libxpc
+  // threads and crash in patched code pages. Default to leak-on-exit.
+  // Set XNIFF_DETACH_ON_EXIT=1 to force explicit cleanup for debugging.
+  const char *detach_on_exit = getenv("XNIFF_DETACH_ON_EXIT");
+  if (!(detach_on_exit && *detach_on_exit && strcmp(detach_on_exit, "0") != 0)) {
+    g_listener = NULL;
+    g_interceptor = NULL;
+    return;
+  }
+
   if (g_interceptor != NULL && g_listener != NULL) {
     gum_interceptor_detach(g_interceptor, g_listener);
   }
