@@ -5,9 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <errno.h>
 #include <pthread.h>
-#include <time.h>
 
 #include <xpc/xpc.h>
 
@@ -44,8 +42,6 @@ static void ipc_send_xpc_event(
     if (!pl_in) return;
 
     xniff_hooks_ipc_lock();
-    int fd = xniff_hooks_ipc_ensure_fd_locked();
-    if (fd < 0) { xniff_hooks_ipc_unlock(); return; }
 
     xniff_ipc_hdr_t hdr = {0};
     hdr.magic = XNIFF_IPC_MAGIC;
@@ -61,13 +57,13 @@ static void ipc_send_xpc_event(
     pl.str2_len = l2;
     pl.str3_len = l3;
 
-    if (xniff_ipc_send_all(fd, &hdr, sizeof(hdr)) != 0) { xniff_hooks_ipc_drop_locked(); xniff_hooks_ipc_unlock(); return; }
-    if (xniff_ipc_send_all(fd, &pl, sizeof(pl)) != 0)   { xniff_hooks_ipc_drop_locked(); xniff_hooks_ipc_unlock(); return; }
+    if (xniff_hooks_ipc_write_locked(&hdr, sizeof(hdr)) != 0) { xniff_hooks_ipc_unlock(); return; }
+    if (xniff_hooks_ipc_write_locked(&pl, sizeof(pl)) != 0)   { xniff_hooks_ipc_unlock(); return; }
 
-    if (l0 && s0) if (xniff_ipc_send_all(fd, s0, l0) != 0) { xniff_hooks_ipc_drop_locked(); xniff_hooks_ipc_unlock(); return; }
-    if (l1 && s1) if (xniff_ipc_send_all(fd, s1, l1) != 0) { xniff_hooks_ipc_drop_locked(); xniff_hooks_ipc_unlock(); return; }
-    if (l2 && s2) if (xniff_ipc_send_all(fd, s2, l2) != 0) { xniff_hooks_ipc_drop_locked(); xniff_hooks_ipc_unlock(); return; }
-    if (l3 && s3) if (xniff_ipc_send_all(fd, s3, l3) != 0) { xniff_hooks_ipc_drop_locked(); xniff_hooks_ipc_unlock(); return; }
+    if (l0 && s0) if (xniff_hooks_ipc_write_locked(s0, l0) != 0) { xniff_hooks_ipc_unlock(); return; }
+    if (l1 && s1) if (xniff_hooks_ipc_write_locked(s1, l1) != 0) { xniff_hooks_ipc_unlock(); return; }
+    if (l2 && s2) if (xniff_hooks_ipc_write_locked(s2, l2) != 0) { xniff_hooks_ipc_unlock(); return; }
+    if (l3 && s3) if (xniff_hooks_ipc_write_locked(s3, l3) != 0) { xniff_hooks_ipc_unlock(); return; }
 
     xniff_hooks_ipc_unlock();
 }

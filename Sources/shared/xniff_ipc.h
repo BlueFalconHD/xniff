@@ -1,4 +1,4 @@
-// Simple Unix domain socket IPC helpers shared by xniff components
+// Shared wire/event structs and in-target ring IPC primitives.
 #ifndef XNIFF_IPC_H
 #define XNIFF_IPC_H
 
@@ -12,6 +12,9 @@ extern "C" {
 
 #define XNIFF_IPC_VERSION 1u
 #define XNIFF_IPC_MAGIC 0x58495043u /* 'XIPC' */
+#define XNIFF_IPC_RING_MAGIC 0x58495247u /* 'XIRG' */
+#define XNIFF_IPC_RING_VERSION 1u
+#define XNIFF_IPC_RING_CAPACITY (1u << 20) /* 1 MiB stream buffer */
 
 // Event kinds for Mach message hooks
 enum {
@@ -32,6 +35,32 @@ typedef struct {
     uint32_t tid_low;      // low bits of thread id (optional)
     uint32_t payload_len;  // length of following payload
 } xniff_ipc_hdr_t;
+
+typedef struct {
+    uint32_t magic;        // XNIFF_IPC_RING_MAGIC
+    uint16_t version;      // XNIFF_IPC_RING_VERSION
+    uint16_t reserved0;
+    uint32_t capacity;     // bytes in data[]
+    uint32_t reserved1;
+    uint64_t write_idx;    // monotonic producer byte counter
+    uint64_t read_idx;     // monotonic consumer byte counter
+    uint64_t dropped_bytes;
+    uint64_t dropped_events;
+} xniff_ipc_ring_hdr_t;
+
+typedef struct {
+    xniff_ipc_ring_hdr_t hdr;
+    uint8_t data[XNIFF_IPC_RING_CAPACITY];
+} xniff_ipc_ring_t;
+
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+_Static_assert(offsetof(xniff_ipc_ring_t, data) == sizeof(xniff_ipc_ring_hdr_t),
+               "ring header must be contiguous with data");
+#endif
+
+// Exported from the injected hooks image; the CLI resolves this symbol in-target
+// and polls it via mach_vm_read_overwrite / mach_vm_write.
+extern xniff_ipc_ring_t xniff_ipc_ring;
 
 // Guard against accidental struct packing/ABI mismatches between components.
 #if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
@@ -128,25 +157,9 @@ typedef struct {
     uint32_t reserved;     // align
 } xniff_ool_ports_t;
 
-// Format a stable per-target socket path (e.g., /tmp/xniff-<pid>.sock)
-int xniff_ipc_path_for_pid(pid_t pid, char *out, size_t outsz);
-
-// Client-side: connect to server for current pid. Returns fd or -1.
-int xniff_ipc_client_connect(pid_t pid);
-
-// Server-side: create/bind/listen on the socket for pid. Returns fd or -1.
-// Removes any stale socket file first.
-int xniff_ipc_server_listen(pid_t pid);
-
-// Blocking accept on a listening server fd. Returns new fd or -1.
-int xniff_ipc_accept(int server_fd);
-
-// Utility: best-effort nonblocking send of a complete buffer.
-// Returns 0 on success, -1 on failure (including partial writes).
-int xniff_ipc_send_all_nb(int fd, const void *buf, size_t len);
-
-// Utility: blocking send of an entire buffer. Returns 0 on success, -1 on error.
-int xniff_ipc_send_all(int fd, const void *buf, size_t len);
+// Append bytes to the process-local ring buffer (producer-side).
+// Returns 0 on success, -1 on failure (e.g. ENOBUFS when ring is full).
+int xniff_ipc_ring_write(const void *buf, size_t len);
 
 #ifdef __cplusplus
 }

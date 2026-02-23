@@ -1,150 +1,83 @@
 #include "xniff_ipc.h"
 
 #include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <pthread.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <sys/stat.h>
-#include <sys/time.h>
 
-#ifndef SUN_LEN
-#define SUN_LEN(su) (offsetof(struct sockaddr_un, sun_path) + strlen((su)->sun_path))
-#endif
+// In-target ring buffer transport polled by xniff-cli.
 
-static void set_nosigpipe(int fd) {
-#ifdef SO_NOSIGPIPE
-    int one = 1;
-    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
-#else
-    (void)fd;
-#endif
+__attribute__((visibility("default"), used)) xniff_ipc_ring_t xniff_ipc_ring = {
+    .hdr =
+        {
+            .magic = XNIFF_IPC_RING_MAGIC,
+            .version = XNIFF_IPC_RING_VERSION,
+            .reserved0 = 0,
+            .capacity = XNIFF_IPC_RING_CAPACITY,
+            .reserved1 = 0,
+            .write_idx = 0,
+            .read_idx = 0,
+            .dropped_bytes = 0,
+            .dropped_events = 0,
+        },
+    .data = {0},
+};
+
+static pthread_mutex_t g_ring_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline uint64_t ring_load_u64(const uint64_t *p) {
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
 }
 
-static void set_send_timeout_ms(int fd, int ms) {
-    if (ms <= 0) return;
-    struct timeval tv = {0};
-    tv.tv_sec = ms / 1000;
-    tv.tv_usec = (ms % 1000) * 1000;
-    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+static inline void ring_store_u64(uint64_t *p, uint64_t v) {
+    __atomic_store_n(p, v, __ATOMIC_RELEASE);
 }
 
-static int env_int_ms(const char *name, int defv) {
-    const char *s = getenv(name);
-    if (!s || !*s) return defv;
-    errno = 0;
-    char *end = NULL;
-    long v = strtol(s, &end, 0);
-    if (errno != 0 || end == s) return defv;
-    if (v < 0) return 0;
-    if (v > 60000) return 60000;
-    return (int)v;
-}
+static int ring_write_bytes(const void *buf, size_t len) {
+    if (len == 0) return 0;
+    if (!buf) return -1;
 
-int xniff_ipc_path_for_pid(pid_t pid, char *out, size_t outsz) {
-    if (!out || outsz == 0) return -1;
-    int n = snprintf(out, outsz, "/tmp/xniff-%d.sock", (int)pid);
-    if (n <= 0 || (size_t)n >= outsz) return -1;
-    return 0;
-}
+    pthread_mutex_lock(&g_ring_lock);
 
-int xniff_ipc_client_connect(pid_t pid) {
-    char path[108];
-    if (xniff_ipc_path_for_pid(pid, path, sizeof(path)) != 0) return -1;
-
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    set_nosigpipe(fd);
-    // Don't let an instrumented target block forever if the listener stalls.
-    // If this times out, callers should drop the connection and retry later.
-    set_send_timeout_ms(fd, env_int_ms("XNIFF_IPC_SNDTIMEO_MS", 50));
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-
-    if (connect(fd, (struct sockaddr *)&addr, SUN_LEN(&addr)) != 0) {
-        int e = errno;
-        close(fd);
-        errno = e;
-        return -1;
-    }
-    return fd;
-}
-
-int xniff_ipc_server_listen(pid_t pid) {
-    char path[108];
-    if (xniff_ipc_path_for_pid(pid, path, sizeof(path)) != 0) return -1;
-
-    // Remove stale
-    unlink(path);
-
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-
-    if (bind(fd, (struct sockaddr *)&addr, SUN_LEN(&addr)) != 0) {
-        int e = errno;
-        close(fd);
-        errno = e;
+    uint64_t cap = (uint64_t)xniff_ipc_ring.hdr.capacity;
+    if (cap == 0 || cap > (uint64_t)XNIFF_IPC_RING_CAPACITY) {
+        pthread_mutex_unlock(&g_ring_lock);
         return -1;
     }
 
-    // Make the socket broadly accessible so differently-sandboxed targets can connect.
-    // NOTE: This relaxes permissions; if undesired, tighten to 0600 or gate by a flag.
-    (void)chmod(path, 0666);
+    uint64_t w = ring_load_u64(&xniff_ipc_ring.hdr.write_idx);
+    uint64_t r = ring_load_u64(&xniff_ipc_ring.hdr.read_idx);
 
-    if (listen(fd, 4) != 0) {
-        int e = errno;
-        close(fd);
-        errno = e;
+    // Recover conservatively if counters look inconsistent.
+    if (w < r || (w - r) > cap) {
+        r = w;
+        ring_store_u64(&xniff_ipc_ring.hdr.read_idx, r);
+    }
+
+    uint64_t used = w - r;
+    uint64_t avail = cap - used;
+    if ((uint64_t)len > avail) {
+        ring_store_u64(&xniff_ipc_ring.hdr.dropped_bytes,
+                       ring_load_u64(&xniff_ipc_ring.hdr.dropped_bytes) + (uint64_t)len);
+        ring_store_u64(&xniff_ipc_ring.hdr.dropped_events,
+                       ring_load_u64(&xniff_ipc_ring.hdr.dropped_events) + 1);
+        pthread_mutex_unlock(&g_ring_lock);
+        errno = ENOBUFS;
         return -1;
     }
 
-    return fd;
-}
-
-int xniff_ipc_accept(int server_fd) {
-    int fd = accept(server_fd, NULL, NULL);
-    if (fd >= 0) set_nosigpipe(fd);
-    return fd;
-}
-
-int xniff_ipc_send_all_nb(int fd, const void *buf, size_t len) {
-    const uint8_t *p = (const uint8_t *)buf;
-    size_t left = len;
-    while (left > 0) {
-        ssize_t n = send(fd, p, left, 0);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return -1; // caller may drop
-            return -1;
-        }
-        if (n == 0) return -1;
-        p += (size_t)n;
-        left -= (size_t)n;
+    uint64_t off = w % cap;
+    uint64_t first = cap - off;
+    if (first > (uint64_t)len) first = (uint64_t)len;
+    memcpy(xniff_ipc_ring.data + off, buf, (size_t)first);
+    if ((uint64_t)len > first) {
+        memcpy(xniff_ipc_ring.data, (const uint8_t *)buf + first, (size_t)((uint64_t)len - first));
     }
+
+    ring_store_u64(&xniff_ipc_ring.hdr.write_idx, w + (uint64_t)len);
+    pthread_mutex_unlock(&g_ring_lock);
     return 0;
 }
 
-int xniff_ipc_send_all(int fd, const void *buf, size_t len) {
-    const uint8_t *p = (const uint8_t *)buf;
-    size_t left = len;
-    while (left > 0) {
-        ssize_t n = send(fd, p, left, 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (n == 0) return -1;
-        p += (size_t)n;
-        left -= (size_t)n;
-    }
-    return 0;
+int xniff_ipc_ring_write(const void *buf, size_t len) {
+    return ring_write_bytes(buf, len);
 }

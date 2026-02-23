@@ -156,7 +156,7 @@ static int build_image_symtab_cache(mach_port_t task, const parsed_image_t *img,
         free(ic->strtab); ic->strtab = NULL; ic->strsize = 0; return -1;
     }
 
-    // Load nlist and filter entries to defined extern functions in __TEXT
+    // Load nlist and filter entries to defined extern symbols in any section.
     size_t nsyms = img->symtab.nsyms;
     struct nlist_64 *nls = (struct nlist_64 *)malloc(nsyms * sizeof(struct nlist_64));
     if (!nls) { free(ic->strtab); ic->strtab = NULL; ic->strsize = 0; return -1; }
@@ -176,8 +176,6 @@ static int build_image_symtab_cache(mach_port_t task, const parsed_image_t *img,
         if ((nl->n_type & N_TYPE) != N_SECT) continue;
         if (nl->n_sect == NO_SECT || nl->n_value == 0) continue;
         if ((size_t)nl->n_un.n_strx >= ic->strsize) continue;
-        mach_vm_address_t runtime = (mach_vm_address_t)nl->n_value + ic->slide;
-        if (runtime < ic->text_start || runtime >= ic->text_end) continue; // keep only text
         keep++;
     }
 
@@ -193,7 +191,6 @@ static int build_image_symtab_cache(mach_port_t task, const parsed_image_t *img,
         if (nl->n_sect == NO_SECT || nl->n_value == 0) continue;
         if ((size_t)nl->n_un.n_strx >= ic->strsize) continue;
         mach_vm_address_t runtime = (mach_vm_address_t)nl->n_value + ic->slide;
-        if (runtime < ic->text_start || runtime >= ic->text_end) continue;
         ic->syms[j].name_off = nl->n_un.n_strx;
         ic->syms[j].runtime  = runtime;
         j++;
@@ -239,7 +236,7 @@ static bool read_uleb128_local(const uint8_t **pp, const uint8_t *end, uint64_t 
 }
 
 // Fast targeted traversal of the export trie for a single symbol name.
-static bool lookup_export_trie_by_name(const image_cache_t *ic, const char *symbol, mach_vm_address_t slide, mach_vm_address_t text_start, mach_vm_address_t text_end, mach_vm_address_t *out_addr) {
+static bool lookup_export_trie_by_name(const image_cache_t *ic, const char *symbol, mach_vm_address_t slide, mach_vm_address_t *out_addr) {
     if (!ic || !ic->exports || ic->exports_size == 0 || !symbol) return false;
     const uint8_t *base = ic->exports;
     const uint8_t *end  = ic->exports + ic->exports_size;
@@ -261,7 +258,7 @@ static bool lookup_export_trie_by_name(const image_cache_t *ic, const char *symb
             if (!is_reexport && !is_stub_or_resolver) {
                 uint64_t addr = 0; if (read_uleb128_local(&tp, tend, &addr)) {
                     mach_vm_address_t runtime = (mach_vm_address_t)addr + slide;
-                    if (runtime >= text_start && runtime < text_end) { *out_addr = runtime; return true; }
+                    *out_addr = runtime; return true;
                 }
             }
             return false; // reached terminal but not usable
@@ -451,10 +448,7 @@ static bool find_symbol_in_image(mach_port_t task, parsed_image_t *img, const ch
     if (!ic->have_exports) (void)ensure_exports_cache(task, img, ic);
     if (ic->have_exports) {
         mach_vm_address_t addr = 0;
-        if (lookup_export_trie_by_name(ic, symbol, img->info.slide,
-                                       img->text.vmaddr + img->info.slide,
-                                       img->text.vmaddr + img->info.slide + img->text.vmsize,
-                                       &addr)) {
+        if (lookup_export_trie_by_name(ic, symbol, img->info.slide, &addr)) {
             *out_addr = addr; return true;
         }
     }

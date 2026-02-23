@@ -1,118 +1,62 @@
-#include <stdio.h>
-#include <stdint.h>
-#include <unistd.h>
-#include <string.h>
 #include <errno.h>
-#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
-#include <pthread.h>
-#include <sys/socket.h>
+#include <string.h>
 
-#include "xniff_ipc.h"
+#include "../shared/xniff_ipc.h"
 
-static volatile sig_atomic_t g_got_sigpipe = 0;
+static int selftest_ipc_ring(void) {
+    const uint8_t payload[] = {0xde, 0xad, 0xbe, 0xef, 0x42};
 
-static void sigpipe_handler(int signo) {
-    (void)signo;
-    g_got_sigpipe = 1;
-}
+    uint64_t w0 = xniff_ipc_ring.hdr.write_idx;
+    uint64_t r0 = xniff_ipc_ring.hdr.read_idx;
+    uint64_t d0 = xniff_ipc_ring.hdr.dropped_events;
 
-typedef struct {
-    int sfd;
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
-    int accepted;
-} ipc_sigpipe_ctx_t;
-
-static void *ipc_sigpipe_server_thread(void *arg) {
-    ipc_sigpipe_ctx_t *ctx = (ipc_sigpipe_ctx_t *)arg;
-    int cfd = xniff_ipc_accept(ctx->sfd);
-    pthread_mutex_lock(&ctx->mu);
-    ctx->accepted = 1;
-    pthread_cond_signal(&ctx->cv);
-    pthread_mutex_unlock(&ctx->mu);
-    if (cfd >= 0) {
-        shutdown(cfd, SHUT_RDWR);
-        close(cfd);
+    if (xniff_ipc_ring_write(payload, sizeof(payload)) != 0) {
+        perror("xniff_ipc_ring_write");
+        return 1;
     }
-    return NULL;
-}
 
-static int selftest_ipc_sigpipe(void) {
-#ifndef SO_NOSIGPIPE
-    printf("SKIP: SO_NOSIGPIPE not available on this platform.\n");
+    uint64_t w1 = xniff_ipc_ring.hdr.write_idx;
+    if (w1 != w0 + sizeof(payload)) {
+        fprintf(stderr, "FAIL: write_idx mismatch (%llu -> %llu)\n",
+                (unsigned long long)w0, (unsigned long long)w1);
+        return 1;
+    }
+    if (xniff_ipc_ring.hdr.read_idx != r0) {
+        fprintf(stderr, "FAIL: read_idx changed unexpectedly\n");
+        return 1;
+    }
+    if (xniff_ipc_ring.hdr.dropped_events != d0) {
+        fprintf(stderr, "FAIL: dropped_events changed unexpectedly\n");
+        return 1;
+    }
+
+    uint8_t got[sizeof(payload)];
+    size_t cap = (size_t)xniff_ipc_ring.hdr.capacity;
+    size_t off = (size_t)(w0 % cap);
+    size_t first = cap - off;
+    if (first > sizeof(payload)) first = sizeof(payload);
+    memcpy(got, xniff_ipc_ring.data + off, first);
+    if (sizeof(payload) > first) memcpy(got + first, xniff_ipc_ring.data, sizeof(payload) - first);
+
+    if (memcmp(got, payload, sizeof(payload)) != 0) {
+        fprintf(stderr, "FAIL: payload mismatch in ring\n");
+        return 1;
+    }
+
+    printf("OK: ring write/readback validated\n");
     return 0;
-#else
-    struct sigaction sa = {0};
-    sa.sa_handler = sigpipe_handler;
-    sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGPIPE, &sa, NULL) != 0) {
-        perror("sigaction(SIGPIPE)");
-        return 1;
-    }
-
-    ipc_sigpipe_ctx_t ctx = {0};
-    ctx.accepted = 0;
-    pthread_mutex_init(&ctx.mu, NULL);
-    pthread_cond_init(&ctx.cv, NULL);
-
-    ctx.sfd = xniff_ipc_server_listen(getpid());
-    if (ctx.sfd < 0) {
-        perror("xniff_ipc_server_listen");
-        return 1;
-    }
-
-    pthread_t th;
-    if (pthread_create(&th, NULL, ipc_sigpipe_server_thread, &ctx) != 0) {
-        perror("pthread_create");
-        close(ctx.sfd);
-        return 1;
-    }
-
-    int fd = xniff_ipc_client_connect(getpid());
-    if (fd < 0) {
-        perror("xniff_ipc_client_connect");
-        close(ctx.sfd);
-        return 1;
-    }
-
-    pthread_mutex_lock(&ctx.mu);
-    while (!ctx.accepted) pthread_cond_wait(&ctx.cv, &ctx.mu);
-    pthread_mutex_unlock(&ctx.mu);
-    pthread_join(th, NULL);
-    close(ctx.sfd);
-
-    errno = 0;
-    char payload[16] = "hello";
-    int rc = xniff_ipc_send_all(fd, payload, sizeof(payload));
-    int e = errno;
-    close(fd);
-
-    if (g_got_sigpipe) {
-        fprintf(stderr, "FAIL: SIGPIPE delivered during send\n");
-        return 1;
-    }
-    if (rc == 0) {
-        fprintf(stderr, "WARN: send succeeded unexpectedly (peer close not observed)\n");
-        return 0;
-    }
-    printf("OK: send failed with errno=%d (%s) and no SIGPIPE\n", e, strerror(e));
-    return 0;
-#endif
 }
 
 int main(int argc, char **argv) {
-    // Lightweight self-tests (no remote patching).
-    // Example: ./xniff-test --ipc-sigpipe
-    if (getenv("XNIFF_TEST_IPC_SIGPIPE")) {
-        return selftest_ipc_sigpipe();
-    }
+    if (getenv("XNIFF_TEST_IPC_RING")) return selftest_ipc_ring();
+
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--ipc-sigpipe") == 0) {
-            return selftest_ipc_sigpipe();
-        }
+        if (strcmp(argv[i], "--ipc-ring") == 0) return selftest_ipc_ring();
     }
 
-    printf("xniff-test: no tests selected (try --ipc-sigpipe)\n");
+    printf("xniff-test: no tests selected (try --ipc-ring)\n");
     return 0;
 }

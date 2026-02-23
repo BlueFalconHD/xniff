@@ -10,6 +10,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/ptrace.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <limits.h>
 #include <libproc.h>
@@ -19,7 +20,6 @@
 #include <mach/mach_vm.h>
 #include <mach/message.h>
 #include <time.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 
 #include "../shared/xniff_ipc.h"
@@ -32,9 +32,6 @@
 #include "sniff_xpc_cmd.h"
 // XPC wire parser (shared library)
 #include "../xpcdesert/xpcdesert.h"
-
-// for sleeping
-#include <unistd.h>
 
 typedef struct {
     bool jsonl;
@@ -94,13 +91,9 @@ static int attach_and_get_task(pid_t pid, mach_port_t *out_task) {
     kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
     if (kr == KERN_SUCCESS) {
         XNIFF_DIAGF("got task port for pid %d without attach\n", pid);
-        sleep(10);
         *out_task = task;
         return 0;
     }
-
-    // sleep 10s
-    sleep(10);
 
     XNIFF_DIAGF("attaching to pid %d\n", pid);
     if (ptrace(PT_ATTACHEXC, pid, 0, 0) != 0) {
@@ -134,10 +127,105 @@ static int detach_process(pid_t pid) {
     return 0;
 }
 
+static int copy_file_all(const char *src_path, const char *dst_path, mode_t dst_mode) {
+    int in_fd = open(src_path, O_RDONLY);
+    if (in_fd < 0) return -1;
+
+    int out_fd = open(dst_path, O_WRONLY | O_CREAT | O_EXCL, dst_mode);
+    if (out_fd < 0) {
+        close(in_fd);
+        return -1;
+    }
+
+    uint8_t buf[64 * 1024];
+    int rc = 0;
+    while (1) {
+        ssize_t rn = read(in_fd, buf, sizeof(buf));
+        if (rn == 0) break;
+        if (rn < 0) {
+            if (errno == EINTR) continue;
+            rc = -1;
+            break;
+        }
+
+        size_t off = 0;
+        while (off < (size_t)rn) {
+            ssize_t wn = write(out_fd, buf + off, (size_t)rn - off);
+            if (wn < 0) {
+                if (errno == EINTR) continue;
+                rc = -1;
+                break;
+            }
+            off += (size_t)wn;
+        }
+        if (rc != 0) break;
+    }
+
+    if (rc == 0) {
+        (void)fchmod(out_fd, dst_mode);
+        (void)fsync(out_fd);
+    }
+
+    close(out_fd);
+    close(in_fd);
+
+    if (rc != 0) {
+        (void)unlink(dst_path);
+        return -1;
+    }
+    return 0;
+}
+
+static int stage_dylib_for_sandbox(const char *src_abs_path,
+                                   char *out_path,
+                                   size_t out_path_size) {
+    if (!src_abs_path || !out_path || out_path_size == 0) return -1;
+
+    const char *home = getenv("HOME");
+    char home_trash_xniff[PATH_MAX] = {0};
+    if (home && home[0]) {
+        int n = snprintf(home_trash_xniff, sizeof(home_trash_xniff),
+                         "%s/.Trash/.xniff", home);
+        if (n > 0 && (size_t)n < sizeof(home_trash_xniff)) {
+            (void)mkdir(home_trash_xniff, 0755);
+        } else {
+            home_trash_xniff[0] = '\0';
+        }
+    }
+
+    const char *k_dirs[] = {
+        home_trash_xniff[0] ? home_trash_xniff : NULL,
+        "/tmp",
+        "/private/tmp",
+        "/private/var/tmp",
+        "/Users/Shared",
+    };
+
+    for (size_t i = 0; i < sizeof(k_dirs) / sizeof(k_dirs[0]); i++) {
+        const char *dir = k_dirs[i];
+        if (!dir || !dir[0]) continue;
+        char candidate[PATH_MAX];
+        for (int attempt = 0; attempt < 16; attempt++) {
+            unsigned int salt = (unsigned int)(arc4random() & 0xffff);
+            int n = snprintf(candidate, sizeof(candidate),
+                             "%s/xniff-hooks-%d-%u.dylib",
+                             dir, (int)getpid(), salt);
+            if (n <= 0 || (size_t)n >= sizeof(candidate)) continue;
+
+            if (copy_file_all(src_abs_path, candidate, 0644) == 0) {
+                (void)strncpy(out_path, candidate, out_path_size - 1);
+                out_path[out_path_size - 1] = '\0';
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s hook-xpc <pid> <hooks.dylib> [--mach|--xpc]  Inject hooks and install either mach_msg* or libxpc XPC APIs.\n", prog);
-    fprintf(stderr, "  %s listen <pid> [flags]          Listen for events from target via Unix socket.\n", prog);
+    fprintf(stderr, "  %s listen <pid> [flags]          Listen for events from target via in-memory ring buffer.\n", prog);
     fprintf(stderr, "  %s sniff-xpc <pid> <hooks.dylib> [--mach|--xpc] [flags] Start listener, inject hooks, and install automatically.\n", prog);
     fprintf(stderr, "\nNotes:\n");
     fprintf(stderr, "- Hooks are installed in-process via frida-gum after injection.\n");
@@ -217,155 +305,10 @@ int main(int argc, char **argv) {
     return 2;
 }
 
-static ssize_t read_fully(int fd, void *buf, size_t len) {
-    uint8_t *p = (uint8_t *)buf;
-    size_t left = len;
-    while (left > 0) {
-        ssize_t n = recv(fd, p, left, 0);
-        if (n == 0) { errno = 0; return -1; } // EOF
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        p += (size_t)n;
-        left -= (size_t)n;
-    }
-    return (ssize_t)len;
-}
-
-typedef struct __attribute__((packed)) {
-    uint32_t magic;
-    uint16_t version;
-    uint16_t kind;
-    uint32_t pid;
-    uint64_t tid;
-    uint32_t payload_len;
-} xniff_ipc_hdr_legacy24_t;
-
-#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
-_Static_assert(sizeof(xniff_ipc_hdr_legacy24_t) == 24, "legacy header must be 24 bytes");
-#endif
-
-typedef enum {
-    XNIFF_HDR_WIRE_V1_20 = 20,
-    XNIFF_HDR_WIRE_LEGACY_24 = 24,
-} xniff_hdr_wire_kind_t;
-
-static bool api_is_known(uint32_t api) {
-    return api == XNIFF_API_MACH_MSG || api == XNIFF_API_MACH_MSG2 || api == XNIFF_API_XPC_HL;
-}
-
 static bool payload_len_sane(uint32_t payload_len) {
     if (payload_len < sizeof(uint32_t)) return false;
     if (payload_len > (64u * 1024u * 1024u)) return false;
     return true;
-}
-
-static bool peek_u32(const uint8_t *buf, size_t len, size_t off, uint32_t *out) {
-    if (!out) return false;
-    if (off + sizeof(uint32_t) > len) return false;
-    uint32_t v = 0;
-    memcpy(&v, buf + off, sizeof(v));
-    *out = v;
-    return true;
-}
-
-static int read_ipc_header_compat(int fd, xniff_ipc_hdr_t *out_hdr, xniff_hdr_wire_kind_t *wire_kind_out) {
-    if (!out_hdr) return -1;
-
-    // Peek enough bytes to discriminate between the current 20-byte header and a legacy 24-byte header.
-    // Also validate the first u32 of the payload (api) to reduce false positives.
-    uint8_t peek[64];
-    ssize_t pn = -1;
-    for (;;) {
-        pn = recv(fd, peek, sizeof(peek), MSG_PEEK);
-        if (pn < 0 && errno == EINTR) continue;
-        break;
-    }
-    if (pn == 0) { errno = 0; return -1; } // EOF
-    if (pn < 0) return -1;
-
-    size_t avail = (size_t)pn;
-    if (avail < sizeof(xniff_ipc_hdr_t)) {
-        if (read_fully(fd, out_hdr, sizeof(*out_hdr)) != (ssize_t)sizeof(*out_hdr)) return -1;
-        if (wire_kind_out) *wire_kind_out = XNIFF_HDR_WIRE_V1_20;
-        return 0;
-    }
-
-    xniff_ipc_hdr_t h1;
-    memcpy(&h1, peek, sizeof(h1));
-
-    bool h1_ok = (h1.magic == XNIFF_IPC_MAGIC) &&
-                 (h1.version == XNIFF_IPC_VERSION) &&
-                 payload_len_sane(h1.payload_len);
-    if (h1_ok && avail >= sizeof(xniff_ipc_hdr_t) + sizeof(uint32_t)) {
-        uint32_t api = 0;
-        if (peek_u32(peek, avail, sizeof(xniff_ipc_hdr_t), &api)) {
-            if (!api_is_known(api)) h1_ok = false;
-        }
-    }
-
-    bool h0_ok = false;
-    xniff_ipc_hdr_legacy24_t h0;
-    if (avail >= sizeof(h0) + sizeof(uint32_t)) {
-        memcpy(&h0, peek, sizeof(h0));
-        h0_ok = (h0.magic == XNIFF_IPC_MAGIC) &&
-                (h0.version == XNIFF_IPC_VERSION) &&
-                payload_len_sane(h0.payload_len);
-        if (h0_ok) {
-            uint32_t api = 0;
-            if (peek_u32(peek, avail, sizeof(h0), &api)) {
-                if (!api_is_known(api)) h0_ok = false;
-            }
-        }
-    }
-
-    // Prefer the current header when both validate; otherwise accept legacy if it validates.
-    if (h1_ok) {
-        if (read_fully(fd, out_hdr, sizeof(*out_hdr)) != (ssize_t)sizeof(*out_hdr)) return -1;
-        if (wire_kind_out) *wire_kind_out = XNIFF_HDR_WIRE_V1_20;
-        return 0;
-    }
-    if (h0_ok) {
-        uint8_t tmp[sizeof(h0)];
-        if (read_fully(fd, tmp, sizeof(tmp)) != (ssize_t)sizeof(tmp)) return -1;
-        memcpy(&h0, tmp, sizeof(h0));
-        out_hdr->magic = h0.magic;
-        out_hdr->version = h0.version;
-        out_hdr->kind = h0.kind;
-        out_hdr->pid = h0.pid;
-        out_hdr->tid_low = (uint32_t)h0.tid;
-        out_hdr->payload_len = h0.payload_len;
-        if (wire_kind_out) *wire_kind_out = XNIFF_HDR_WIRE_LEGACY_24;
-        return 0;
-    }
-
-    // Unknown framing; fall back to consuming the v1-sized header so the caller can emit diagnostics.
-    if (read_fully(fd, out_hdr, sizeof(*out_hdr)) != (ssize_t)sizeof(*out_hdr)) return -1;
-    if (wire_kind_out) *wire_kind_out = XNIFF_HDR_WIRE_V1_20;
-    return 0;
-}
-
-static void diag_dump_header(const char *why, const xniff_ipc_hdr_t *hdr) {
-    if (!hdr) return;
-    const uint8_t *b = (const uint8_t *)hdr;
-    char hex[sizeof(*hdr) * 2 + 1];
-    for (size_t i = 0; i < sizeof(*hdr); i++) snprintf(&hex[i * 2], 3, "%02x", b[i]);
-    XNIFF_DIAGF("%s: raw_hdr=%s\n", why ? why : "header", hex);
-    XNIFF_DIAGF("%s: magic=0x%08x (want 0x%08x) ver=%u (want %u) kind=%u pid=%u tid_low=%u payload_len=%u\n",
-                why ? why : "header",
-                hdr->magic, XNIFF_IPC_MAGIC,
-                (unsigned)hdr->version, (unsigned)XNIFF_IPC_VERSION,
-                (unsigned)hdr->kind, hdr->pid, hdr->tid_low, hdr->payload_len);
-}
-
-static void diag_disconnect(const char *where) {
-    int e = errno;
-    if (e == 0) {
-        XNIFF_DIAGF("%s: client disconnected (EOF)\n", where ? where : "listen");
-    } else {
-        XNIFF_DIAGF("%s: client disconnected (errno=%d: %s)\n", where ? where : "listen", e, strerror(e));
-    }
 }
 
 static void format_time(char *buf, size_t sz, double *mono_s_out) {
@@ -868,11 +811,64 @@ static void print_event(int kind, const xniff_ipc_mach_payload_t *pl, const uint
     }
 }
 
+static int task_read_exact(mach_port_t task, mach_vm_address_t address, void *buf, size_t len) {
+    if (!buf && len != 0) return -1;
+    mach_vm_size_t out_sz = 0;
+    kern_return_t kr = mach_vm_read_overwrite(task,
+                                              address,
+                                              (mach_vm_size_t)len,
+                                              (mach_vm_address_t)(uintptr_t)buf,
+                                              &out_sz);
+    if (kr != KERN_SUCCESS || out_sz != (mach_vm_size_t)len) return -1;
+    return 0;
+}
+
+static int task_write_exact(mach_port_t task, mach_vm_address_t address, const void *buf, size_t len) {
+    if (!buf && len != 0) return -1;
+    kern_return_t kr = mach_vm_write(task,
+                                     address,
+                                     (vm_offset_t)(uintptr_t)buf,
+                                     (mach_msg_type_number_t)len);
+    return kr == KERN_SUCCESS ? 0 : -1;
+}
+
+static int resolve_remote_ring_addr(mach_port_t task, mach_vm_address_t *out_addr) {
+    if (!out_addr) return -1;
+    mach_vm_address_t addr = 0;
+    if (xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "_xniff_ipc_ring", &addr) == 0 ||
+        xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "xniff_ipc_ring", &addr) == 0) {
+        *out_addr = addr;
+        return 0;
+    }
+    return -1;
+}
+
 static int cmd_listen(pid_t pid) {
-    int sfd = xniff_ipc_server_listen(pid);
-    if (sfd < 0) { perror("listen"); return -1; }
-    char path[108]; xniff_ipc_path_for_pid(pid, path, sizeof(path));
-    XNIFF_DIAGF("listening on %s...\n", path);
+    mach_port_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS) {
+        fprintf(stderr, "listen: task_for_pid failed for %d: %d (%s)\n",
+                (int)pid, kr, mach_error_string(kr));
+        return -1;
+    }
+
+    mach_vm_address_t ring_addr = 0;
+    for (int i = 0; i < 400; i++) { // up to ~20s while parent injects hooks
+        if (resolve_remote_ring_addr(task, &ring_addr) == 0) break;
+        usleep(50 * 1000);
+    }
+    if (ring_addr == 0) {
+        fprintf(stderr, "listen: failed to resolve remote xniff ring symbol in pid %d\n", (int)pid);
+        return -1;
+    }
+
+    mach_vm_address_t ring_hdr_addr = ring_addr + (mach_vm_address_t)offsetof(xniff_ipc_ring_t, hdr);
+    mach_vm_address_t ring_data_addr = ring_addr + (mach_vm_address_t)offsetof(xniff_ipc_ring_t, data);
+    mach_vm_address_t ring_read_idx_addr =
+        ring_hdr_addr + (mach_vm_address_t)offsetof(xniff_ipc_ring_hdr_t, read_idx);
+
+    XNIFF_DIAGF("listening on ring buffer: target_pid=%d ring=0x%llx\n",
+                (int)pid, (unsigned long long)ring_addr);
 
     // Prepare dump directory for this pid
     char base_dir[256];
@@ -882,226 +878,252 @@ static int cmd_listen(pid_t pid) {
         mkdir(base_dir, 0755);
     }
     unsigned long long evt_idx = 0;
+    uint64_t local_read_idx = UINT64_MAX;
+
+    uint8_t *stream = NULL;
+    size_t stream_len = 0;
+    size_t stream_cap = 0;
 
     for (;;) {
-        int cfd = xniff_ipc_accept(sfd);
-        if (cfd < 0) { if (errno == EINTR) continue; perror("accept"); return -1; }
-        XNIFF_DIAGF("client connected\n");
-        bool warned_legacy_hdr = false;
-        for (;;) {
-            xniff_ipc_hdr_t hdr;
-            xniff_hdr_wire_kind_t wire_kind = XNIFF_HDR_WIRE_V1_20;
-            if (read_ipc_header_compat(cfd, &hdr, &wire_kind) != 0) {
-                diag_disconnect("read header");
-                close(cfd);
-                pending_calls_clear_pid((uint32_t)pid);
-                break;
-            }
-            if (wire_kind == XNIFF_HDR_WIRE_LEGACY_24 && !warned_legacy_hdr) {
-                warned_legacy_hdr = true;
-                XNIFF_DIAGF("note: detected legacy 24-byte IPC header (tid64). Your injected xniff-hooks is older/different; rebuild and reinject to use the current 20-byte header.\n");
-            }
-            if (hdr.magic != XNIFF_IPC_MAGIC || hdr.version != XNIFF_IPC_VERSION) {
-                diag_dump_header("bad header/magic", &hdr);
-                XNIFF_DIAGF("bad header/magic: this is often caused by interleaved writes from multiple hook threads; ensure you’re using the updated xniff-hooks.\n");
-                close(cfd);
-                pending_calls_clear_pid((uint32_t)pid);
-                break;
-            }
-            if (hdr.payload_len < sizeof(uint32_t)) { fprintf(stderr, "short payload len %u\n", hdr.payload_len); close(cfd); break; }
-            if (hdr.payload_len > (64u * 1024u * 1024u)) {
-                // Compatibility: some older/mismatched hook builds appear to scribble the upper 16 bits of
-                // payload_len (often 0xAAAAxxxx). If the low 16 bits look sane and the payload begins with
-                // a valid api field, salvage the length instead of hard-failing.
-                uint32_t hi = hdr.payload_len & 0xFFFF0000u;
-                uint32_t lo = hdr.payload_len & 0x0000FFFFu;
-                bool salvaged = false;
-                if ((hi == 0xAAAA0000u || hi == 0x55550000u) && payload_len_sane(lo)) {
-                    uint32_t api = 0;
-                    ssize_t pk;
-                    do {
-                        pk = recv(cfd, &api, sizeof(api), MSG_PEEK | MSG_WAITALL);
-                    } while (pk < 0 && errno == EINTR);
-                    if (pk == (ssize_t)sizeof(api) && api_is_known(api)) {
-                        XNIFF_DIAGF("warning: salvaging scribbled payload_len 0x%08x -> %u (likely old/mismatched xniff-hooks)\n",
-                                    hdr.payload_len, lo);
-                        hdr.payload_len = lo;
-                        salvaged = true;
-                    }
+        xniff_ipc_ring_hdr_t rmeta = {0};
+        if (task_read_exact(task, ring_hdr_addr, &rmeta, sizeof(rmeta)) != 0) {
+            usleep(10 * 1000);
+            continue;
+        }
+        if (rmeta.magic != XNIFF_IPC_RING_MAGIC || rmeta.version != XNIFF_IPC_RING_VERSION ||
+            rmeta.capacity == 0 || rmeta.capacity > XNIFF_IPC_RING_CAPACITY) {
+            usleep(10 * 1000);
+            continue;
+        }
+        if (local_read_idx == UINT64_MAX) local_read_idx = rmeta.read_idx;
+
+        if (rmeta.write_idx < local_read_idx || (rmeta.write_idx - local_read_idx) > (uint64_t)rmeta.capacity) {
+            local_read_idx = rmeta.write_idx;
+        }
+
+        bool pulled = false;
+        while (local_read_idx < rmeta.write_idx) {
+            uint64_t cap = (uint64_t)rmeta.capacity;
+            uint64_t off = local_read_idx % cap;
+            uint64_t avail = rmeta.write_idx - local_read_idx;
+            uint64_t contig = cap - off;
+            uint64_t chunk64 = avail < contig ? avail : contig;
+            if (chunk64 > 64u * 1024u) chunk64 = 64u * 1024u;
+            size_t chunk = (size_t)chunk64;
+
+            if (stream_cap - stream_len < chunk) {
+                size_t need = stream_len + chunk;
+                size_t new_cap = stream_cap ? stream_cap : 64u * 1024u;
+                while (new_cap < need) new_cap *= 2;
+                uint8_t *tmp = (uint8_t *)realloc(stream, new_cap);
+                if (!tmp) {
+                    fprintf(stderr, "listen: oom while growing stream buffer\n");
+                    free(stream);
+                    return -1;
                 }
-                if (!salvaged) {
-                    diag_dump_header("insane payload_len", &hdr);
-                    close(cfd);
-                    pending_calls_clear_pid((uint32_t)pid);
-                    break;
-                }
+                stream = tmp;
+                stream_cap = new_cap;
             }
 
-            uint8_t *buf = (uint8_t *)malloc(hdr.payload_len);
-            if (!buf) { fprintf(stderr, "oom %u\n", hdr.payload_len); close(cfd); break; }
-            if (read_fully(cfd, buf, hdr.payload_len) != (ssize_t)hdr.payload_len) {
-                diag_disconnect("read payload");
-                free(buf);
-                close(cfd);
-                pending_calls_clear_pid((uint32_t)pid);
+            if (task_read_exact(task,
+                                ring_data_addr + (mach_vm_address_t)off,
+                                stream + stream_len,
+                                chunk) != 0) {
                 break;
+            }
+            stream_len += chunk;
+            local_read_idx += (uint64_t)chunk;
+            pulled = true;
+        }
+        if (pulled) {
+            (void)task_write_exact(task, ring_read_idx_addr, &local_read_idx, sizeof(local_read_idx));
+        }
+
+        while (stream_len >= sizeof(xniff_ipc_hdr_t)) {
+            xniff_ipc_hdr_t hdr;
+            memcpy(&hdr, stream, sizeof(hdr));
+            if (hdr.magic != XNIFF_IPC_MAGIC || hdr.version != XNIFF_IPC_VERSION ||
+                !payload_len_sane(hdr.payload_len)) {
+                memmove(stream, stream + 1, stream_len - 1);
+                stream_len -= 1;
+                continue;
+            }
+            size_t frame_len = sizeof(hdr) + (size_t)hdr.payload_len;
+            if (stream_len < frame_len) break;
+
+            uint8_t *buf = NULL;
+            if (hdr.payload_len != 0) {
+                buf = (uint8_t *)malloc(hdr.payload_len);
+                if (!buf) {
+                    fprintf(stderr, "oom %u\n", hdr.payload_len);
+                    free(stream);
+                    return -1;
+                }
+                memcpy(buf, stream + sizeof(hdr), hdr.payload_len);
             }
 
             uint32_t api = 0;
-            memcpy(&api, buf, sizeof(api));
+            if (hdr.payload_len >= sizeof(api)) memcpy(&api, buf, sizeof(api));
 
             unsigned long long cur_evt_id = evt_idx;
             uint64_t call_id = 0;
             unsigned long long entry_evt_id = 0;
 
             if (api == XNIFF_API_XPC_HL) {
-                if (hdr.payload_len < sizeof(xniff_ipc_xpc_payload_t)) {
-                    fprintf(stderr, "short xpc payload len %u\n", hdr.payload_len);
-                    free(buf);
-                    close(cfd);
-                    pending_calls_clear_pid((uint32_t)pid);
-                    break;
+                if (hdr.payload_len >= sizeof(xniff_ipc_xpc_payload_t)) {
+                    xniff_ipc_xpc_payload_t *pl = (xniff_ipc_xpc_payload_t *)buf;
+                    size_t off = sizeof(*pl);
+                    char *s0 = wire_copy_str(buf, hdr.payload_len, &off, pl->str0_len);
+                    char *s1 = wire_copy_str(buf, hdr.payload_len, &off, pl->str1_len);
+                    char *s2 = wire_copy_str(buf, hdr.payload_len, &off, pl->str2_len);
+                    char *s3 = wire_copy_str(buf, hdr.payload_len, &off, pl->str3_len);
+
+                    bool is_entry = (hdr.kind == XNIFF_EVT_XPC_ENTRY);
+                    bool is_exit = (hdr.kind == XNIFF_EVT_XPC_EXIT);
+                    if (is_entry) {
+                        call_id = pending_calls_push(hdr.pid, hdr.tid_low, pl->api, pl->func, cur_evt_id);
+                    } else if (is_exit) {
+                        (void)pending_calls_pop(hdr.pid, hdr.tid_low, pl->api, pl->func,
+                                                &call_id, &entry_evt_id);
+                    }
+
+                    if (g_listener_opts.jsonl) {
+                        char tbuf[64];
+                        double mono_s = 0.0;
+                        format_time(tbuf, sizeof(tbuf), &mono_s);
+                        jsonl_print_xpc_event(cur_evt_id, call_id, entry_evt_id, &hdr, pl,
+                                              s0, s1, s2, s3, tbuf, mono_s);
+                    } else {
+                        print_xpc_event(&hdr, pl, s0, s1, s2, s3);
+                    }
+                    free(s0);
+                    free(s1);
+                    free(s2);
+                    free(s3);
+                    evt_idx++;
+                }
+                if (buf) free(buf);
+                memmove(stream, stream + frame_len, stream_len - frame_len);
+                stream_len -= frame_len;
+                continue;
+            }
+
+            if (hdr.payload_len >= sizeof(xniff_ipc_mach_payload_t)) {
+                xniff_ipc_mach_payload_t *pl = (xniff_ipc_mach_payload_t *)buf;
+                uint8_t *msg_bytes = buf + sizeof(*pl);
+                size_t msg_avail = 0;
+                if (hdr.payload_len > sizeof(*pl)) msg_avail = (size_t)hdr.payload_len - sizeof(*pl);
+                size_t msg_len = pl->copy_len;
+                if (msg_len > msg_avail) msg_len = msg_avail;
+
+                bool is_entry = (hdr.kind == XNIFF_EVT_MACH_ENTRY || hdr.kind == XNIFF_EVT_MACH2_ENTRY);
+                bool is_exit = (hdr.kind == XNIFF_EVT_MACH_EXIT || hdr.kind == XNIFF_EVT_MACH2_EXIT);
+                if (is_entry) {
+                    call_id = pending_calls_push(hdr.pid, hdr.tid_low, pl->api, 0, cur_evt_id);
+                } else if (is_exit) {
+                    (void)pending_calls_pop(hdr.pid, hdr.tid_low, pl->api, 0, &call_id, &entry_evt_id);
                 }
 
-                xniff_ipc_xpc_payload_t *pl = (xniff_ipc_xpc_payload_t *)buf;
-                size_t off = sizeof(*pl);
-                char *s0 = wire_copy_str(buf, hdr.payload_len, &off, pl->str0_len);
-                char *s1 = wire_copy_str(buf, hdr.payload_len, &off, pl->str1_len);
-                char *s2 = wire_copy_str(buf, hdr.payload_len, &off, pl->str2_len);
-                char *s3 = wire_copy_str(buf, hdr.payload_len, &off, pl->str3_len);
+                // Dump inline message bytes + attachments to files (optional), and collect metadata for JSONL.
+                char prefix[512] = {0};
+                char pmsg[600] = {0};
+                const char *msg_path = NULL;
+                xniff_att_meta_t *atts = NULL;
+                size_t att_count = 0, att_cap = 0;
 
-                bool is_entry = (hdr.kind == XNIFF_EVT_XPC_ENTRY);
-                bool is_exit  = (hdr.kind == XNIFF_EVT_XPC_EXIT);
-                if (is_entry) {
-                    call_id = pending_calls_push(hdr.pid, hdr.tid_low, pl->api, pl->func, cur_evt_id);
-                } else if (is_exit) {
-                    (void)pending_calls_pop(hdr.pid, hdr.tid_low, pl->api, pl->func, &call_id, &entry_evt_id);
+                if (g_listener_opts.dump_files) {
+                    snprintf(prefix, sizeof(prefix), "%s/%s_%06llu", base_dir, kind_to_tag(hdr.kind), evt_idx);
+                    if (msg_len) {
+                        snprintf(pmsg, sizeof(pmsg), "%s_msg.bin", prefix);
+                        FILE *fp = fopen(pmsg, "wb");
+                        if (fp) {
+                            fwrite(msg_bytes, 1, msg_len, fp);
+                            fclose(fp);
+                            msg_path = pmsg;
+                        }
+                    }
+                }
+
+                // Parse TLVs already contained in payload and dump them
+                size_t offset = sizeof(*pl) + msg_len;
+                while (offset + sizeof(xniff_ipc_tlv_t) <= hdr.payload_len) {
+                    xniff_ipc_tlv_t *tlv = (xniff_ipc_tlv_t *)(buf + offset);
+                    offset += sizeof(*tlv);
+                    if (offset + tlv->length > hdr.payload_len) break; // malformed
+                    uint8_t *val = buf + offset;
+
+                    if ((tlv->type == XNIFF_TLV_OOL_DATA && tlv->length >= sizeof(xniff_ool_data_t)) ||
+                        (tlv->type == XNIFF_TLV_OOL_PORTS && tlv->length >= sizeof(xniff_ool_ports_t))) {
+                        if (att_count == att_cap) {
+                            size_t new_cap = att_cap ? att_cap * 2 : 8;
+                            xniff_att_meta_t *tmp = (xniff_att_meta_t *)realloc(atts, new_cap * sizeof(*atts));
+                            if (!tmp) break;
+                            atts = tmp;
+                            att_cap = new_cap;
+                        }
+                        xniff_att_meta_t *m = &atts[att_count++];
+                        memset(m, 0, sizeof(*m));
+                        m->type = tlv->type;
+                        if (tlv->type == XNIFF_TLV_OOL_DATA) {
+                            xniff_ool_data_t *md = (xniff_ool_data_t *)val;
+                            m->index = md->index;
+                            m->address = md->address;
+                            m->size_bytes = md->size;
+                            if (g_listener_opts.dump_files) {
+                                snprintf(m->path, sizeof(m->path), "%s_ool%u.bin", prefix, md->index);
+                                const uint8_t *bytes = val + sizeof(*md);
+                                FILE *fp = fopen(m->path, "wb");
+                                if (fp) {
+                                    fwrite(bytes, 1, md->size, fp);
+                                    fclose(fp);
+                                }
+                            } else {
+                                m->path[0] = '\0';
+                            }
+                        } else if (tlv->type == XNIFF_TLV_OOL_PORTS) {
+                            xniff_ool_ports_t *md = (xniff_ool_ports_t *)val;
+                            m->index = md->index;
+                            m->address = md->address;
+                            m->count = md->count;
+                            m->elem_size = md->elem_size;
+                            size_t bytes_len = (size_t)md->count * (size_t)md->elem_size;
+                            m->size_bytes = (uint32_t)bytes_len;
+                            if (g_listener_opts.dump_files) {
+                                snprintf(m->path, sizeof(m->path), "%s_ool_ports%u.bin", prefix, md->index);
+                                const uint8_t *bytes = val + sizeof(*md);
+                                FILE *fp = fopen(m->path, "wb");
+                                if (fp) {
+                                    fwrite(bytes, 1, bytes_len, fp);
+                                    fclose(fp);
+                                }
+                            } else {
+                                m->path[0] = '\0';
+                            }
+                        }
+                    }
+                    offset += tlv->length;
                 }
 
                 if (g_listener_opts.jsonl) {
                     char tbuf[64];
                     double mono_s = 0.0;
                     format_time(tbuf, sizeof(tbuf), &mono_s);
-                    jsonl_print_xpc_event(cur_evt_id, call_id, entry_evt_id, &hdr, pl, s0, s1, s2, s3, tbuf, mono_s);
+                    jsonl_print_event(cur_evt_id, call_id, entry_evt_id, &hdr, pl, msg_bytes, msg_len,
+                                      tbuf, mono_s, msg_path, atts, att_count);
                 } else {
-                    print_xpc_event(&hdr, pl, s0, s1, s2, s3);
+                    print_event(hdr.kind, pl, msg_bytes, msg_len);
                 }
 
-                free(s0); free(s1); free(s2); free(s3);
+                if (atts) free(atts);
                 evt_idx++;
-                free(buf);
-                continue;
             }
-
-            if (hdr.payload_len < sizeof(xniff_ipc_mach_payload_t)) {
-                fprintf(stderr, "short mach payload len %u\n", hdr.payload_len);
-                free(buf);
-                close(cfd);
-                pending_calls_clear_pid((uint32_t)pid);
-                break;
-            }
-
-            xniff_ipc_mach_payload_t *pl = (xniff_ipc_mach_payload_t *)buf;
-            uint8_t *msg_bytes = buf + sizeof(*pl);
-            size_t msg_avail = 0;
-            if (hdr.payload_len > sizeof(*pl)) msg_avail = (size_t)hdr.payload_len - sizeof(*pl);
-            size_t msg_len = pl->copy_len;
-            if (msg_len > msg_avail) msg_len = msg_avail;
-
-            bool is_entry = (hdr.kind == XNIFF_EVT_MACH_ENTRY || hdr.kind == XNIFF_EVT_MACH2_ENTRY);
-            bool is_exit  = (hdr.kind == XNIFF_EVT_MACH_EXIT  || hdr.kind == XNIFF_EVT_MACH2_EXIT);
-            if (is_entry) {
-                call_id = pending_calls_push(hdr.pid, hdr.tid_low, pl->api, 0, cur_evt_id);
-            } else if (is_exit) {
-                (void)pending_calls_pop(hdr.pid, hdr.tid_low, pl->api, 0, &call_id, &entry_evt_id);
-            }
-
-            // Dump inline message bytes + attachments to files (optional), and collect metadata for JSONL.
-            char prefix[512] = {0};
-            char pmsg[600] = {0};
-            const char *msg_path = NULL;
-            xniff_att_meta_t *atts = NULL;
-            size_t att_count = 0, att_cap = 0;
-
-            if (g_listener_opts.dump_files) {
-                snprintf(prefix, sizeof(prefix), "%s/%s_%06llu", base_dir, kind_to_tag(hdr.kind), evt_idx);
-                if (msg_len) {
-                    snprintf(pmsg, sizeof(pmsg), "%s_msg.bin", prefix);
-                    FILE *fp = fopen(pmsg, "wb");
-                    if (fp) { fwrite(msg_bytes, 1, msg_len, fp); fclose(fp); msg_path = pmsg; }
-                }
-            }
-
-            // Parse TLVs already contained in payload and dump them
-            size_t offset = sizeof(*pl) + msg_len;
-            while (offset + sizeof(xniff_ipc_tlv_t) <= hdr.payload_len) {
-                xniff_ipc_tlv_t *tlv = (xniff_ipc_tlv_t *)(buf + offset);
-                offset += sizeof(*tlv);
-                if (offset + tlv->length > hdr.payload_len) break; // malformed
-                uint8_t *val = buf + offset;
-
-                if ((tlv->type == XNIFF_TLV_OOL_DATA && tlv->length >= sizeof(xniff_ool_data_t)) ||
-                    (tlv->type == XNIFF_TLV_OOL_PORTS && tlv->length >= sizeof(xniff_ool_ports_t))) {
-                    if (att_count == att_cap) {
-                        size_t new_cap = att_cap ? att_cap * 2 : 8;
-                        xniff_att_meta_t *tmp = (xniff_att_meta_t *)realloc(atts, new_cap * sizeof(*atts));
-                        if (!tmp) break;
-                        atts = tmp;
-                        att_cap = new_cap;
-                    }
-                    xniff_att_meta_t *m = &atts[att_count++];
-                    memset(m, 0, sizeof(*m));
-                    m->type = tlv->type;
-                    if (tlv->type == XNIFF_TLV_OOL_DATA) {
-                        xniff_ool_data_t *md = (xniff_ool_data_t *)val;
-                        m->index = md->index;
-                        m->address = md->address;
-                        m->size_bytes = md->size;
-                        if (g_listener_opts.dump_files) {
-                            snprintf(m->path, sizeof(m->path), "%s_ool%u.bin", prefix, md->index);
-                            const uint8_t *bytes = val + sizeof(*md);
-                            FILE *fp = fopen(m->path, "wb");
-                            if (fp) { fwrite(bytes, 1, md->size, fp); fclose(fp); }
-                        } else {
-                            m->path[0] = '\0';
-                        }
-                    } else if (tlv->type == XNIFF_TLV_OOL_PORTS) {
-                        xniff_ool_ports_t *md = (xniff_ool_ports_t *)val;
-                        m->index = md->index;
-                        m->address = md->address;
-                        m->count = md->count;
-                        m->elem_size = md->elem_size;
-                        size_t bytes_len = (size_t)md->count * (size_t)md->elem_size;
-                        m->size_bytes = (uint32_t)bytes_len;
-                        if (g_listener_opts.dump_files) {
-                            snprintf(m->path, sizeof(m->path), "%s_ool_ports%u.bin", prefix, md->index);
-                            const uint8_t *bytes = val + sizeof(*md);
-                            FILE *fp = fopen(m->path, "wb");
-                            if (fp) { fwrite(bytes, 1, bytes_len, fp); fclose(fp); }
-                        } else {
-                            m->path[0] = '\0';
-                        }
-                    }
-                }
-
-                offset += tlv->length;
-            }
-
-            if (g_listener_opts.jsonl) {
-                char tbuf[64];
-                double mono_s = 0.0;
-                format_time(tbuf, sizeof(tbuf), &mono_s);
-                jsonl_print_event(cur_evt_id, call_id, entry_evt_id, &hdr, pl, msg_bytes, msg_len, tbuf, mono_s, msg_path, atts, att_count);
-            } else {
-                print_event(hdr.kind, pl, msg_bytes, msg_len);
-            }
-
-            if (atts) free(atts);
-
-            evt_idx++;
-            free(buf);
+            if (buf) free(buf);
+            memmove(stream, stream + frame_len, stream_len - frame_len);
+            stream_len -= frame_len;
         }
+        usleep(10 * 1000);
     }
+    // unreachable
     return 0;
 }
 
@@ -1118,9 +1140,18 @@ static int cmd_hook_xpc(pid_t pid, const char *dylib_path, int mode) {
         return -1;
     }
 
+    char inject_path[PATH_MAX] = {0};
+    if (stage_dylib_for_sandbox(abs_path, inject_path, sizeof(inject_path)) == 0) {
+        XNIFF_DIAGF("hook-xpc: staged hooks dylib at %s (from %s)\n", inject_path, abs_path);
+    } else {
+        (void)strncpy(inject_path, abs_path, sizeof(inject_path) - 1);
+        inject_path[sizeof(inject_path) - 1] = '\0';
+        XNIFF_DIAGF("hook-xpc: warning: failed to stage hooks dylib; using original path %s\n", abs_path);
+    }
+
     // Inject hooks dylib (uses filtered dlopen/pthread_exit resolution)
     (void)xniff_dump_task_images(task);
-    if (xniff_inject_dylib_task(task, abs_path, NULL) != 0) {
+    if (xniff_inject_dylib_task(task, inject_path, NULL) != 0) {
         fprintf(stderr, "failed to inject hooks dylib into pid %d\n", pid);
         detach_process(pid);
         return -1;
@@ -1129,16 +1160,16 @@ static int cmd_hook_xpc(pid_t pid, const char *dylib_path, int mode) {
     for (int i = 0; i < 40; i++) {
         mach_vm_address_t tmp = 0;
         // Try to resolve our exported ABI marker to confirm load
-        if (xniff_find_symbol_in_image_exact_path(task, abs_path, "_xniff_hooks_abi_version", &tmp) == 0 ||
+        if (xniff_find_symbol_in_image_exact_path(task, inject_path, "_xniff_hooks_abi_version", &tmp) == 0 ||
             xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "_xniff_hooks_abi_version", &tmp) == 0 ||
-            xniff_find_symbol_in_image_exact_path(task, abs_path, "xniff_hooks_abi_version", &tmp) == 0 ||
+            xniff_find_symbol_in_image_exact_path(task, inject_path, "xniff_hooks_abi_version", &tmp) == 0 ||
             xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "xniff_hooks_abi_version", &tmp) == 0) {
             break;
         }
         usleep(50 * 1000);
     }
     detach_process(pid);
-    XNIFF_DIAGF("hook-xpc: injected %s; xniff-hooks installs interceptors via frida-gum\n", abs_path);
+    XNIFF_DIAGF("hook-xpc: injected %s; xniff-hooks installs interceptors via frida-gum\n", inject_path);
     return 0;
 }
 
@@ -1158,14 +1189,20 @@ int cmd_sniff_xpc(pid_t pid, const char *dylib_path, int mode) {
         (void)dup2(STDERR_FILENO, STDOUT_FILENO);
     }
 
-    // Wait for listener socket to exist to minimize dropped early events
-    char sock_path[108];
-    if (xniff_ipc_path_for_pid(pid, sock_path, sizeof(sock_path)) == 0) {
-        for (int i = 0; i < 50; i++) { // ~2.5s
-            struct stat st;
-            if (stat(sock_path, &st) == 0) break;
-            usleep(50 * 1000);
+    // Wait for listener process startup. If it exits early, do not inject.
+    bool listener_ready = false;
+    for (int i = 0; i < 20; i++) { // ~1s
+        if (kill(child, 0) != 0 && errno == ESRCH) {
+            break;
         }
+        listener_ready = true;
+        usleep(50 * 1000);
+    }
+    if (!listener_ready) {
+        fprintf(stderr, "sniff-xpc: listener failed to start for pid %d\n", (int)pid);
+        (void)kill(child, SIGTERM);
+        (void)waitpid(child, NULL, 0);
+        return -1;
     }
 
     int rc = cmd_hook_xpc(pid, dylib_path, mode);

@@ -24,6 +24,9 @@ _XNIFF_SHCODE_START:
     mov     x0, sp              // pthread_t* storage (stack scratch)
     mov     x1, xzr             // attr = NULL
     adr     x2, _XNIFF_START_ROUTINE
+    // pthread start routines are function pointers on arm64e; sign with
+    // IA key + zero discriminator before handing to pthread runtime.
+    paciza  x2
     mov     x3, xzr             // arg = NULL
     ldr     x4, _XNIFF_PL_PTHREAD_CREATE_FROM_MACH_THREAD
     blr     x4

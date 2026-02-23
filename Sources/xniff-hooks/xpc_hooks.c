@@ -160,8 +160,6 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
     size_t scratch_cap = 0;
 
     xniff_hooks_ipc_lock();
-    int fd = xniff_hooks_ipc_ensure_fd_locked();
-    if (fd < 0) goto out;
 
     const xniff_hook_limits_t *lim = limits();
 
@@ -269,9 +267,9 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
     pl.msg_addr = (uint64_t)(uintptr_t)msg;
 
     // Send header, payload, and inline bytes (blocking to ensure ordering)
-    if (xniff_ipc_send_all(fd, &hdr, sizeof(hdr)) != 0) { xniff_hooks_ipc_drop_locked(); goto out; }
-    if (xniff_ipc_send_all(fd, &pl, sizeof(pl)) != 0)  { xniff_hooks_ipc_drop_locked(); goto out; }
-    if (copy_len && msg_copy && xniff_ipc_send_all(fd, msg_copy, copy_len) != 0)   { xniff_hooks_ipc_drop_locked(); goto out; }
+    if (xniff_hooks_ipc_write_locked(&hdr, sizeof(hdr)) != 0) goto out;
+    if (xniff_hooks_ipc_write_locked(&pl, sizeof(pl)) != 0) goto out;
+    if (copy_len && msg_copy && xniff_hooks_ipc_write_locked(msg_copy, copy_len) != 0) goto out;
 
     // Send attachments
     if (att_sz != 0 && msgh_size_ok && msg_copy) {
@@ -297,18 +295,18 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
                 md.flags = (ool->deallocate ? 1u : 0u) | (ool->copy ? 2u : 0u);
                 md.address = (uint64_t)(uintptr_t)ool->address;
                 md.size = n;
-                if (xniff_ipc_send_all(fd, &h, sizeof(h)) != 0)  { xniff_hooks_ipc_drop_locked(); goto out; }
-                if (xniff_ipc_send_all(fd, &md, sizeof(md)) != 0) { xniff_hooks_ipc_drop_locked(); goto out; }
+                if (xniff_hooks_ipc_write_locked(&h, sizeof(h)) != 0) goto out;
+                if (xniff_hooks_ipc_write_locked(&md, sizeof(md)) != 0) goto out;
                 if ((size_t)n > scratch_cap) {
                     uint8_t *ns = (uint8_t *)realloc(scratch, (size_t)n);
-                    if (!ns) { xniff_hooks_ipc_drop_locked(); goto out; }
+                    if (!ns) goto out;
                     scratch = ns;
                     scratch_cap = (size_t)n;
                 }
                 if (scratch && n) {
                     memset(scratch, 0, (size_t)n);
                     if (ool->address) (void)xniff_safe_copy(ool->address, scratch, (size_t)n);
-                    if (xniff_ipc_send_all(fd, scratch, (size_t)n) != 0) { xniff_hooks_ipc_drop_locked(); goto out; }
+                    if (xniff_hooks_ipc_write_locked(scratch, (size_t)n) != 0) goto out;
                 }
                 att_left -= (overhead + (size_t)n);
             } else if (t == MACH_MSG_OOL_PORTS_DESCRIPTOR) {
@@ -329,18 +327,18 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
                 md.count = send_count;
                 md.address = (uint64_t)(uintptr_t)op->address;
                 md.elem_size = (uint32_t)sizeof(mach_port_t);
-                if (xniff_ipc_send_all(fd, &h, sizeof(h)) != 0)  { xniff_hooks_ipc_drop_locked(); goto out; }
-                if (xniff_ipc_send_all(fd, &md, sizeof(md)) != 0) { xniff_hooks_ipc_drop_locked(); goto out; }
+                if (xniff_hooks_ipc_write_locked(&h, sizeof(h)) != 0) goto out;
+                if (xniff_hooks_ipc_write_locked(&md, sizeof(md)) != 0) goto out;
                 if ((size_t)n > scratch_cap) {
                     uint8_t *ns = (uint8_t *)realloc(scratch, (size_t)n);
-                    if (!ns) { xniff_hooks_ipc_drop_locked(); goto out; }
+                    if (!ns) goto out;
                     scratch = ns;
                     scratch_cap = (size_t)n;
                 }
                 if (scratch && n) {
                     memset(scratch, 0, (size_t)n);
                     if (op->address) (void)xniff_safe_copy(op->address, scratch, (size_t)n);
-                    if (xniff_ipc_send_all(fd, scratch, (size_t)n) != 0) { xniff_hooks_ipc_drop_locked(); goto out; }
+                    if (xniff_hooks_ipc_write_locked(scratch, (size_t)n) != 0) goto out;
                 }
                 att_left -= (overhead + (size_t)n);
             }
