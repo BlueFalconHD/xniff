@@ -9,11 +9,34 @@
 #include <dlfcn.h>
 #include <mach/thread_act.h>
 
+#if defined(__has_feature)
+#if __has_feature(ptrauth_calls) && defined(__LP64__)
+#include <ptrauth.h>
+#define XNIFF_HAS_PTRAUTH 1
+#endif
+#endif
+#ifndef XNIFF_HAS_PTRAUTH
+#define XNIFF_HAS_PTRAUTH 0
+#endif
+
 #define PATH_LIBDYLD_EXACT "/usr/lib/system/libdyld.dylib"
 #define PATH_LIBDYLD_SUB "libdyld"
 
 #define PATH_LIBSYS_PTHREAD_EXACT "/usr/lib/system/libsystem_pthread.dylib"
 #define PATH_LIBSYS_PTHREAD_SUB "libsystem_pthread"
+
+static void (*xniff_sign_remote_pc_fptr(mach_vm_address_t entry))(void) {
+#if XNIFF_HAS_PTRAUTH
+  // arm64e thread state stores pc as process-independent-code-signed pointer.
+  void *raw_pc = (void *)(uintptr_t)entry;
+  void *signed_pc = ptrauth_sign_unauthenticated(
+      raw_pc, ptrauth_key_process_independent_code,
+      ptrauth_string_discriminator("pc"));
+  return (void (*)(void))signed_pc;
+#else
+  return (void (*)(void))(uintptr_t)entry;
+#endif
+}
 
 int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path,
                             mach_vm_address_t *out_handle) {
@@ -205,11 +228,11 @@ int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path,
   arm_thread_state64_t st;
   memset(&st, 0, sizeof(st));
 
-  // Remote thread state must not be PAC-signed in the injector's context.
-  // Mark as NO_PTRAUTH and provide raw PC/SP values for the target.
-  arm_thread_state64_ptrauth_strip(st);
+  // set stack/program counter through SDK accessors so arm64e opaque thread
+  // state layouts are handled correctly.
   arm_thread_state64_set_sp(st, sp);
-  arm_thread_state64_set_pc_presigned_fptr(st, (void (*)(void))(uintptr_t)code_addr);
+  arm_thread_state64_set_pc_presigned_fptr(st,
+                                           xniff_sign_remote_pc_fptr(code_addr));
 
   // create the thread
   thread_act_t th = MACH_PORT_NULL;

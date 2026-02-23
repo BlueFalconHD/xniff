@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -29,6 +30,20 @@ static char *xniff_xpc_desc(xpc_object_t obj, uint32_t *len_out) {
     uint32_t n = xniff_strnlen_u32(s, XNIFF_XPC_STR_MAX);
     if (len_out) *len_out = n;
     return s; // free() by caller
+}
+
+static char *xniff_ptr_desc(uint64_t ptr, uint32_t *len_out) {
+    if (len_out) *len_out = 0;
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)ptr);
+    if (n <= 0) return NULL;
+    size_t m = (size_t)n;
+    char *s = (char *)malloc(m + 1);
+    if (!s) return NULL;
+    memcpy(s, buf, m);
+    s[m] = '\0';
+    if (len_out) *len_out = (uint32_t)m;
+    return s;
 }
 
 static void ipc_send_xpc_event(
@@ -103,12 +118,11 @@ void xniff_emit_xpc_connection_create_exit(uint64_t ret, const uint64_t args[8])
 }
 
 void xniff_emit_xpc_pipe_routine_entry(const uint64_t args[8]) {
-    xpc_object_t pipe = (xpc_object_t)(uintptr_t)(args ? args[0] : 0);
-    xpc_object_t *in  = (xpc_object_t *)(uintptr_t)(args ? args[1] : 0);
-    xpc_object_t in_obj = (in ? *in : NULL);
+    uint64_t pipe_ptr = (args ? args[0] : 0);
+    xpc_object_t in_obj = (xpc_object_t)(uintptr_t)(args ? args[1] : 0);
 
     uint32_t l0 = 0, l1 = 0;
-    char *pdesc = xniff_xpc_desc(pipe, &l0);
+    char *pdesc = xniff_ptr_desc(pipe_ptr, &l0);
     char *idesc = xniff_xpc_desc(in_obj, &l1);
 
     xniff_ipc_xpc_payload_t pl;
@@ -119,16 +133,14 @@ void xniff_emit_xpc_pipe_routine_entry(const uint64_t args[8]) {
 }
 
 void xniff_emit_xpc_pipe_routine_exit(uint64_t ret, const uint64_t args[8]) {
-    xpc_object_t pipe = (xpc_object_t)(uintptr_t)(args ? args[0] : 0);
-    xpc_object_t *in  = (xpc_object_t *)(uintptr_t)(args ? args[1] : 0);
-    xpc_object_t *out = (xpc_object_t *)(uintptr_t)(args ? args[2] : 0);
-    xpc_object_t in_obj  = (in ? *in : NULL);
-    xpc_object_t out_obj = (out ? *out : NULL);
+    uint64_t pipe_ptr = (args ? args[0] : 0);
+    xpc_object_t in_obj = (xpc_object_t)(uintptr_t)(args ? args[1] : 0);
+    uint64_t out_ptr = (args ? args[2] : 0);
 
     uint32_t l0 = 0, l1 = 0, l2 = 0;
-    char *pdesc = xniff_xpc_desc(pipe, &l0);
+    char *pdesc = xniff_ptr_desc(pipe_ptr, &l0);
     char *idesc = xniff_xpc_desc(in_obj, &l1);
-    char *odesc = xniff_xpc_desc(out_obj, &l2);
+    char *odesc = xniff_ptr_desc(out_ptr, &l2);
 
     xniff_ipc_xpc_payload_t pl;
     pl_init_from_args(&pl, XNIFF_XPC_FUNC_PIPE_ROUTINE, XNIFF_DIR_EXIT, ret, args);
@@ -175,4 +187,18 @@ void xniff_emit_xpc_connection_send_message_with_reply_sync_entry(const uint64_t
 
 void xniff_emit_xpc_connection_send_message_with_reply_sync_exit(uint64_t ret, const uint64_t args[8]) {
     send_connection_message_event_args(XNIFF_EVT_XPC_EXIT, XNIFF_DIR_EXIT, XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC, ret, args, true);
+}
+
+void xniff_emit_xpc_connection_call_event_handler_entry(const uint64_t args[8]) {
+    xniff_ipc_xpc_payload_t pl;
+    pl_init_from_args(&pl, XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER, XNIFF_DIR_ENTRY, 0, args);
+    // This is a private libxpc internal. Avoid dereferencing conn/msg pointers here to keep
+    // hook-side behavior conservative across OS updates.
+    ipc_send_xpc_event(XNIFF_EVT_XPC_ENTRY, &pl, NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+}
+
+void xniff_emit_xpc_connection_call_event_handler_exit(uint64_t ret, const uint64_t args[8]) {
+    xniff_ipc_xpc_payload_t pl;
+    pl_init_from_args(&pl, XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER, XNIFF_DIR_EXIT, ret, args);
+    ipc_send_xpc_event(XNIFF_EVT_XPC_EXIT, &pl, NULL, 0, NULL, 0, NULL, 0, NULL, 0);
 }

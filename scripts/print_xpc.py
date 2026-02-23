@@ -123,17 +123,54 @@ def _has_xpc_pretty(ev: Dict[str, Any]) -> bool:
     return isinstance(p, str) and len(p) > 0
 
 
-def _xpc_text(ev: Dict[str, Any], *, use_mach_pretty: bool, use_hl_strings: bool) -> Optional[str]:
-    if use_mach_pretty:
-        p = _get(ev, "xpc", "pretty", default=None)
-        if isinstance(p, str) and p:
-            return p
+def _has_hl_xpc(ev: Dict[str, Any]) -> bool:
+    xpc = ev.get("xpc")
+    if not isinstance(xpc, dict):
+        return False
+    # New structured representation.
+    sf = xpc.get("string_fields")
+    if isinstance(sf, dict):
+        for v in sf.values():
+            if isinstance(v, str) and v:
+                return True
+    # Back-compat slots.
+    for k in ("str0", "str1", "str2", "str3"):
+        v = xpc.get(k)
+        if isinstance(v, str) and v:
+            return True
+    # Metadata-only high-level events (e.g. call_event_handler) should still be included.
+    if isinstance(xpc.get("func_name"), str) and xpc.get("func_name"):
+        return True
+    if xpc.get("func") is not None:
+        return True
+    return False
 
-    if use_hl_strings:
-        xpc = ev.get("xpc")
-        if not isinstance(xpc, dict):
-            return None
-        parts: List[str] = []
+
+def _has_selected_xpc(ev: Dict[str, Any], *, use_mach_pretty: bool, use_hl_strings: bool) -> bool:
+    if use_mach_pretty and _has_xpc_pretty(ev):
+        return True
+    if use_hl_strings and _has_hl_xpc(ev):
+        return True
+    return False
+
+
+def _xpc_hl_parts(ev: Dict[str, Any]) -> List[str]:
+    xpc = ev.get("xpc")
+    if not isinstance(xpc, dict):
+        return []
+
+    parts: List[str] = []
+    sf = xpc.get("string_fields")
+    if isinstance(sf, dict):
+        for k in sorted(sf.keys()):
+            v = sf.get(k)
+            if not isinstance(v, str) or not v:
+                continue
+            if "\n" in v:
+                parts.append(f"{k}:\n{v}")
+            else:
+                parts.append(f"{k}: {v}")
+    else:
         for k in ("str0", "str1", "str2", "str3"):
             v = xpc.get(k)
             if not isinstance(v, str) or not v:
@@ -142,9 +179,34 @@ def _xpc_text(ev: Dict[str, Any], *, use_mach_pretty: bool, use_hl_strings: bool
                 parts.append(f"{k}:\n{v}")
             else:
                 parts.append(f"{k}: {v}")
+
+    args_named = xpc.get("args_named")
+    if isinstance(args_named, dict):
+        for k in sorted(args_named.keys()):
+            v = args_named.get(k)
+            if v is None:
+                continue
+            parts.append(f"arg.{k}: {v}")
+
+    return parts
+
+
+def _xpc_text(ev: Dict[str, Any], *, use_mach_pretty: bool, use_hl_strings: bool) -> Optional[str]:
+    blocks: List[str] = []
+
+    if use_mach_pretty:
+        p = _get(ev, "xpc", "pretty", default=None)
+        if isinstance(p, str) and p:
+            blocks.append(p)
+
+    if use_hl_strings:
+        parts = _xpc_hl_parts(ev)
         if parts:
-            return "\n".join(parts)
-    return None
+            blocks.append("\n".join(parts))
+
+    if not blocks:
+        return None
+    return "\n\n".join(blocks)
 
 
 def _is_entry_kind(kind: str) -> bool:
@@ -157,7 +219,7 @@ def _is_exit_kind(kind: str) -> bool:
 
 def _choose_entry_exit(bucket: CallBucket, ev: Dict[str, Any], *, use_mach_pretty: bool, use_hl_strings: bool) -> None:
     kind = str(ev.get("kind") or "")
-    if _xpc_text(ev, use_mach_pretty=use_mach_pretty, use_hl_strings=use_hl_strings) is None:
+    if not _has_selected_xpc(ev, use_mach_pretty=use_mach_pretty, use_hl_strings=use_hl_strings):
         return
     if _is_entry_kind(kind) and bucket.entry_xpc is None:
         bucket.entry_xpc = ev
@@ -190,10 +252,15 @@ def _render_event(
         return f"{label}: <missing>\n"
     eid = _as_int(ev.get("event_id"), 0)
     ts = str(ev.get("ts_real") or "")
+    kind = str(ev.get("kind") or "")
+    pid = _as_int(ev.get("pid"), 0)
+    proc_name = ev.get("proc_name")
     is_send = bool(_get(ev, "mach", "is_send", default=False))
     is_recv = bool(_get(ev, "mach", "is_recv", default=False))
     remote, local = _ports(ev)
-    ret = _fmt_ret(_get(ev, "mach", "ret", default=0))
+    mach_ret = _get(ev, "mach", "ret", default=None)
+    xpc_ret = _get(ev, "xpc", "ret", default=None)
+    ret = _fmt_ret(mach_ret if mach_ret is not None else xpc_ret)
     pretty = _xpc_text(ev, use_mach_pretty=use_mach_pretty, use_hl_strings=use_hl_strings)
 
     peer_role = _get(ev, "mach", "peer_role", default=None)
@@ -211,18 +278,47 @@ def _render_event(
     if isinstance(xpc_func, str) and xpc_func:
         conn_pid = _as_int(_get(ev, "xpc", "conn_pid", default=0), 0)
         conn_name = _get(ev, "xpc", "conn_name", default=None)
+        flow = _get(ev, "xpc", "flow", default=None)
+        xpc_peer_role = _get(ev, "xpc", "peer_role", default=None)
+        service_name = _get(ev, "xpc", "service_name", default=None)
+        conn_ptr = _get(ev, "xpc", "conn_ptr", default=None)
+        msg_ptr = _get(ev, "xpc", "msg_ptr", default=None)
+        conn_seq = _as_int(_get(ev, "xpc", "conn_seq", default=0), 0)
+        response_to_event_id = _as_int(_get(ev, "xpc", "response_to_event_id", default=0), 0)
         extra += f" func={xpc_func}"
+        if isinstance(flow, str) and flow:
+            extra += f" flow={flow}"
+        if isinstance(xpc_peer_role, str) and xpc_peer_role and xpc_peer_role != "unknown":
+            extra += f" xpc_peer_role={xpc_peer_role}"
+        if isinstance(service_name, str) and service_name:
+            extra += f" service={service_name}"
+        if isinstance(conn_ptr, str) and conn_ptr:
+            extra += f" conn_ptr={conn_ptr}"
+        if isinstance(msg_ptr, str) and msg_ptr:
+            extra += f" msg_ptr={msg_ptr}"
+        if conn_seq:
+            extra += f" conn_seq={conn_seq}"
+        if response_to_event_id:
+            extra += f" response_to_event_id={response_to_event_id}"
         if conn_pid:
             extra += f" conn_pid={conn_pid}"
         if isinstance(conn_name, str) and conn_name:
             extra += f" conn_name={conn_name}"
 
-    hdr = (
-        f"{label}: event_id={eid} ts={ts} send={str(is_send).lower()} recv={str(is_recv).lower()}"
-        f" remote=0x{remote:x} local=0x{local:x} ret={ret}{extra}\n"
-    )
+    hdr = f"{label}: event_id={eid} ts={ts}"
+    if kind:
+        hdr += f" kind={kind}"
+    if pid:
+        hdr += f" pid={pid}"
+    if isinstance(proc_name, str) and proc_name:
+        hdr += f" proc={proc_name}"
+    if is_send or is_recv or remote or local:
+        hdr += f" send={str(is_send).lower()} recv={str(is_recv).lower()} remote=0x{remote:x} local=0x{local:x}"
+    hdr += f" ret={ret}{extra}\n"
     if isinstance(pretty, str) and pretty:
         return hdr + pretty.rstrip() + "\n"
+    if isinstance(xpc_func, str) and xpc_func:
+        return hdr + "<no decoded XPC payload text in this event>\n"
     return hdr + "<no XPC payload in this event>\n"
 
 
@@ -230,8 +326,8 @@ def main(argv: List[str]) -> int:
     ap = argparse.ArgumentParser(
         description=(
             "Print XPC request/response bodies from xniff output (schema xniff.event.v1).\n"
-            "This can print either mach-level decoded XPC payloads (xpc.pretty), high-level libxpc descriptions\n"
-            "(xpc.str0..str3 from xpc_copy_description), or both."
+            "This can print either mach-level decoded XPC payloads (xpc.pretty), high-level libxpc output\n"
+            "(xpc.string_fields/args_named and legacy str0..str3), or both."
         )
     )
     ap.add_argument("events_path", help="Path to events.jsonl (or JSON array) captured from xniff-cli listen --jsonl")
@@ -244,7 +340,7 @@ def main(argv: List[str]) -> int:
         help="Only print calls where both an XPC entry and an XPC exit were captured (non-missing).",
     )
     ap.add_argument("--mach-only", action="store_true", help="Only print mach-level decoded XPC payloads (xpc.pretty).")
-    ap.add_argument("--hl-only", action="store_true", help="Only print high-level libxpc descriptions (xpc.str0..str3).")
+    ap.add_argument("--hl-only", action="store_true", help="Only print high-level libxpc fields (xpc.string_fields / args_named).")
     ap.add_argument("--min-call-id", type=int, default=None, help="Only include call_id >= N")
     ap.add_argument("--max-call-id", type=int, default=None, help="Only include call_id <= N")
     args = ap.parse_args(argv)
@@ -259,6 +355,7 @@ def main(argv: List[str]) -> int:
     total = 0
     total_with_xpc = 0
     recv_xpc_exits: List[Dict[str, Any]] = []
+    events_by_id: Dict[int, Dict[str, Any]] = {}
 
     for ev in iter_events(args.events_path):
         total += 1
@@ -277,8 +374,11 @@ def main(argv: List[str]) -> int:
             b = CallBucket(call_id=call_id)
             buckets[call_id] = b
         b.note_event(ev)
-        if _xpc_text(ev, use_mach_pretty=use_mach_pretty, use_hl_strings=use_hl_strings) is not None:
+        if _has_selected_xpc(ev, use_mach_pretty=use_mach_pretty, use_hl_strings=use_hl_strings):
             total_with_xpc += 1
+            eid = _as_int(ev.get("event_id"), 0)
+            if eid:
+                events_by_id[eid] = ev
             _choose_entry_exit(b, ev, use_mach_pretty=use_mach_pretty, use_hl_strings=use_hl_strings)
             kind = str(ev.get("kind") or "")
             if _is_exit_kind(kind) and bool(_get(ev, "mach", "is_recv", default=False)):
@@ -405,6 +505,29 @@ def main(argv: List[str]) -> int:
         if args.all and b.other_xpc:
             for ev in b.other_xpc:
                 sys.stdout.write(_render_event(ev, "OTHER", use_mach_pretty=use_mach_pretty, use_hl_strings=use_hl_strings))
+
+        # Show high-level response linkage when present: send event responded to a prior recv event.
+        src = entry if entry is not None else exit_ev
+        response_to_event_id = _as_int(_get(src or {}, "xpc", "response_to_event_id", default=0), 0)
+        if response_to_event_id:
+            linked = events_by_id.get(response_to_event_id)
+            if isinstance(linked, dict):
+                linked_call = _as_int(linked.get("call_id"), 0)
+                linked_func = _get(linked, "xpc", "func_name", default=None)
+                linked_flow = _get(linked, "xpc", "flow", default=None)
+                linked_pid = _as_int(linked.get("pid"), 0)
+                msg = f"LINK: response_to_event_id={response_to_event_id}"
+                if linked_call:
+                    msg += f" linked_call_id={linked_call}"
+                if linked_pid:
+                    msg += f" linked_pid={linked_pid}"
+                if isinstance(linked_func, str) and linked_func:
+                    msg += f" linked_func={linked_func}"
+                if isinstance(linked_flow, str) and linked_flow:
+                    msg += f" linked_flow={linked_flow}"
+                print(msg)
+            else:
+                print(f"LINK: response_to_event_id={response_to_event_id} (event not found in input)")
         print()
 
     print(f"read_events={total} xpc_events={total_with_xpc} calls={len(buckets)}", file=sys.stderr)

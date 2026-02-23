@@ -25,6 +25,8 @@ enum {
     // High-level libxpc hooks
     XNIFF_EVT_XPC_ENTRY   = 5,
     XNIFF_EVT_XPC_EXIT    = 6,
+    // Hook-side diagnostic log line
+    XNIFF_EVT_DEBUG_LOG   = 7,
 };
 
 typedef struct {
@@ -79,6 +81,7 @@ enum {
     XNIFF_API_MACH_MSG  = 1,
     XNIFF_API_MACH_MSG2 = 2,
     XNIFF_API_XPC_HL    = 3,
+    XNIFF_API_DEBUG     = 4,
 };
 
 // Direction: entry or exit
@@ -127,6 +130,7 @@ enum {
     XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE          = 3,
     XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY = 4,
     XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC = 5,
+    XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER    = 6,
 };
 
 // TLV framing for attachments following the message bytes
@@ -156,6 +160,13 @@ typedef struct {
     uint32_t elem_size;    // sizeof(mach_port_t)
     uint32_t reserved;     // align
 } xniff_ool_ports_t;
+
+// Payload for XNIFF_EVT_DEBUG_LOG, followed by msg_len bytes (not NUL-terminated).
+typedef struct {
+    uint32_t api;          // XNIFF_API_DEBUG
+    uint32_t level;        // reserved for future use (0=debug/info)
+    uint32_t msg_len;      // bytes of message following this struct
+} xniff_ipc_debug_payload_t;
 
 // Append bytes to the process-local ring buffer (producer-side).
 // Returns 0 on success, -1 on failure (e.g. ENOBUFS when ring is full).
