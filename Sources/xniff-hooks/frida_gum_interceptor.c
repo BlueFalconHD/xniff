@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <mach/mach.h>
 
 #include "xniff_hooks_emit.h"
 #include "xniff_hooks_ipc.h"
@@ -51,6 +52,13 @@ static pthread_mutex_t g_attach_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_enter_count = 0;
 static uint64_t g_leave_count = 0;
 static gboolean g_event_handler_hook_attached = FALSE;
+
+typedef struct {
+  thread_t *threads;
+  mach_msg_type_number_t count;
+} XniffSuspendedThreadSet;
+
+static XniffSuspendedThreadSet g_suspended_threads = {0};
 
 typedef struct {
   const char *name;
@@ -110,6 +118,63 @@ static void xniff_hooks_debug_log(const char *fmt, ...) {
   if (msg_len != 0) ok |= xniff_hooks_ipc_write_locked(line, msg_len);
   xniff_hooks_ipc_unlock();
   (void)ok;
+}
+
+static void xniff_suspend_all_other_threads(void) {
+  thread_act_array_t threads = NULL;
+  mach_msg_type_number_t count = 0;
+  kern_return_t kr = task_threads(mach_task_self(), &threads, &count);
+  if (kr != KERN_SUCCESS || threads == NULL || count == 0) {
+    return;
+  }
+
+  thread_t self = mach_thread_self();
+  thread_t *kept = (thread_t *)calloc((size_t)count, sizeof(thread_t));
+  if (kept == NULL) {
+    for (mach_msg_type_number_t i = 0; i < count; i++) {
+      mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(),
+                  (vm_address_t)(uintptr_t)threads,
+                  (vm_size_t)((size_t)count * sizeof(thread_t)));
+    mach_port_deallocate(mach_task_self(), self);
+    return;
+  }
+
+  mach_msg_type_number_t kept_count = 0;
+  for (mach_msg_type_number_t i = 0; i < count; i++) {
+    thread_t t = threads[i];
+    if (t == self) {
+      mach_port_deallocate(mach_task_self(), t);
+      continue;
+    }
+    if (thread_suspend(t) == KERN_SUCCESS) {
+      kept[kept_count++] = t; // keep send right for later resume
+    } else {
+      mach_port_deallocate(mach_task_self(), t);
+    }
+  }
+
+  vm_deallocate(mach_task_self(),
+                (vm_address_t)(uintptr_t)threads,
+                (vm_size_t)((size_t)count * sizeof(thread_t)));
+  mach_port_deallocate(mach_task_self(), self);
+
+  g_suspended_threads.threads = kept;
+  g_suspended_threads.count = kept_count;
+}
+
+static void xniff_resume_suspended_threads(void) {
+  if (g_suspended_threads.threads == NULL) return;
+  for (mach_msg_type_number_t i = 0; i < g_suspended_threads.count; i++) {
+    thread_t t = g_suspended_threads.threads[i];
+    if (t == MACH_PORT_NULL) continue;
+    (void)thread_resume(t);
+    mach_port_deallocate(mach_task_self(), t);
+  }
+  free(g_suspended_threads.threads);
+  g_suspended_threads.threads = NULL;
+  g_suspended_threads.count = 0;
 }
 
 static inline void xniff_read_args_u64(GumInvocationContext *ic, uint64_t out[8]) {
@@ -432,31 +497,25 @@ static gboolean xniff_attach_event_handler_hook_locked(void) {
   return FALSE;
 }
 
-static void *xniff_event_handler_retry_thread(void *arg) {
-  (void)arg;
-  // Retry for ~60s in case libxpc symbols appear after constructor-time injection.
-  for (int i = 0; i < 600; i++) {
-    if (g_interceptor == NULL || g_listener == NULL) break;
-
+static void xniff_attach_all_hooks_blocking(void) {
+  for (int i = 0;; i++) {
     pthread_mutex_lock(&g_attach_mutex);
     gum_interceptor_begin_transaction(g_interceptor);
     gboolean ok = xniff_attach_all_core_hooks_locked();
+    guint pending = xniff_count_pending_hooks();
     gum_interceptor_end_transaction(g_interceptor);
     pthread_mutex_unlock(&g_attach_mutex);
     if (ok) {
-      xniff_hooks_debug_log("hook retry: all hooks attached");
-      return NULL;
+      if (i != 0) {
+        xniff_hooks_debug_log("hook install: all hooks attached after %d retries", i);
+      }
+      return;
     }
-    if (i < 10 || (i % 20) == 19 || i == 599) {
-      xniff_hooks_debug_log("hook retry: attempt %d pending_hooks=%u", i + 1, xniff_count_pending_hooks());
+    if (i < 10 || (i % 20) == 19) {
+      xniff_hooks_debug_log("hook install: waiting for hooks (pending=%u, retries=%d)", pending, i + 1);
     }
-    usleep(100 * 1000);
+    usleep(50 * 1000);
   }
-  guint pending = xniff_count_pending_hooks();
-  if (pending != 0) {
-    xniff_hooks_debug_log("hook retry: gave up with pending_hooks=%u", pending);
-  }
-  return NULL;
 }
 
 static void xniff_install_hooks_once(void) {
@@ -465,28 +524,16 @@ static void xniff_install_hooks_once(void) {
 
   g_interceptor = gum_interceptor_obtain();
   g_listener = g_object_new(XNIFF_TYPE_LISTENER, NULL);
-
-  pthread_mutex_lock(&g_attach_mutex);
-  gum_interceptor_begin_transaction(g_interceptor);
-  gboolean all_attached = xniff_attach_all_core_hooks_locked();
-  gum_interceptor_end_transaction(g_interceptor);
-  pthread_mutex_unlock(&g_attach_mutex);
-
-  if (!all_attached) {
-    xniff_hooks_debug_log("xniff_install_hooks_once: deferred attach pending_hooks=%u", xniff_count_pending_hooks());
-    pthread_t t;
-    if (pthread_create(&t, NULL, xniff_event_handler_retry_thread, NULL) == 0) {
-      (void)pthread_detach(t);
-    }
-  }
-
+  xniff_attach_all_hooks_blocking();
   xniff_hooks_debug_log("xniff_install_hooks_once: done");
 }
 
 __attribute__((constructor)) static void xniff_frida_gum_ctor(void) {
   xniff_hooks_debug_log("ctor: entered");
-  xniff_hooks_debug_log("ctor: running install inline");
+  xniff_suspend_all_other_threads();
   (void)pthread_once(&g_once, xniff_install_hooks_once);
+  xniff_resume_suspended_threads();
+  xniff_hooks_debug_log("ctor: all hooks attached; resumed halted threads");
 }
 
 __attribute__((destructor)) static void xniff_frida_gum_dtor(void) {
