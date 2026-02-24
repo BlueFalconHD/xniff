@@ -55,13 +55,9 @@ typedef struct {
     uint8_t data[XNIFF_IPC_RING_CAPACITY];
 } xniff_ipc_ring_t;
 
-#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
 _Static_assert(offsetof(xniff_ipc_ring_t, data) == sizeof(xniff_ipc_ring_hdr_t),
                "ring header must be contiguous with data");
-#endif
 
-// Exported from the injected hooks image; the CLI resolves this symbol in-target
-// and polls it via mach_vm_read_overwrite / mach_vm_write.
 extern xniff_ipc_ring_t xniff_ipc_ring;
 
 // Guard against accidental struct packing/ABI mismatches between components.
@@ -111,6 +107,7 @@ typedef struct {
 
 // High-level XPC hook payload. Followed by up to 4 byte strings (not NUL-terminated)
 // in this order: str0, str1, str2, str3 (lengths below). Interpretation depends on func.
+// Optional extension TLVs may follow the 4 strings.
 typedef struct {
     uint32_t api;          // XNIFF_API_XPC_HL
     uint32_t direction;    // XNIFF_DIR_*
@@ -143,6 +140,8 @@ typedef struct {
 enum {
     XNIFF_TLV_OOL_DATA  = 1, // value: xniff_ool_data_t + bytes
     XNIFF_TLV_OOL_PORTS = 2, // value: xniff_ool_ports_t + bytes
+    // value: xniff_xpc_serialized_t + bytes
+    XNIFF_TLV_XPC_SERIALIZED = 0x100,
 };
 
 typedef struct {
@@ -160,6 +159,25 @@ typedef struct {
     uint32_t elem_size;    // sizeof(mach_port_t)
     uint32_t reserved;     // align
 } xniff_ool_ports_t;
+
+typedef struct {
+    uint8_t slot;          // XNIFF_XPC_SERIAL_SLOT_*
+    uint8_t format;        // XNIFF_XPC_SERIAL_FORMAT_*
+    uint16_t flags;        // bit0: value was truncated to stored_len
+    uint32_t original_len; // serializer output size before truncation
+    uint32_t stored_len;   // byte length of serialized bytes that follow
+} xniff_xpc_serialized_t;
+
+enum {
+    XNIFF_XPC_SERIAL_SLOT_MESSAGE = 1,
+    XNIFF_XPC_SERIAL_SLOT_REPLY   = 2,
+    XNIFF_XPC_SERIAL_SLOT_EVENT   = 3,
+};
+
+enum {
+    // Output of private libxpc xpc_make_serialization() (version 5 container).
+    XNIFF_XPC_SERIAL_FORMAT_LIBXPC_V5 = 1,
+};
 
 // Payload for XNIFF_EVT_DEBUG_LOG, followed by msg_len bytes (not NUL-terminated).
 typedef struct {

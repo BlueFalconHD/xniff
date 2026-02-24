@@ -22,8 +22,3 @@ to run:
 ```
 sudo build/xniff-cli sniff-xpc-wait com.apple.Virtualization.VirtualMachine build/libxniff-hooks.dylib --jsonl --xpc > out.json
 ```
-
-4) run one-command stress test + summary
-```
-sudo scripts/xpc_stress_harness.py --workers 6 --threads 8 --duration 30 --mode xpc
-```

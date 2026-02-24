@@ -188,6 +188,27 @@ def _xpc_hl_parts(ev: Dict[str, Any]) -> List[str]:
                 continue
             parts.append(f"arg.{k}: {v}")
 
+    serialized = xpc.get("serialized")
+    if isinstance(serialized, dict):
+        for slot in ("message", "reply", "event"):
+            ent = serialized.get(slot)
+            if not isinstance(ent, dict):
+                continue
+            fmt = ent.get("format")
+            stored_len = _as_int(ent.get("stored_len"), 0)
+            original_len = _as_int(ent.get("original_len"), 0)
+            trunc = bool(ent.get("truncated", False))
+            hdr = f"serialized.{slot}: format={fmt} stored={stored_len} original={original_len}"
+            if trunc:
+                hdr += " truncated=true"
+            parts.append(hdr)
+            pretty = ent.get("pretty")
+            if isinstance(pretty, str) and pretty:
+                if "\n" in pretty:
+                    parts.append(f"serialized.{slot}.pretty:\n{pretty}")
+                else:
+                    parts.append(f"serialized.{slot}.pretty: {pretty}")
+
     return parts
 
 

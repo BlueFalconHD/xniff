@@ -503,6 +503,23 @@ typedef struct {
     const char *peer_name;
 } xniff_xpc_analysis_t;
 
+typedef struct {
+    bool present;
+    uint8_t slot;
+    uint8_t format;
+    uint16_t flags;
+    uint32_t original_len;
+    uint32_t stored_len;
+    const uint8_t *bytes;
+    char *pretty;
+} xniff_xpc_serial_item_t;
+
+typedef struct {
+    xniff_xpc_serial_item_t message;
+    xniff_xpc_serial_item_t reply;
+    xniff_xpc_serial_item_t event;
+} xniff_xpc_serialized_set_t;
+
 static xniff_conn_meta_t *g_conn_meta = NULL;
 
 static bool str_nonempty(const char *s) {
@@ -678,6 +695,128 @@ static void json_write_hex_u64(FILE *out, uint64_t v) {
     char buf[32];
     snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)v);
     json_write_escaped(out, buf);
+}
+
+static uint32_t u32le_at(const uint8_t *p) {
+    if (!p) return 0;
+    return ((uint32_t)p[0]) |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static const char *xpc_serial_slot_name(uint8_t slot) {
+    switch (slot) {
+        case XNIFF_XPC_SERIAL_SLOT_MESSAGE: return "message";
+        case XNIFF_XPC_SERIAL_SLOT_REPLY:   return "reply";
+        case XNIFF_XPC_SERIAL_SLOT_EVENT:   return "event";
+    }
+    return "unknown";
+}
+
+static const char *xpc_serial_format_name(uint8_t format) {
+    switch (format) {
+        case XNIFF_XPC_SERIAL_FORMAT_LIBXPC_V5: return "libxpc_v5";
+    }
+    return "unknown";
+}
+
+static char *xpc_serial_pretty_from_blob(const uint8_t *bytes, size_t len, uint8_t format) {
+    if (!bytes || len < 4) return NULL;
+
+    const uint8_t *obj = bytes;
+    size_t obj_len = len;
+    bool parsed = false;
+
+    if (format == XNIFF_XPC_SERIAL_FORMAT_LIBXPC_V5) {
+        if (len >= 8 && u32le_at(bytes) == 0x42133742u && u32le_at(bytes + 4) == 5u) {
+            obj = bytes + 8;
+            obj_len = len - 8;
+        }
+    }
+
+    xpcd_object_t *root = xpcd_parse(obj, obj_len);
+    if (!root && format == XNIFF_XPC_SERIAL_FORMAT_LIBXPC_V5) {
+        size_t off = 0;
+        if (xpcd_find_payload(bytes, len, 512, &off) == 0 && off < len) {
+            root = xpcd_parse(bytes + off, len - off);
+            parsed = true;
+        }
+    }
+    if (!root && !parsed) {
+        size_t off = 0;
+        if (xpcd_find_payload(obj, obj_len, 512, &off) == 0 && off < obj_len) {
+            root = xpcd_parse(obj + off, obj_len - off);
+        }
+    }
+    if (!root) return NULL;
+    char *pretty = xpcd_format(root);
+    xpcd_free(root);
+    return pretty;
+}
+
+static xniff_xpc_serial_item_t *xpc_serial_item_for_slot(xniff_xpc_serialized_set_t *xs, uint8_t slot) {
+    if (!xs) return NULL;
+    switch (slot) {
+        case XNIFF_XPC_SERIAL_SLOT_MESSAGE: return &xs->message;
+        case XNIFF_XPC_SERIAL_SLOT_REPLY:   return &xs->reply;
+        case XNIFF_XPC_SERIAL_SLOT_EVENT:   return &xs->event;
+    }
+    return NULL;
+}
+
+static void xpc_serialized_init(xniff_xpc_serialized_set_t *xs) {
+    if (!xs) return;
+    memset(xs, 0, sizeof(*xs));
+}
+
+static void xpc_serialized_free(xniff_xpc_serialized_set_t *xs) {
+    if (!xs) return;
+    if (xs->message.pretty) free(xs->message.pretty);
+    if (xs->reply.pretty) free(xs->reply.pretty);
+    if (xs->event.pretty) free(xs->event.pretty);
+    memset(xs, 0, sizeof(*xs));
+}
+
+static void xpc_serialized_parse_tlvs(const uint8_t *buf, size_t total, size_t off, xniff_xpc_serialized_set_t *xs) {
+    if (!buf || !xs) return;
+    while (off + sizeof(xniff_ipc_tlv_t) <= total) {
+        xniff_ipc_tlv_t tlv = {0};
+        memcpy(&tlv, buf + off, sizeof(tlv));
+        off += sizeof(tlv);
+        if (off + tlv.length > total) break;
+        const uint8_t *val = buf + off;
+        size_t val_len = tlv.length;
+
+        if (tlv.type == XNIFF_TLV_XPC_SERIALIZED && val_len >= sizeof(xniff_xpc_serialized_t)) {
+            xniff_xpc_serialized_t md = {0};
+            memcpy(&md, val, sizeof(md));
+            if (md.stored_len > UINT32_MAX - (uint32_t)sizeof(md)) {
+                off += val_len;
+                continue;
+            }
+            size_t bytes_avail = val_len - sizeof(md);
+            size_t stored = md.stored_len;
+            if (stored > bytes_avail) stored = bytes_avail;
+
+            xniff_xpc_serial_item_t *dst = xpc_serial_item_for_slot(xs, md.slot);
+            if (dst) {
+                dst->present = true;
+                dst->slot = md.slot;
+                dst->format = md.format;
+                dst->flags = md.flags;
+                dst->original_len = md.original_len;
+                dst->stored_len = (uint32_t)stored;
+                dst->bytes = val + sizeof(md);
+                if (dst->pretty) { free(dst->pretty); dst->pretty = NULL; }
+                if (g_listener_opts.parse_xpc) {
+                    dst->pretty = xpc_serial_pretty_from_blob(dst->bytes, stored, dst->format);
+                }
+            }
+        }
+
+        off += val_len;
+    }
 }
 
 typedef struct {
@@ -1009,6 +1148,54 @@ static void jsonl_write_xpc_named_args(uint32_t func, const uint64_t args[8]) {
     fputc('}', stdout);
 }
 
+static void jsonl_write_xpc_serial_item(const xniff_xpc_serial_item_t *it) {
+    if (!it || !it->present) {
+        fputs("null", stdout);
+        return;
+    }
+    fputc('{', stdout);
+    fputs("\"slot\":", stdout); json_write_escaped(stdout, xpc_serial_slot_name(it->slot)); fputc(',', stdout);
+    fputs("\"format\":", stdout); json_write_escaped(stdout, xpc_serial_format_name(it->format)); fputc(',', stdout);
+    fputs("\"format_id\":", stdout); fprintf(stdout, "%u,", (unsigned)it->format);
+    fputs("\"flags\":", stdout); fprintf(stdout, "%u,", (unsigned)it->flags);
+    fputs("\"truncated\":", stdout); fputs((it->flags & 1u) ? "true," : "false,", stdout);
+    fputs("\"original_len\":", stdout); fprintf(stdout, "%u,", it->original_len);
+    fputs("\"stored_len\":", stdout); fprintf(stdout, "%u,", it->stored_len);
+    fputs("\"wire_hex\":", stdout);
+    if (it->bytes && it->stored_len) json_write_hex(stdout, it->bytes, it->stored_len);
+    else fputs("\"\"", stdout);
+    fputs(",\"pretty\":", stdout);
+    if (it->pretty) json_write_escaped(stdout, it->pretty); else fputs("null", stdout);
+    fputc('}', stdout);
+}
+
+static void jsonl_write_xpc_serialized(const xniff_xpc_serialized_set_t *xs) {
+    fputc('{', stdout);
+    fputs("\"message\":", stdout);
+    if (xs) jsonl_write_xpc_serial_item(&xs->message); else fputs("null", stdout);
+    fputs(",\"reply\":", stdout);
+    if (xs) jsonl_write_xpc_serial_item(&xs->reply); else fputs("null", stdout);
+    fputs(",\"event\":", stdout);
+    if (xs) jsonl_write_xpc_serial_item(&xs->event); else fputs("null", stdout);
+    fputc('}', stdout);
+}
+
+static void print_xpc_serial_item(const xniff_xpc_serial_item_t *it) {
+    if (!it || !it->present) return;
+    printf("  xpc.serialized.%s: format=%s(%u) stored=%u original=%u%s\n",
+           xpc_serial_slot_name(it->slot),
+           xpc_serial_format_name(it->format),
+           (unsigned)it->format,
+           it->stored_len,
+           it->original_len,
+           (it->flags & 1u) ? " truncated" : "");
+    if (it->pretty) {
+        printf("  xpc.serialized.%s.pretty: %s\n",
+               xpc_serial_slot_name(it->slot),
+               it->pretty);
+    }
+}
+
 static void print_xpc_string_fields(uint16_t kind, uint32_t func,
                                     const char *s0, const char *s1,
                                     const char *s2, const char *s3) {
@@ -1054,6 +1241,7 @@ static void jsonl_print_xpc_event(
     const xniff_ipc_hdr_t *ihdr,
     const xniff_ipc_xpc_payload_t *pl,
     const xniff_xpc_analysis_t *xa,
+    const xniff_xpc_serialized_set_t *xs,
     const char *s0,
     const char *s1,
     const char *s2,
@@ -1106,6 +1294,7 @@ static void jsonl_print_xpc_event(
     fputs("],", stdout);
     fputs("\"args_named\":", stdout); jsonl_write_xpc_named_args(pl->func, pl->args); fputc(',', stdout);
     fputs("\"string_fields\":", stdout); jsonl_write_xpc_string_fields(ihdr->kind, pl->func, s0, s1, s2, s3); fputc(',', stdout);
+    fputs("\"serialized\":", stdout); jsonl_write_xpc_serialized(xs); fputc(',', stdout);
     fputs("\"str0\":", stdout); if (s0) json_write_escaped(stdout, s0); else fputs("null", stdout);
     fputs(",\"str1\":", stdout); if (s1) json_write_escaped(stdout, s1); else fputs("null", stdout);
     fputs(",\"str2\":", stdout); if (s2) json_write_escaped(stdout, s2); else fputs("null", stdout);
@@ -1120,6 +1309,7 @@ static void print_xpc_event(
     const xniff_ipc_hdr_t *ihdr,
     const xniff_ipc_xpc_payload_t *pl,
     const xniff_xpc_analysis_t *xa,
+    const xniff_xpc_serialized_set_t *xs,
     const char *s0,
     const char *s1,
     const char *s2,
@@ -1151,6 +1341,11 @@ static void print_xpc_event(
     printf("  xpc.ret: 0x%llx\n", (unsigned long long)pl->ret_value);
     print_xpc_named_args(pl->func, pl->args);
     print_xpc_string_fields(ihdr->kind, pl->func, s0, s1, s2, s3);
+    if (xs) {
+        print_xpc_serial_item(&xs->message);
+        print_xpc_serial_item(&xs->reply);
+        print_xpc_serial_item(&xs->event);
+    }
 }
 
 static void print_event(int kind, const xniff_ipc_mach_payload_t *pl, const uint8_t *msg_bytes, size_t msg_len) {
@@ -1441,6 +1636,9 @@ static int cmd_listen(pid_t pid) {
                     char *s1 = wire_copy_str(buf, hdr.payload_len, &off, pl->str1_len);
                     char *s2 = wire_copy_str(buf, hdr.payload_len, &off, pl->str2_len);
                     char *s3 = wire_copy_str(buf, hdr.payload_len, &off, pl->str3_len);
+                    xniff_xpc_serialized_set_t xser;
+                    xpc_serialized_init(&xser);
+                    xpc_serialized_parse_tlvs(buf, hdr.payload_len, off, &xser);
 
                     bool is_entry = (hdr.kind == XNIFF_EVT_XPC_ENTRY);
                     bool is_exit = (hdr.kind == XNIFF_EVT_XPC_EXIT);
@@ -1460,10 +1658,11 @@ static int cmd_listen(pid_t pid) {
 
                     if (g_listener_opts.jsonl) {
                         jsonl_print_xpc_event(cur_evt_id, call_id, entry_evt_id, &hdr, pl,
-                                              &xa, s0, s1, s2, s3, tbuf, mono_s);
+                                              &xa, &xser, s0, s1, s2, s3, tbuf, mono_s);
                     } else {
-                        print_xpc_event(&hdr, pl, &xa, s0, s1, s2, s3, tbuf, mono_s);
+                        print_xpc_event(&hdr, pl, &xa, &xser, s0, s1, s2, s3, tbuf, mono_s);
                     }
+                    xpc_serialized_free(&xser);
                     free(s0);
                     free(s1);
                     free(s2);
