@@ -7,6 +7,7 @@
 
 #include "../shared/xniff_ipc.h"
 #include "../shared/xniff_ipc_v2.h"
+#include "xpc_reply_tracker.h"
 
 static int selftest_ipc_ring(void) {
     const uint8_t payload[] = {0xde, 0xad, 0xbe, 0xef, 0x42};
@@ -126,6 +127,26 @@ static int selftest_v2_call_id(void) {
     return 0;
 }
 
+static int selftest_xpc_reply_tracker(void) {
+    const uint64_t context = 0x12345000;
+    uint64_t actual = 0;
+
+    xniff_xpc_reply_tracker_clear();
+    bool passed = !xniff_xpc_reply_tracker_record(0, 17) &&
+                  xniff_xpc_reply_tracker_record(context, 17) &&
+                  xniff_xpc_reply_tracker_record(context, 18) &&
+                  xniff_xpc_reply_tracker_take(context, &actual) &&
+                  actual == 18 &&
+                  !xniff_xpc_reply_tracker_take(context, &actual);
+    xniff_xpc_reply_tracker_clear();
+    if (!passed) {
+        fprintf(stderr, "FAIL: XPC reply tracker did not preserve and consume correlation\n");
+        return 1;
+    }
+    printf("OK: XPC reply tracker correlation validated\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (getenv("XNIFF_TEST_IPC_RING")) return selftest_ipc_ring();
 
@@ -133,6 +154,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--ipc-ring") == 0) return selftest_ipc_ring();
         if (strcmp(argv[i], "--ipc-drop") == 0) return selftest_ipc_drop();
         if (strcmp(argv[i], "--v2-call-id") == 0) return selftest_v2_call_id();
+        if (strcmp(argv[i], "--xpc-reply-tracker") == 0) return selftest_xpc_reply_tracker();
     }
 
     printf("xniff-test: no tests selected (try --ipc-ring)\n");

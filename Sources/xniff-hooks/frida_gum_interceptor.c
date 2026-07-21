@@ -14,6 +14,7 @@
 
 #include "xniff_hooks_emit.h"
 #include "xniff_hooks_ipc.h"
+#include "xpc_reply_tracker.h"
 #include "../shared/xniff_ipc.h"
 #include "../shared/xniff_ipc_v2.h"
 #include "../shared/xniff_capture_file.h"
@@ -38,6 +39,8 @@ enum _XniffHookId {
   XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE_WITH_REPLY,
   XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC,
   XNIFF_HOOK_XPC_CONNECTION_CALL_EVENT_HANDLER,
+  XNIFF_HOOK_XPC_CONNECTION_PACK_MESSAGE,
+  XNIFF_HOOK_XPC_CONNECTION_CALL_REPLY_ASYNC,
   XNIFF_HOOK_XPC_CONNECTION_CHECK_IN,
   XNIFF_HOOK_XPC_DICTIONARY_SEND_REPLY,
   XNIFF_HOOK_XPC_SESSION_SEND_MESSAGE,
@@ -62,7 +65,10 @@ static pthread_mutex_t g_attach_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_enter_count = 0;
 static uint64_t g_leave_count = 0;
 static gboolean g_event_handler_hook_attached = FALSE;
+static gboolean g_pack_message_hook_attached = FALSE;
+static gboolean g_call_reply_async_hook_attached = FALSE;
 static uint64_t g_next_call_id = 0;
+static __thread uint32_t g_async_connection_send_depth = 0;
 
 typedef struct {
   thread_t *threads;
@@ -80,7 +86,13 @@ typedef struct {
 
 static gboolean xniff_hook_event_handler_enabled(void);
 static gboolean xniff_attach_event_handler_hook_locked(void);
+static gboolean xniff_attach_pack_message_hook_locked(void);
+static gboolean xniff_attach_call_reply_async_hook_locked(void);
 static void xniff_attach_optional_check_in_hook_once(void);
+
+static gboolean xniff_internal_reply_hooks_ready(void) {
+  return g_pack_message_hook_attached && g_call_reply_async_hook_attached;
+}
 
 static XniffExportHookSpec g_export_hooks[] = {
   { NULL, "mach_msg", XNIFF_HOOK_MACH_MSG, FALSE },
@@ -106,6 +118,7 @@ typedef struct {
   uint64_t parent_call_id;
   void *replacement_block;
   uint8_t emit_enabled;
+  uint8_t tracks_async_reply;
 } XniffInvocationData;
 
 static void xniff_hooks_debug_log(const char *fmt, ...) {
@@ -234,10 +247,10 @@ static void xniff_install_connection_reply_wrapper(GumInvocationContext *ic,
   if (ic == NULL || inv == NULL || inv->args[3] == 0) return;
   XniffConnectionReplyHandler original = (XniffConnectionReplyHandler)(uintptr_t)inv->args[3];
   uint64_t call_id = inv->call_id;
-  uint64_t connection = inv->args[0];
-  uint64_t message = inv->args[1];
   XniffConnectionReplyHandler wrapper = Block_copy(^(xpc_object_t reply) {
-    uint64_t args[8] = { connection, message, 0, 0, 0, 0, 0, 0 };
+    // The caller may release its connection and message immediately after the
+    // send returns. Only the reply is guaranteed to be live in this fallback.
+    uint64_t args[8] = {0};
     uint64_t previous_call_id = xniff_hooks_current_call_id();
     xniff_hooks_set_current_call_id(call_id);
     xniff_ignore_current_thread();
@@ -281,6 +294,12 @@ static void xniff_release_reply_wrapper(XniffInvocationData *inv) {
   inv->replacement_block = NULL;
 }
 
+static void xniff_leave_async_reply_scope(XniffInvocationData *inv) {
+  if (inv == NULL || inv->tracks_async_reply == 0) return;
+  if (g_async_connection_send_depth != 0) g_async_connection_send_depth--;
+  inv->tracks_async_reply = 0;
+}
+
 static void xniff_listener_on_enter(GumInvocationListener *listener, GumInvocationContext *ic) {
   (void)listener;
   XniffHookId hook_id = (XniffHookId)GPOINTER_TO_SIZE(gum_invocation_context_get_listener_function_data(ic));
@@ -289,19 +308,41 @@ static void xniff_listener_on_enter(GumInvocationListener *listener, GumInvocati
   if (inv != NULL) {
     inv->parent_call_id = xniff_hooks_current_call_id();
     inv->emit_enabled = enabled ? 1u : 0u;
-    if (enabled && hook_id == XNIFF_HOOK_XPC_DICTIONARY_SEND_REPLY &&
-        inv->parent_call_id != 0) {
-      inv->call_id = inv->parent_call_id;
-    } else {
-      inv->call_id = enabled ? __atomic_add_fetch(&g_next_call_id, 1, __ATOMIC_RELAXED) : 0;
-    }
+    inv->call_id = 0;
     inv->replacement_block = NULL;
+    inv->tracks_async_reply = 0;
   }
   if (!enabled) return;
   if (inv != NULL) {
     xniff_read_args_u64(ic, inv->args);
   }
   const uint64_t *args = (inv != NULL) ? inv->args : NULL;
+
+  if ((hook_id == XNIFF_HOOK_XPC_CONNECTION_PACK_MESSAGE ||
+       hook_id == XNIFF_HOOK_XPC_CONNECTION_CALL_REPLY_ASYNC) &&
+      !xniff_internal_reply_hooks_ready()) {
+    if (inv != NULL) inv->emit_enabled = 0;
+    return;
+  }
+
+  uint64_t pending_reply_call_id = 0;
+  if (inv != NULL) {
+    if ((hook_id == XNIFF_HOOK_XPC_DICTIONARY_SEND_REPLY ||
+         hook_id == XNIFF_HOOK_XPC_CONNECTION_PACK_MESSAGE) &&
+        inv->parent_call_id != 0) {
+      inv->call_id = inv->parent_call_id;
+    } else if (hook_id == XNIFF_HOOK_XPC_CONNECTION_CALL_REPLY_ASYNC &&
+               xniff_xpc_reply_tracker_take(inv->args[1], &pending_reply_call_id)) {
+      inv->call_id = pending_reply_call_id;
+    } else {
+      inv->call_id = __atomic_add_fetch(&g_next_call_id, 1, __ATOMIC_RELAXED);
+    }
+    if (hook_id == XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE_WITH_REPLY &&
+        xniff_internal_reply_hooks_ready()) {
+      g_async_connection_send_depth++;
+      inv->tracks_async_reply = 1;
+    }
+  }
 
   uint64_t n = __atomic_add_fetch(&g_enter_count, 1, __ATOMIC_RELAXED);
   if (xniff_hooks_debug_is_enabled() && (n <= 16 || (n & 0xFFFu) == 1u)) {
@@ -331,7 +372,9 @@ static void xniff_listener_on_enter(GumInvocationListener *listener, GumInvocati
       xniff_emit_xpc_connection_send_message_entry(args);
       break;
     case XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE_WITH_REPLY:
-      xniff_install_connection_reply_wrapper(ic, inv);
+      if (!xniff_internal_reply_hooks_ready()) {
+        xniff_install_connection_reply_wrapper(ic, inv);
+      }
       xniff_emit_xpc_connection_send_message_with_reply_entry(args);
       break;
     case XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC:
@@ -340,6 +383,21 @@ static void xniff_listener_on_enter(GumInvocationListener *listener, GumInvocati
     case XNIFF_HOOK_XPC_CONNECTION_CALL_EVENT_HANDLER:
       xniff_emit_xpc_connection_call_event_handler_entry(args);
       break;
+    case XNIFF_HOOK_XPC_CONNECTION_PACK_MESSAGE:
+      break;
+    case XNIFF_HOOK_XPC_CONNECTION_CALL_REPLY_ASYNC: {
+      // The decoded reply and connection are live here. The original message
+      // was captured on entry and may already have been released by its caller.
+      uint64_t response_args[8] = {
+        args[0],
+        0,
+        args[1],
+        0, 0, 0, 0, 0,
+      };
+      xniff_emit_xpc_connection_send_message_with_reply_async_response(args[2],
+                                                                        response_args);
+      break;
+    }
     case XNIFF_HOOK_XPC_CONNECTION_CHECK_IN:
       xniff_emit_xpc_connection_check_in_entry(args);
       break;
@@ -367,9 +425,13 @@ static void xniff_listener_on_leave(GumInvocationListener *listener, GumInvocati
   (void)listener;
   XniffHookId hook_id = (XniffHookId)GPOINTER_TO_SIZE(gum_invocation_context_get_listener_function_data(ic));
   XniffInvocationData *inv = GUM_IC_GET_INVOCATION_DATA(ic, XniffInvocationData);
-  if (inv != NULL && inv->emit_enabled == 0) return;
+  if (inv != NULL && inv->emit_enabled == 0) {
+    xniff_leave_async_reply_scope(inv);
+    return;
+  }
   if (!xniff_hook_capture_enabled(hook_id)) {
     xniff_release_reply_wrapper(inv);
+    xniff_leave_async_reply_scope(inv);
     xniff_hooks_set_current_call_id(inv != NULL ? inv->parent_call_id : 0);
     return;
   }
@@ -411,6 +473,16 @@ static void xniff_listener_on_leave(GumInvocationListener *listener, GumInvocati
       break;
     case XNIFF_HOOK_XPC_CONNECTION_CALL_EVENT_HANDLER:
       break;
+    case XNIFF_HOOK_XPC_CONNECTION_PACK_MESSAGE:
+      // arg2 is the newly allocated async reply port; the return value is the
+      // serializer later supplied as arg1 to call_reply_async.
+      if (g_async_connection_send_depth != 0 && args[2] != 0 && ret != 0 &&
+          inv != NULL && inv->call_id != 0) {
+        (void)xniff_xpc_reply_tracker_record(ret, inv->call_id);
+      }
+      break;
+    case XNIFF_HOOK_XPC_CONNECTION_CALL_REPLY_ASYNC:
+      break;
     case XNIFF_HOOK_XPC_CONNECTION_CHECK_IN:
       xniff_emit_xpc_connection_check_in_exit(ret, args);
       break;
@@ -425,6 +497,7 @@ static void xniff_listener_on_leave(GumInvocationListener *listener, GumInvocati
   xniff_unignore_current_thread();
   xniff_hooks_set_current_call_id(inv != NULL ? inv->parent_call_id : 0);
   xniff_release_reply_wrapper(inv);
+  xniff_leave_async_reply_scope(inv);
 }
 
 static void xniff_listener_class_init(XniffListenerClass *klass) {
@@ -615,6 +688,8 @@ static gboolean xniff_attach_all_core_hooks_locked(void) {
   if (xniff_hook_event_handler_enabled() && !xniff_attach_event_handler_hook_locked()) {
     all_attached = FALSE;
   }
+  if (!xniff_attach_pack_message_hook_locked()) all_attached = FALSE;
+  if (!xniff_attach_call_reply_async_hook_locked()) all_attached = FALSE;
   return all_attached;
 }
 
@@ -624,6 +699,8 @@ static guint xniff_count_pending_hooks(void) {
     if (!g_export_hooks[i].attached) pending++;
   }
   if (xniff_hook_event_handler_enabled() && !g_event_handler_hook_attached) pending++;
+  if (!g_pack_message_hook_attached) pending++;
+  if (!g_call_reply_async_hook_attached) pending++;
   return pending;
 }
 
@@ -655,6 +732,30 @@ static gboolean xniff_attach_event_handler_hook_locked(void) {
                                                XNIFF_HOOK_XPC_CONNECTION_CALL_EVENT_HANDLER)) {
     g_event_handler_hook_attached = TRUE;
     xniff_hooks_debug_log("event-handler hook: attached");
+    return TRUE;
+  }
+  return FALSE;
+}
+
+static gboolean xniff_attach_pack_message_hook_locked(void) {
+  if (g_pack_message_hook_attached) return TRUE;
+  if (g_interceptor == NULL || g_listener == NULL) return FALSE;
+  if (xniff_attach_private_function_if_present("libxpc", "_xpc_connection_pack_message",
+                                               XNIFF_HOOK_XPC_CONNECTION_PACK_MESSAGE)) {
+    g_pack_message_hook_attached = TRUE;
+    xniff_hooks_debug_log("reply-context hook: attached pack-message");
+    return TRUE;
+  }
+  return FALSE;
+}
+
+static gboolean xniff_attach_call_reply_async_hook_locked(void) {
+  if (g_call_reply_async_hook_attached) return TRUE;
+  if (g_interceptor == NULL || g_listener == NULL) return FALSE;
+  if (xniff_attach_private_function_if_present("libxpc", "_xpc_connection_call_reply_async",
+                                               XNIFF_HOOK_XPC_CONNECTION_CALL_REPLY_ASYNC)) {
+    g_call_reply_async_hook_attached = TRUE;
+    xniff_hooks_debug_log("reply-context hook: attached call-reply-async");
     return TRUE;
   }
   return FALSE;

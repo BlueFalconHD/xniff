@@ -132,15 +132,18 @@ file(GLOB XNIFF_TEST_SOURCES CONFIGURE_DEPENDS
 
 add_executable(xniff-test
     ${XNIFF_TEST_SOURCES}
+    ${PROJECT_SOURCE_DIR}/Sources/xniff-hooks/xpc_reply_tracker.c
     ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_capture_file.c
     ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_ipc.c
     ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_ipc_v2.c)
 target_link_libraries(xniff-test PRIVATE)
 target_include_directories(xniff-test PRIVATE
+    ${PROJECT_SOURCE_DIR}/Sources/xniff-hooks
     ${PROJECT_SOURCE_DIR}/Sources/shared)
 add_test(NAME xniff-ipc-ring COMMAND xniff-test --ipc-ring)
 add_test(NAME xniff-ipc-drop COMMAND xniff-test --ipc-drop)
 add_test(NAME xniff-v2-call-id COMMAND xniff-test --v2-call-id)
+add_test(NAME xniff-xpc-reply-tracker COMMAND xniff-test --xpc-reply-tracker)
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
