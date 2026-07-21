@@ -627,24 +627,6 @@ void xniff_emit_xpc_connection_call_event_handler_entry(const uint64_t args[8]) 
     if (has_blob) xniff_xpc_serial_blob_free(&blob);
 }
 
-void xniff_emit_xpc_connection_call_event_handler_exit(uint64_t ret, const uint64_t args[8]) {
-    xniff_ipc_xpc_payload_t pl;
-    pl_init_from_args(&pl, XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER, XNIFF_DIR_EXIT, ret, args);
-    xpc_connection_t conn = (xpc_connection_t)(uintptr_t)(args ? args[0] : 0);
-    xpc_object_t event = (xpc_object_t)(uintptr_t)(args ? args[1] : 0);
-    xniff_xpc_conn_meta_capture_t conn_meta;
-    bool has_conn_meta = xniff_capture_xpc_conn_meta(conn, &conn_meta);
-    if (has_conn_meta && (conn_meta.md.flags & XNIFF_XPC_CONN_META_HAS_PID_PUBLIC)) {
-        pl.conn_pid = conn_meta.md.pid_public;
-    }
-    xniff_xpc_serial_blob_t blob;
-    bool has_blob = xniff_capture_xpc_serialized(event, XNIFF_XPC_SERIAL_SLOT_EVENT, &blob);
-    ipc_send_xpc_event_ex(XNIFF_EVT_XPC_EXIT, &pl, NULL, 0, NULL, 0, NULL, 0, NULL, 0,
-                          has_blob ? &blob : NULL, has_blob ? 1u : 0u,
-                          has_conn_meta ? &conn_meta : NULL);
-    if (has_blob) xniff_xpc_serial_blob_free(&blob);
-}
-
 static void send_connection_meta_event_args(uint16_t kind, uint32_t direction, uint32_t func, uint64_t ret, const uint64_t args[8]) {
     xpc_connection_t conn = (xpc_connection_t)(uintptr_t)(args ? args[0] : 0);
     xniff_xpc_conn_meta_capture_t conn_meta;

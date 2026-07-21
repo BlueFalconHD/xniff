@@ -27,7 +27,6 @@ void xniff_emit_xpc_connection_send_message_with_reply_async_response(uint64_t r
 void xniff_emit_xpc_connection_send_message_with_reply_sync_entry(const uint64_t args[8]);
 void xniff_emit_xpc_connection_send_message_with_reply_sync_exit(uint64_t ret, const uint64_t args[8]);
 void xniff_emit_xpc_connection_call_event_handler_entry(const uint64_t args[8]);
-void xniff_emit_xpc_connection_call_event_handler_exit(uint64_t ret, const uint64_t args[8]);
 void xniff_emit_xpc_connection_check_in_entry(const uint64_t args[8]);
 void xniff_emit_xpc_connection_check_in_exit(uint64_t ret, const uint64_t args[8]);
 void xniff_emit_xpc_dictionary_send_reply_entry(const uint64_t args[8]);

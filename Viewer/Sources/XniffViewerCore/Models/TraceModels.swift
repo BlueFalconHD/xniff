@@ -246,8 +246,13 @@ public struct TraceCall: Sendable, Identifiable, Hashable {
     }
 
     public var response: TraceEvent? {
-        events.first { $0.role == .response }
-            ?? events.last { $0.direction == .exit && $0.id != request?.id }
+        if let response = events.first(where: { $0.role == .response }) {
+            return response
+        }
+        if let request, [.incoming, .oneWay].contains(request.role) {
+            return nil
+        }
+        return events.last { $0.direction == .exit && $0.id != request?.id }
     }
 
     public var primaryEvent: TraceEvent { request ?? response ?? events[0] }
