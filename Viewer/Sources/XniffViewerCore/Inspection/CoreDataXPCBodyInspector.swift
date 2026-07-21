@@ -29,14 +29,20 @@ public struct CoreDataXPCBodyInspector: TraceBodyInspector {
         if let code = message.code {
             details.append(BodyInspectionDetail("Message code", value: String(code)))
         }
-        if let pinningMode = message.pinningMode {
-            details.append(BodyInspectionDetail("Pinning", value: pinningMode))
-        }
         if let token = message.token {
             details.append(BodyInspectionDetail("Token", value: token))
         }
+        if let contextName = message.contextName {
+            details.append(BodyInspectionDetail("Context", value: contextName))
+        }
+        if let transactionAuthor = message.transactionAuthor {
+            details.append(BodyInspectionDetail("Transaction author", value: transactionAuthor))
+        }
         if let processName = message.processName {
             details.append(BodyInspectionDetail("Process", value: processName))
+        }
+        if message.allowsAncillaryEntities {
+            details.append(BodyInspectionDetail("Ancillary entities", value: "Allowed"))
         }
         return details
     }
