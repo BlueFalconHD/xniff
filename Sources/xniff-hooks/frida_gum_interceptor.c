@@ -17,7 +17,6 @@
 #include "xpc_reply_tracker.h"
 #include "../shared/xniff_ipc.h"
 #include "../shared/xniff_ipc_v2.h"
-#include "../shared/xniff_capture_file.h"
 
 typedef struct _XniffListener XniffListener;
 typedef enum _XniffHookId XniffHookId;
@@ -809,8 +808,6 @@ static void xniff_install_hooks_once(void) {
 
 __attribute__((constructor)) static void xniff_frida_gum_ctor(void) {
   xniff_hooks_configure_capture_mode_from_environment();
-  /* Materialize direct captures even when the target makes no matching calls. */
-  (void)xniff_capture_file_is_configured();
   xniff_hooks_set_streaming_enabled(false);
   xniff_suspend_all_other_threads();
   (void)pthread_once(&g_once, xniff_install_hooks_once);

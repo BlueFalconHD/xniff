@@ -1560,14 +1560,13 @@ static int install_hooks(pid_t pid, const char *dylib_path, int mode) {
 }
 
 static int spawn_suspended_target(char *const launch_argv[], const char *hooks_path,
-                                  int mode, const char *capture_file, pid_t *out_pid) {
+                                  int mode, pid_t *out_pid) {
     if (!launch_argv || !launch_argv[0] || !hooks_path || !out_pid) {
         errno = EINVAL;
         return -1;
     }
     xniff_launch_environment_t launch_environment;
-    if (xniff_launch_environment_create(hooks_path, mode, capture_file,
-                                        &launch_environment) != 0) {
+    if (xniff_launch_environment_create(hooks_path, mode, &launch_environment) != 0) {
         errno = ENOMEM;
         return -1;
     }
@@ -1713,51 +1712,14 @@ static int cmd_attach(pid_t pid, const char *dylib_path, int mode) {
 }
 
 static int cmd_launch(const char *dylib_path, int mode, char *const launch_argv[]) {
-    const char *direct_capture = NULL;
-    if (g_listener_opts.out_bin && strcmp(g_listener_opts.out_bin_path, "-") != 0) {
-        direct_capture = g_listener_opts.out_bin_path;
-        (void)unlink(direct_capture);
-    }
     pid_t pid = 0;
-    if (spawn_suspended_target(launch_argv, dylib_path, mode, direct_capture, &pid) != 0) {
+    if (spawn_suspended_target(launch_argv, dylib_path, mode, &pid) != 0) {
         fprintf(stderr, "launch: failed to spawn suspended target '%s': %s\n",
                 launch_argv && launch_argv[0] ? launch_argv[0] : "(null)", strerror(errno));
         return -1;
     }
 
     XNIFF_DIAGF("launch: spawned suspended pid %d (%s)\n", (int)pid, launch_argv[0]);
-    if (direct_capture) {
-        if (continue_traced_target(pid, 0) != 0) {
-            fprintf(stderr, "launch: failed to resume target: %s\n", strerror(errno));
-            (void)kill(pid, SIGKILL);
-            (void)waitpid(pid, NULL, 0);
-            return -1;
-        }
-        int status = 0;
-        for (;;) {
-            pid_t wait_result = waitpid(pid, &status, 0);
-            if (wait_result < 0) {
-                if (errno == EINTR) continue;
-                return -1;
-            }
-            if (!WIFSTOPPED(status)) break;
-            if (continue_after_trace_stop(pid, status) != 0) {
-                fprintf(stderr, "launch: failed to continue target: %s\n", strerror(errno));
-                (void)kill(pid, SIGKILL);
-                (void)waitpid(pid, NULL, 0);
-                return -1;
-            }
-        }
-        struct stat capture_stat;
-        if (stat(direct_capture, &capture_stat) != 0 ||
-            capture_stat.st_size < (off_t)sizeof(xniff_bin_file_hdr_t)) {
-            fprintf(stderr,
-                    "launch: hooks did not initialize; DYLD insertion may have been blocked\n");
-            return -1;
-        }
-        XNIFF_DIAGF("launch: wrote capture to %s\n", direct_capture);
-        return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
-    }
     int rc = capture_attached_process(pid, dylib_path, mode, true, true, true);
     if (rc != 0) {
         (void)kill(pid, SIGKILL);
