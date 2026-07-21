@@ -22,7 +22,6 @@ private enum MessageTab: String, CaseIterable, Identifiable {
     case headers = "Headers"
     case backtrace = "Backtrace"
     case body = "Body"
-    case hex = "Hex"
 
     var id: String { rawValue }
 }
@@ -125,8 +124,6 @@ struct MessagePaneView: View {
                 BacktraceView(frames: event.backtrace)
             case .body:
                 bodyContent
-            case .hex:
-                hexContent
             }
         } else {
             ContentUnavailableView(
@@ -157,43 +154,18 @@ struct MessagePaneView: View {
                         payloadPicker(decoded)
                     }
                     if let inspection = selectedInspection(from: payload) {
-                        inspectionBar(inspection, available: payload.inspections)
+                        inspectorPicker(payload.inspections)
                         Divider()
-                        BodyTreeView(
-                            payloadID: "\(payload.id.uuidString):\(inspection.id)",
-                            value: inspection.body
-                        ) { range in
-                            selectedPayloadID = payload.id
-                            highlightedRange = range
-                            selectedTab = .hex
-                        }
+                        BodyInspectionView(
+                            payloadID: payload.id,
+                            inspection: inspection,
+                            parent: payload.parent(of: inspection),
+                            data: payload.data,
+                            highlightedRange: highlightedRange,
+                            viewInParent: viewInParent
+                        )
                     }
                 }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var hexContent: some View {
-        switch decodeState {
-        case .idle, .loading:
-            ProgressView("Preparing hex…")
-                .controlSize(.small)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        case .loaded(let decoded):
-            if let payload = selectedPayload(from: decoded) {
-                VStack(spacing: 0) {
-                    if decoded.count > 1 {
-                        payloadPicker(decoded)
-                    }
-                    HexView(
-                        payloadID: payload.id,
-                        data: payload.data,
-                        highlightedRange: highlightedRange
-                    )
-                }
-            } else {
-                ContentUnavailableView("No Raw Body", systemImage: "number")
             }
         }
     }
@@ -220,30 +192,30 @@ struct MessagePaneView: View {
         .padding(8)
     }
 
-    private func inspectionBar(
-        _ inspection: BodyInspection,
-        available inspections: [BodyInspection]
-    ) -> some View {
-        HStack(spacing: 8) {
-            Label(inspection.title, systemImage: inspection.systemImage)
-                .font(.caption.weight(.semibold))
-            if let summary = inspection.summary {
-                Text(summary)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer()
-            Picker("Inspector", selection: $selectedInspectorID) {
+    private func inspectorPicker(_ inspections: [BodyInspection]) -> some View {
+        HStack {
+            Picker("View", selection: Binding(
+                get: { selectedInspectorID },
+                set: { newValue in
+                    selectedInspectorID = newValue
+                    highlightedRange = nil
+                }
+            )) {
                 ForEach(inspections) { candidate in
                     Text(candidate.name).tag(Optional(candidate.id))
                 }
             }
             .frame(minWidth: 150, idealWidth: 180, maxWidth: 220)
-            .help("Choose an applicable analysis layer")
+            .help("Choose an applicable inspector")
+            Spacer()
         }
         .padding(.horizontal, 10)
         .frame(height: 34)
+    }
+
+    private func viewInParent(_ parentID: String, range: Range<Int>) {
+        selectedInspectorID = parentID
+        highlightedRange = range
     }
 
     private func decodePayloads() async {

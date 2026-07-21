@@ -2,7 +2,7 @@ import Foundation
 
 public struct RawXPCBodyInspector: TraceBodyInspector {
     public let identifier = StandardBodyInspectorID.rawXPC
-    public let parentIdentifier: String? = nil
+    public let parentIdentifier: String? = StandardBodyInspectorID.hex
     public let priority = 0
 
     public init() {}
@@ -13,9 +13,7 @@ public struct RawXPCBodyInspector: TraceBodyInspector {
             name: "Raw XPC",
             priority: priority,
             parentID: parentIdentifier,
-            body: context.originalBody,
-            title: "XPC serialization",
-            systemImage: "shippingbox"
+            content: .tree(context.originalBody)
         )
     }
 }

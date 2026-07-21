@@ -196,20 +196,22 @@ private let diagnosticSerialization = Data(hex: """
         name: "Foundation NSXPC",
         priority: 100,
         parentID: StandardBodyInspectorID.rawXPC,
-        body: envelope.logicalBody,
-        title: "NSXPCConnection"
+        content: .tree(envelope.logicalBody)
     )
     let context = BodyInspectorContext(
         originalBody: .null,
+        originalData: Data(),
         inspections: [StandardBodyInspectorID.foundationNSXPC: foundation]
     )
     let coreData = try #require(CoreDataXPCBodyInspector().inspect(context))
+    let coreDataBody = try #require(coreData.tree)
     #expect(coreData.parentID == StandardBodyInspectorID.foundationNSXPC)
     #expect(coreData.name == "Core Data")
-    #expect(coreData.body.recursiveStrings.contains("Entity"))
-    #expect(coreData.body.recursiveStrings.contains("CoreUser"))
-    #expect(coreData.body.recursiveStrings.contains("Predicate"))
-    #expect(!coreData.body.recursiveStrings.contains("Unidentified field 4"))
+    #expect(coreDataBody.recursiveStrings.contains("Entity"))
+    #expect(coreDataBody.recursiveStrings.contains("CoreUser"))
+    #expect(coreDataBody.recursiveStrings.contains("Predicate"))
+    #expect(!coreDataBody.recursiveStrings.contains("Unidentified field 4"))
+    #expect(coreData.details.contains { $0.label == "Message code" && $0.value == "2" })
 }
 
 @Test func labelsUndecodedCoreDataReplyBuffersHonestly() throws {
@@ -252,9 +254,48 @@ private let diagnosticSerialization = Data(hex: """
         TestInspector(id: "highest", parent: "middle", priority: 20, output: .string("semantic")),
         TestInspector(id: "unrelated", parent: "missing", priority: 1_000, output: .string("bad")),
     ])
-    let inspections = registry.inspections(for: .null)
+    let inspections = registry.inspections(for: .null, data: Data())
     #expect(inspections.map(\.id) == ["highest", "middle", "raw"])
-    #expect(inspections.first?.body.summary == "semantic")
+    #expect(inspections.first?.tree?.summary == "semantic")
+}
+
+@Test func standardInspectorsTreatHexAsTheRawXPCParent() throws {
+    let bytes = Data([0x42, 0x13, 0x37, 0x42])
+    let inspections = BodyInspectorRegistry.standard.inspections(for: .null, data: bytes)
+    let raw = try #require(inspections.first { $0.id == StandardBodyInspectorID.rawXPC })
+    let hex = try #require(inspections.first { $0.id == StandardBodyInspectorID.hex })
+
+    #expect(raw.parentID == hex.id)
+    guard case .bytes(let inspectedBytes) = hex.content else {
+        Issue.record("Expected Hex to expose byte content")
+        return
+    }
+    #expect(inspectedBytes == bytes)
+}
+
+@Test func rendersCopiedTreesAsReadableStructuredText() {
+    let value = TraceValue.object(type: "Message", fields: [
+        TraceField(name: "operation name", value: .string("fetch")),
+        TraceField(name: "items", value: .array([.signed(1), .bool(true)])),
+    ])
+
+    #expect(TraceValueTextRenderer.render(value, rootName: "body") == """
+        body: Message {
+          "operation name": "fetch"
+          items: [
+            1
+            true
+          ]
+        }
+        """)
+}
+
+@Test func supportsRegisteringAdditionalCoreDataOperations() {
+    let registry = CoreDataOperationRegistry(decoders: [TestCoreDataOperationDecoder()])
+    let operation = registry.decode(.string("wire value"), code: 99)
+
+    #expect(operation.name == "Custom operation")
+    #expect(operation.body.summary == "decoded custom value")
 }
 
 @Test func decodesExternalTraceWhenProvided() async throws {
@@ -278,17 +319,18 @@ private let diagnosticSerialization = Data(hex: """
     let coreDataInspections = decoded.compactMap {
         $0.inspection(withID: StandardBodyInspectorID.coreDataXPC)
     }
-    let coreDataMessages = foundationInspections.compactMap {
-        CoreDataXPCMessageDecoder.decode($0.body)
+    let coreDataMessages = foundationInspections.compactMap { inspection in
+        inspection.tree.flatMap { CoreDataXPCMessageDecoder.decode($0) }
     }
-    let archivedTypes = Set(foundationInspections.flatMap { $0.body.recursiveObjectTypes }).sorted()
+    let archivedTypes = Set(foundationInspections.flatMap { $0.tree?.recursiveObjectTypes ?? [] }).sorted()
     var shapeCounts: [String: Int] = [:]
     var decodedIndex = 0
     for event in document.events {
         for _ in event.payloads {
             if let foundation = decoded[decodedIndex]
                 .inspection(withID: StandardBodyInspectorID.foundationNSXPC),
-               let message = CoreDataXPCMessageDecoder.decode(foundation.body) {
+               let foundationBody = foundation.tree,
+               let message = CoreDataXPCMessageDecoder.decode(foundationBody) {
                 let key = "\(event.role.rawValue) code \(message.code.map(String.init) ?? "?"): "
                     + message.logicalBody.structuralShape
                 shapeCounts[key, default: 0] += 1
@@ -401,9 +443,17 @@ private struct TestInspector: TraceBodyInspector {
             name: identifier,
             priority: priority,
             parentID: parentIdentifier,
-            body: output,
-            title: identifier
+            content: .tree(output)
         )
+    }
+}
+
+private struct TestCoreDataOperationDecoder: CoreDataOperationDecoder {
+    let code: Int64 = 99
+    let name = "Custom operation"
+
+    func decode(_ body: TraceValue) -> TraceValue {
+        .string("decoded custom value")
     }
 }
 

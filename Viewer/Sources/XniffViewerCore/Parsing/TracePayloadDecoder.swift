@@ -22,11 +22,15 @@ public struct DecodedTracePayload: Sendable, Identifiable {
         self.slice = slice
         self.data = data
         self.value = value
-        self.inspections = BodyInspectorRegistry.standard.inspections(for: value)
+        self.inspections = BodyInspectorRegistry.standard.inspections(for: value, data: data)
     }
 
     public func inspection(withID id: String) -> BodyInspection? {
         inspections.first { $0.id == id }
+    }
+
+    public func parent(of inspection: BodyInspection) -> BodyInspection? {
+        inspection.parentID.flatMap(inspection(withID:))
     }
 }
 

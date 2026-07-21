@@ -12,7 +12,7 @@ struct HexView: View {
                 Text("\(data.count.formatted()) bytes")
                 if let selectedRange {
                     Text(String(
-                        format: "Selected 0x%X–0x%X (%d bytes)",
+                        format: "Selected 0x%X..<0x%X (%d bytes)",
                         selectedRange.lowerBound,
                         selectedRange.upperBound,
                         selectedRange.count

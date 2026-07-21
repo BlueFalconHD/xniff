@@ -2,6 +2,7 @@ import Foundation
 
 public struct BodyInspectorRegistry: Sendable {
     public static let standard = BodyInspectorRegistry(inspectors: [
+        HexBodyInspector(),
         RawXPCBodyInspector(),
         FoundationNSXPCBodyInspector(),
         CoreDataXPCBodyInspector(),
@@ -13,7 +14,7 @@ public struct BodyInspectorRegistry: Sendable {
         self.inspectors = inspectors
     }
 
-    public func inspections(for body: TraceValue) -> [BodyInspection] {
+    public func inspections(for body: TraceValue, data: Data) -> [BodyInspection] {
         var available: [String: BodyInspection] = [:]
         var pending = inspectors.sorted { lhs, rhs in
             if lhs.priority == rhs.priority { return lhs.identifier < rhs.identifier }
@@ -30,7 +31,11 @@ public struct BodyInspectorRegistry: Sendable {
                     continue
                 }
 
-                let context = BodyInspectorContext(originalBody: body, inspections: available)
+                let context = BodyInspectorContext(
+                    originalBody: body,
+                    originalData: data,
+                    inspections: available
+                )
                 if let result = inspector.inspect(context) {
                     available[inspector.identifier] = result
                 }

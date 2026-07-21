@@ -7,10 +7,14 @@ results are sorted by descending priority, so the highest-level applicable
 interpretation is the viewer default while every lower-level result remains
 available in the Body picker.
 
+An inspection returns typed content (`tree` or `bytes`) and optional structured
+detail rows. The viewer owns their presentation; inspectors do not provide
+custom title-bar text or icons.
+
 The built-in chain is:
 
 ```text
-Raw XPC (0) -> Foundation NSXPC (100) -> Core Data XPC (200)
+Hex (-100) -> Raw XPC (0) -> Foundation NSXPC (100) -> Core Data XPC (200)
 ```
 
 To add a layer:
@@ -24,8 +28,15 @@ To add a layer:
 5. Register it in `BodyInspectorRegistry.standard` and add a fixture test.
 
 Inspectors should preserve `TraceValue.sourced` wrappers when replacing a tree
-node. That is how **Show in Hex** continues to select the corresponding bytes in
-the original XPC serialization after several semantic transformations.
+node. A tree item's context menu uses that range for **Copy Hex** and **View in
+_parent_**. Parent navigation selects the exact range when possible, then falls
+back to the smallest containing or overlapping node. Since Hex is the root
+inspection, the same chain also supports byte highlighting without a separate
+Hex tab.
+
+Core Data framing and operation semantics are separate. Add a focused
+`CoreDataOperationDecoder` and register it in `CoreDataOperationRegistry` to
+support another message code without changing the XPC message decoder.
 
 ## Known reverse-engineering work
 
