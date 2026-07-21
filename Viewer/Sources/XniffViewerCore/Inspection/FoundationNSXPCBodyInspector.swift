@@ -28,27 +28,8 @@ public struct FoundationNSXPCBodyInspector: TraceBodyInspector {
         var details: [BodyInspectionDetail] = [
             BodyInspectionDetail("Frame", value: envelope.frameKind.label)
         ]
-        if let operation = envelope.operation {
-            details.append(BodyInspectionDetail("Operation", value: operation))
-        }
-        if let signature = envelope.invocationSignature {
-            details.append(BodyInspectionDetail("Invocation signature", value: signature))
-        }
-        if let returnType = envelope.invocation?.methodSignature?.returnType.displayName {
-            details.append(BodyInspectionDetail("Return type", value: returnType))
-        }
-        if let invocation = envelope.invocation {
-            let types = invocation.arguments.map { $0.type?.displayName ?? "unknown" }
-            details.append(BodyInspectionDetail("Argument types", value: types.joined(separator: ", ")))
-        }
         if let signature = envelope.replySignature {
             details.append(BodyInspectionDetail("Reply signature", value: signature))
-        }
-        if !envelope.replyObjectTypes.isEmpty {
-            details.append(BodyInspectionDetail(
-                "Reply object types",
-                value: envelope.replyObjectTypes.joined(separator: ", ")
-            ))
         }
         if let flags = envelope.flags {
             let labels = envelope.flagSet.labels

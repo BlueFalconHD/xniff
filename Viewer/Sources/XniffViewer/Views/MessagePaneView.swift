@@ -1,7 +1,7 @@
 import SwiftUI
 import XniffViewerCore
 
-enum MessageSide: String, Sendable {
+enum MessageSide: String, Sendable, Hashable {
     case request
     case response
 
@@ -44,6 +44,9 @@ struct MessagePaneView: View {
     let document: TraceDocument
     let event: TraceEvent?
     let counterpartEvent: TraceEvent?
+    let detailsHeight: CGFloat?
+    let detailsNaturalHeightChanged: (CGFloat) -> Void
+    let detailsResized: (CGFloat) -> Void
 
     @State private var selectedTab: MessageTab = .body
     @State private var decodeState: MessageDecodeState = .idle
@@ -81,43 +84,33 @@ struct MessagePaneView: View {
     }
 
     private var paneHeader: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text(title)
-                    .font(.headline)
-                Spacer()
-                if let event {
-                    Text(event.role.label)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .padding(.horizontal, 12)
-            .frame(height: 34)
-
-            HStack(spacing: 18) {
-                ForEach(MessageTab.allCases) { tab in
-                    Button {
-                        selectedTab = tab
-                    } label: {
-                        Text(tab.rawValue)
-                            .font(.callout.weight(selectedTab == tab ? .semibold : .regular))
-                            .foregroundStyle(selectedTab == tab ? .primary : .secondary)
-                            .padding(.vertical, 7)
-                            .overlay(alignment: .bottom) {
-                                if selectedTab == tab {
-                                    Rectangle()
-                                        .fill(Color.accentColor)
-                                        .frame(height: 2)
-                                }
+        HStack(spacing: 18) {
+            Text(title)
+                .font(.headline)
+            Divider()
+                .frame(height: 18)
+            ForEach(MessageTab.allCases) { tab in
+                Button {
+                    selectedTab = tab
+                } label: {
+                    Text(tab.rawValue)
+                        .font(.callout.weight(selectedTab == tab ? .semibold : .regular))
+                        .foregroundStyle(selectedTab == tab ? .primary : .secondary)
+                        .padding(.vertical, 9)
+                        .overlay(alignment: .bottom) {
+                            if selectedTab == tab {
+                                Rectangle()
+                                    .fill(Color.accentColor)
+                                    .frame(height: 2)
                             }
-                    }
-                    .buttonStyle(.plain)
+                        }
                 }
-                Spacer()
+                .buttonStyle(.plain)
             }
-            .padding(.horizontal, 12)
+            Spacer()
         }
+        .padding(.horizontal, 12)
+        .frame(height: 38)
     }
 
     @ViewBuilder
@@ -168,6 +161,9 @@ struct MessagePaneView: View {
                             parent: payload.parent(of: inspection),
                             data: payload.data,
                             highlightedRange: highlightedRange,
+                            detailsHeight: detailsHeight,
+                            detailsNaturalHeightChanged: detailsNaturalHeightChanged,
+                            detailsResized: detailsResized,
                             viewInParent: viewInParent
                         )
                     }

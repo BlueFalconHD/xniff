@@ -6,13 +6,13 @@ struct ContentView: View {
     var body: some View {
         VSplitView {
             CallTableView(store: store)
-                .frame(minHeight: 220, idealHeight: 390)
+                .frame(minHeight: 120, idealHeight: 390)
 
             CallInspectorView(
                 document: store.document,
                 call: store.selectedCall
             )
-            .frame(minHeight: 260, idealHeight: 420)
+            .frame(minHeight: 140, idealHeight: 420)
         }
         .navigationTitle(store.title)
         .searchable(text: $store.query, prompt: "Service, function, role, PID, or call ID")

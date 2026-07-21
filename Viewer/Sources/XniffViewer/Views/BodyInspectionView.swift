@@ -7,15 +7,25 @@ struct BodyInspectionView: View {
     let parent: BodyInspection?
     let data: Data
     let highlightedRange: Range<Int>?
+    let detailsHeight: CGFloat?
+    let detailsNaturalHeightChanged: (CGFloat) -> Void
+    let detailsResized: (CGFloat) -> Void
     let viewInParent: (String, Range<Int>) -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
-            if !inspection.details.isEmpty {
-                BodyInspectionDetailsView(details: inspection.details)
-                Divider()
+        GeometryReader { proxy in
+            VStack(spacing: 0) {
+                BodyInspectionDetailsSection(
+                    details: inspection.details,
+                    alignedHeight: detailsHeight,
+                    maximumHeight: max(0, proxy.size.height - 80),
+                    naturalHeightChanged: detailsNaturalHeightChanged,
+                    resized: detailsResized
+                )
+                content
+                    .frame(minHeight: 0)
+                    .layoutPriority(1)
             }
-            content
         }
     }
 
@@ -40,27 +50,5 @@ struct BodyInspectionView: View {
                 viewInParent(parent.id, range)
             }
         }
-    }
-}
-
-private struct BodyInspectionDetailsView: View {
-    let details: [BodyInspectionDetail]
-
-    var body: some View {
-        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 5) {
-            ForEach(details) { detail in
-                GridRow(alignment: .firstTextBaseline) {
-                    Text(detail.label)
-                        .foregroundStyle(.secondary)
-                        .gridColumnAlignment(.trailing)
-                    Text(detail.value)
-                        .textSelection(.enabled)
-                        .gridColumnAlignment(.leading)
-                }
-            }
-        }
-        .font(.callout)
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

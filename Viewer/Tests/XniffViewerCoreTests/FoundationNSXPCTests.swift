@@ -55,7 +55,7 @@ private let replyInvocationArchive = Data(nsxpcHex: """
     #expect(envelope.validationIssues.isEmpty)
 }
 
-@Test func foundationInspectorExposesTypedInvocationDetails() throws {
+@Test func foundationInspectorOmitsInvocationDetailsAlreadyShownInTree() throws {
     let body = expandedEnvelope(
         archive: requestInvocationArchive,
         fields: [
@@ -81,9 +81,10 @@ private let replyInvocationArchive = Data(nsxpcHex: """
 
     #expect(inspection.tree?.summary == "NSXPC request")
     #expect(inspection.details.contains { $0.label == "Frame" && $0.value == "Request" })
-    #expect(inspection.details.contains {
-        $0.label == "Argument types" && $0.value == "object, block"
-    })
+    #expect(!inspection.details.contains { $0.label == "Operation" })
+    #expect(!inspection.details.contains { $0.label == "Invocation signature" })
+    #expect(!inspection.details.contains { $0.label == "Return type" })
+    #expect(!inspection.details.contains { $0.label == "Argument types" })
     #expect(inspection.details.contains {
         $0.label == "Flags" && $0.value.contains("expects reply")
     })
