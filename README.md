@@ -70,12 +70,14 @@ The Body inspector picker shows every analysis layer that applies to the
 selected payload, with the most semantic layer selected by default. The built-in
 layers are **Hex**, **Raw XPC**, **Foundation NSXPC**, and **Core Data**. Hex is
 the root inspector, so every semantic layer can navigate back to the bytes that
-produced it. Foundation hides
-the `f`, `root`, `proxynum`, `replysig`, and `sequence` transport envelope; Core
-Data then hides `NSCoreDataXPCMessage` and its nested archive framing. You can
-select a lower layer at any time to audit that transformation. Private Core Data
-result buffers whose format is not yet understood are labeled as opaque rather
-than presented as a successful decode.
+produced it. Foundation parses the `f`, `root`, `ool`, `proxynum`, `replysig`,
+and `sequence` transport envelope; reconstructs request and reply invocations;
+labels arguments from their Objective-C type encodings; and recognizes proxy
+release and progress control frames. Core Data then hides
+`NSCoreDataXPCMessage` and its nested archive framing. You can select a lower
+layer at any time to audit that transformation. Private Core Data result buffers
+whose format is not yet understood are labeled as opaque rather than presented
+as a successful decode.
 
 Right-click any decoded tree item to copy its value, its complete textual tree,
 or its source bytes as hex. **View in _parent_** steps down one inspector layer

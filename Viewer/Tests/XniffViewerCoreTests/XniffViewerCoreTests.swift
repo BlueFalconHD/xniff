@@ -109,7 +109,7 @@ private let diagnosticSerialization = Data(hex: """
     #expect(value.recursiveStrings.contains("world"))
 }
 
-@Test func recognizesFoundationNSXPCEnvelope() throws {
+@Test func doesNotMistakeArbitraryBPlistForFoundationNSXPC() throws {
     let data = Data(hex: """
         62706C6973743137
         D01E00000000000000
@@ -123,12 +123,7 @@ private let diagnosticSerialization = Data(hex: """
         TraceField(name: "sequence", value: .unsigned(7)),
         TraceField(name: "root", value: .data(data, interpretation: nil)),
     ]))
-    let envelope = try #require(FoundationXPCEnvelopeDecoder.decode(expanded))
-    #expect(envelope.flags == 33)
-    #expect(envelope.proxyNumber == 1)
-    #expect(envelope.sequence == 7)
-    #expect(envelope.replyObjectTypes == ["NSString"])
-    #expect(envelope.logicalBody.recursiveStrings.contains("world"))
+    #expect(FoundationXPCEnvelopeDecoder.decode(expanded) == nil)
 }
 
 @Test func unwrapsCoreDataXPCFraming() throws {

@@ -25,12 +25,21 @@ public struct FoundationNSXPCBodyInspector: TraceBodyInspector {
     }
 
     private func details(for envelope: FoundationXPCEnvelope) -> [BodyInspectionDetail] {
-        var details: [BodyInspectionDetail] = []
+        var details: [BodyInspectionDetail] = [
+            BodyInspectionDetail("Frame", value: envelope.frameKind.label)
+        ]
         if let operation = envelope.operation {
             details.append(BodyInspectionDetail("Operation", value: operation))
         }
         if let signature = envelope.invocationSignature {
             details.append(BodyInspectionDetail("Invocation signature", value: signature))
+        }
+        if let returnType = envelope.invocation?.methodSignature?.returnType.displayName {
+            details.append(BodyInspectionDetail("Return type", value: returnType))
+        }
+        if let invocation = envelope.invocation {
+            let types = invocation.arguments.map { $0.type?.displayName ?? "unknown" }
+            details.append(BodyInspectionDetail("Argument types", value: types.joined(separator: ", ")))
         }
         if let signature = envelope.replySignature {
             details.append(BodyInspectionDetail("Reply signature", value: signature))
@@ -42,13 +51,27 @@ public struct FoundationNSXPCBodyInspector: TraceBodyInspector {
             ))
         }
         if let flags = envelope.flags {
-            details.append(BodyInspectionDetail("Flags", value: String(format: "0x%llX", flags)))
+            let labels = envelope.flagSet.labels
+            let suffix = labels.isEmpty ? "" : " (\(labels.joined(separator: ", ")))"
+            details.append(BodyInspectionDetail("Flags", value: String(format: "0x%llX", flags) + suffix))
         }
         if let proxyNumber = envelope.proxyNumber {
             details.append(BodyInspectionDetail("Proxy", value: String(proxyNumber)))
         }
         if let sequence = envelope.sequence {
             details.append(BodyInspectionDetail("Sequence", value: String(sequence)))
+        }
+        if !envelope.outOfLineObjects.isEmpty {
+            details.append(BodyInspectionDetail(
+                "Out-of-line objects",
+                value: String(envelope.outOfLineObjects.count)
+            ))
+        }
+        if !envelope.validationIssues.isEmpty {
+            details.append(BodyInspectionDetail(
+                "Validation",
+                value: envelope.validationIssues.joined(separator: "; ")
+            ))
         }
         return details
     }
