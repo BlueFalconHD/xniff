@@ -26,55 +26,58 @@ public enum XPCSerializationDecoder {
     }
 
     private static func decodeObject(_ reader: inout BinaryReader) throws -> TraceValue {
+        let objectStart = reader.offset
         let rawType = try reader.readUInt32()
         guard rawType >= 0x1000 else {
             throw TraceParseError.invalidFile(String(format: "Invalid XPC type 0x%08x", rawType))
         }
         let type = (rawType - 0x1000) >> 12
+        let value: TraceValue
         switch type {
         case 0x00:
-            return .null
+            value = .null
         case 0x01:
-            return .bool(try reader.readUInt32() != 0)
+            value = .bool(try reader.readUInt32() != 0)
         case 0x02:
-            return .signed(try reader.readInt64())
+            value = .signed(try reader.readInt64())
         case 0x03:
-            return .unsigned(try reader.readUInt64())
+            value = .unsigned(try reader.readUInt64())
         case 0x04:
-            return .double(try reader.readDouble())
+            value = .double(try reader.readDouble())
         case 0x05:
-            return .object(type: "Pointer", fields: [
+            value = .object(type: "Pointer", fields: [
                 TraceField(name: "address", value: .string(String(format: "0x%llx", try reader.readUInt64())))
             ])
         case 0x06:
-            return .object(type: "Date", fields: [
+            value = .object(type: "Date", fields: [
                 TraceField(name: "raw", value: .unsigned(try reader.readUInt64()))
             ])
         case 0x07:
             let length = Int(try reader.readUInt32())
-            return .data(try reader.readData(count: length))
+            value = .data(try reader.readData(count: length), interpretation: nil)
         case 0x08:
             let length = Int(try reader.readUInt32())
             var bytes = try reader.readData(count: length)
             if bytes.last == 0 { bytes.removeLast() }
-            return .string(String(decoding: bytes, as: UTF8.self))
+            value = .string(String(decoding: bytes, as: UTF8.self))
         case 0x09:
             let bytes = [UInt8](try reader.readData(count: 16))
             let hex = bytes.enumerated().map { index, byte in
                 let separator = [4, 6, 8, 10].contains(index) ? "-" : ""
                 return separator + String(format: "%02x", byte)
             }.joined()
-            return .object(type: "UUID", fields: [TraceField(name: "value", value: .string(hex))])
+            value = .object(type: "UUID", fields: [TraceField(name: "value", value: .string(hex))])
         case 0x0a, 0x0b, 0x0c:
             let name = type == 0x0a ? "File descriptor" : (type == 0x0b ? "Shared memory" : "Mach send right")
-            return .object(type: name, fields: [
+            value = .object(type: name, fields: [
                 TraceField(name: "value", value: .unsigned(UInt64(try reader.readUInt32())))
             ])
         case 0x0d, 0x0e:
-            return try decodeContainer(type: type, reader: &reader)
+            value = try decodeContainer(type: type, reader: &reader)
         default:
             throw TraceParseError.unsupported(String(format: "Unsupported XPC type 0x%08x", rawType))
         }
+        return .sourced(range: objectStart..<reader.offset, value: value)
     }
 
     private static func decodeContainer(type: UInt32, reader: inout BinaryReader) throws -> TraceValue {

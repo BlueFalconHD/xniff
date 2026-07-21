@@ -57,10 +57,27 @@ The build also produces `build/xniff-viewer.app` for Finder or Launchpad-style
 use. Dumps with `.xniff` and `.xniffbin` extensions can be opened with the app.
 
 The native SwiftUI/AppKit viewer memory-maps and indexes the dump, filters large
-traces off the main thread, and decodes payloads only when selected. It groups
-XPC requests and responses by call ID and recursively expands libxpc v5 values,
-property lists, JSON data, and `NSKeyedArchiver` objects without loading the
-application's private classes.
+traces off the main thread, and decodes payloads only when selected. Each row is
+one logical call; its request and response share a bottom inspector with
+Headers, Backtrace, Body, and Hex tabs.
+
+Body is the default view. It recursively expands libxpc v5 values, binary/XML
+property lists, JSON, `NSKeyedArchiver`, and the inline `bplist17` format used by
+Foundation XPC without loading the target application's private classes. Keyed
+archives retain their encoded class names and property keys in the tree.
+
+The Body inspector picker shows every analysis layer that applies to the
+selected payload, with the most semantic layer selected by default. The built-in
+layers are **Raw XPC**, **Foundation NSXPC**, and **Core Data**. Foundation hides
+the `f`, `root`, `proxynum`, `replysig`, and `sequence` transport envelope; Core
+Data then hides `NSCoreDataXPCMessage` and its nested archive framing. You can
+select a lower layer at any time to audit that transformation. Private Core Data
+result buffers whose format is not yet understood are labeled as opaque rather
+than presented as a successful decode.
+
+Right-click any decoded tree item and choose **Show in Hex** to jump to its bytes
+in the original serialized XPC message. See [Viewer/INSPECTORS.md](Viewer/INSPECTORS.md)
+for the small API used to add another layered body inspector.
 
 For terminal inspection, use:
 

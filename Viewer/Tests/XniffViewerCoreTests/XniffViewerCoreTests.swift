@@ -34,6 +34,15 @@ private let diagnosticSerialization = Data(hex: """
     #expect(value.recursiveStrings.contains(where: { $0.contains("MysteryArchiveObject") }))
 }
 
+@Test func normalizesArchivedNSNull() throws {
+    let archive = try NSKeyedArchiver.archivedData(
+        withRootObject: NSNull(),
+        requiringSecureCoding: false
+    )
+    let value = try KeyedArchiveDecoder.decode(archive)
+    #expect(value.summary == "null")
+}
+
 @Test func indexesAndPairsXPCRecords() throws {
     let callID: UInt64 = 77
     let request = makeRecord(direction: 0, sequence: 1, callID: callID, reply: false)
@@ -50,6 +59,9 @@ private let diagnosticSerialization = Data(hex: """
     #expect(document.events[0].role == .request)
     #expect(document.events[1].role == .response)
     #expect(document.events[0].callID == document.events[1].callID)
+    #expect(document.calls.count == 1)
+    #expect(document.calls[0].request?.id == document.events[0].id)
+    #expect(document.calls[0].response?.id == document.events[1].id)
 
     let payload = try #require(document.events[0].payloads.first)
     let decoded = EmbeddedPayloadDecoder.decode(document.data(for: payload), format: payload.format)
@@ -64,6 +76,242 @@ private let diagnosticSerialization = Data(hex: """
 
     let document = try XniffTraceParser.parse(data: file)
     #expect(document.events.isEmpty)
+}
+
+@Test func retainsDataWhileDecodingItsPropertyList() throws {
+    let plist = try PropertyListSerialization.data(
+        fromPropertyList: ["hello": "world"],
+        format: .binary,
+        options: 0
+    )
+    let value = EmbeddedPayloadDecoder.expandEmbeddedData(
+        .sourced(range: 0x120..<0x200, value: .data(plist, interpretation: nil))
+    )
+    guard case .sourced(_, let wrapped) = value,
+          case .data(let bytes, let interpretation) = wrapped else {
+        Issue.record("Expected a sourced Data value")
+        return
+    }
+    #expect(bytes == plist)
+    #expect(interpretation?.summary.contains("Binary property list v0 at 0x128") == true)
+    #expect(interpretation?.recursiveStrings.contains("world") == true)
+}
+
+@Test func decodesInlineBPlist17Dictionary() throws {
+    let data = Data(hex: """
+        62706C6973743137
+        D01E00000000000000
+        7668656C6C6F00
+        76776F726C6400
+        """)
+    let value = try BPlist17Decoder.decode(data, sourceOffset: 0x400)
+    #expect(value.recursiveStrings.contains("hello"))
+    #expect(value.recursiveStrings.contains("world"))
+}
+
+@Test func recognizesFoundationNSXPCEnvelope() throws {
+    let data = Data(hex: """
+        62706C6973743137
+        D01E00000000000000
+        7668656C6C6F00
+        76776F726C6400
+        """)
+    let expanded = EmbeddedPayloadDecoder.expandEmbeddedData(.dictionary([
+        TraceField(name: "f", value: .unsigned(33)),
+        TraceField(name: "proxynum", value: .unsigned(1)),
+        TraceField(name: "replysig", value: .string(#"v16@?0@"NSString"8"#)),
+        TraceField(name: "sequence", value: .unsigned(7)),
+        TraceField(name: "root", value: .data(data, interpretation: nil)),
+    ]))
+    let envelope = try #require(FoundationXPCEnvelopeDecoder.decode(expanded))
+    #expect(envelope.flags == 33)
+    #expect(envelope.proxyNumber == 1)
+    #expect(envelope.sequence == 7)
+    #expect(envelope.replyObjectTypes == ["NSString"])
+    #expect(envelope.logicalBody.recursiveStrings.contains("world"))
+}
+
+@Test func unwrapsCoreDataXPCFraming() throws {
+    let request = TraceValue.object(type: "NSFetchRequest", fields: [
+        TraceField(name: "entity", value: .string("Usage"))
+    ])
+    let archive = TraceValue.data(Data([1]), interpretation: .object(
+        type: "Binary property list v0 at 0x10",
+        fields: [TraceField(name: "NSKeyedArchiver", value: request)]
+    ))
+    let outerBody = TraceValue.data(Data([2]), interpretation: .array([
+        archive,
+        .string("unpinned"),
+    ]))
+    let message = TraceValue.object(type: "NSCoreDataXPCMessage", fields: [
+        TraceField(name: "NSCoreDataXPCMessageCode", value: .signed(2)),
+        TraceField(name: "NSCoreDataXPCMessageBody", value: outerBody),
+    ])
+    let decoded = try #require(CoreDataXPCMessageDecoder.decode(.array([message, .null])))
+    #expect(decoded.code == 2)
+    #expect(decoded.pinningMode == "unpinned")
+    #expect(decoded.logicalBody.summary == "NSFetchRequest")
+    #expect(decoded.logicalBody.recursiveStrings.contains("Usage"))
+}
+
+@Test func bodyInspectorsLayerCoreDataAboveFoundationAndRawXPC() throws {
+    let compactFetch = TraceValue.array([
+        .string("CoreUser"),
+        .signed(582),
+        .object(type: "NSNull", fields: []),
+        .object(type: "NSComparisonPredicate", fields: []),
+        .object(type: "NSNull", fields: []),
+        .object(type: "NSNull", fields: []),
+        .signed(0),
+        .signed(0),
+        .signed(0),
+        .object(type: "NSNull", fields: []),
+        .object(type: "NSNull", fields: []),
+    ])
+    let archive = TraceValue.data(Data([1]), interpretation: .object(
+        type: "Binary property list v0 at 0x10",
+        fields: [TraceField(name: "NSKeyedArchiver", value: compactFetch)]
+    ))
+    let outerBody = TraceValue.data(Data([2]), interpretation: .array([archive, .string("unpinned")]))
+    let message = TraceValue.object(type: "NSCoreDataXPCMessage", fields: [
+        TraceField(name: "NSCoreDataXPCMessageCode", value: .signed(2)),
+        TraceField(name: "NSCoreDataXPCMessageBody", value: outerBody),
+    ])
+    let invocation = TraceValue.array([
+        .string("handleRequest:reply:"),
+        .string("v32@0:8@16@?24"),
+        .array([message, .null]),
+    ])
+    let envelope = FoundationXPCEnvelope(
+        decodedRoot: invocation,
+        metadata: [],
+        flags: 1,
+        proxyNumber: 1,
+        sequence: 1,
+        replySignature: nil
+    )
+
+    let foundation = BodyInspection(
+        id: StandardBodyInspectorID.foundationNSXPC,
+        name: "Foundation NSXPC",
+        priority: 100,
+        parentID: StandardBodyInspectorID.rawXPC,
+        body: envelope.logicalBody,
+        title: "NSXPCConnection"
+    )
+    let context = BodyInspectorContext(
+        originalBody: .null,
+        inspections: [StandardBodyInspectorID.foundationNSXPC: foundation]
+    )
+    let coreData = try #require(CoreDataXPCBodyInspector().inspect(context))
+    #expect(coreData.parentID == StandardBodyInspectorID.foundationNSXPC)
+    #expect(coreData.name == "Core Data")
+    #expect(coreData.body.recursiveStrings.contains("Entity"))
+    #expect(coreData.body.recursiveStrings.contains("CoreUser"))
+    #expect(coreData.body.recursiveStrings.contains("Predicate"))
+    #expect(!coreData.body.recursiveStrings.contains("Unidentified field 4"))
+}
+
+@Test func labelsUndecodedCoreDataReplyBuffersHonestly() throws {
+    let rawResult = TraceValue.data(Data(repeating: 0xAB, count: 128), interpretation: nil)
+    let outerBody = TraceValue.data(Data([2]), interpretation: .array([rawResult, .string("unpinned")]))
+    let message = TraceValue.object(type: "NSCoreDataXPCMessage", fields: [
+        TraceField(name: "NSCoreDataXPCMessageCode", value: .signed(0)),
+        TraceField(name: "NSCoreDataXPCMessageBody", value: outerBody),
+    ])
+    let decoded = try #require(CoreDataXPCMessageDecoder.decode(message))
+    #expect(decoded.logicalBody.recursiveStrings.contains("Undecoded result data"))
+    #expect(decoded.logicalBody.recursiveStrings.contains("Opaque Core Data result buffer"))
+}
+
+@Test func preservesCountPrefixedCoreDataReplyResults() throws {
+    let row = TraceValue.array([
+        .signed(1),
+        .string("com.example.application"),
+        .string("Example"),
+    ])
+    let outerBody = TraceValue.data(Data([2]), interpretation: .array([
+        .signed(1),
+        row,
+    ]))
+    let message = TraceValue.object(type: "NSCoreDataXPCMessage", fields: [
+        TraceField(name: "NSCoreDataXPCMessageCode", value: .signed(0)),
+        TraceField(name: "NSCoreDataXPCMessageBody", value: outerBody),
+    ])
+    let decoded = try #require(CoreDataXPCMessageDecoder.decode(message))
+    #expect(decoded.pinningMode == nil)
+    #expect(decoded.logicalBody.recursiveStrings.contains("Results"))
+    #expect(decoded.logicalBody.recursiveStrings.contains("com.example.application"))
+    #expect(!decoded.logicalBody.recursiveStrings.contains("Undecoded result data"))
+}
+
+@Test func inspectorRegistryOrdersAndChainsApplicableLayers() throws {
+    let registry = BodyInspectorRegistry(inspectors: [
+        TestInspector(id: "raw", parent: nil, priority: 0, output: .string("wire")),
+        TestInspector(id: "middle", parent: "raw", priority: 10, output: .string("decoded")),
+        TestInspector(id: "highest", parent: "middle", priority: 20, output: .string("semantic")),
+        TestInspector(id: "unrelated", parent: "missing", priority: 1_000, output: .string("bad")),
+    ])
+    let inspections = registry.inspections(for: .null)
+    #expect(inspections.map(\.id) == ["highest", "middle", "raw"])
+    #expect(inspections.first?.body.summary == "semantic")
+}
+
+@Test func decodesExternalTraceWhenProvided() async throws {
+    guard let path = ProcessInfo.processInfo.environment["XNIFF_TEST_TRACE"] else { return }
+    let clock = ContinuousClock()
+    let started = clock.now
+    let document = try XniffTraceParser.parse(url: URL(fileURLWithPath: path))
+    let inputs = document.events.flatMap { event in
+        event.payloads.map { payload in
+            TracePayloadInput(slice: payload, data: document.data(for: payload))
+        }
+    }
+    let decoded = await TracePayloadDecoder.decode(inputs)
+    let bplist17Count = decoded.count {
+        $0.value.recursiveStrings.contains { $0.hasPrefix("Binary property list v17") }
+    }
+    let bplist17Errors = decoded.flatMap { $0.value.recursiveErrors }
+    let foundationInspections = decoded.compactMap {
+        $0.inspection(withID: StandardBodyInspectorID.foundationNSXPC)
+    }
+    let coreDataInspections = decoded.compactMap {
+        $0.inspection(withID: StandardBodyInspectorID.coreDataXPC)
+    }
+    let coreDataMessages = foundationInspections.compactMap {
+        CoreDataXPCMessageDecoder.decode($0.body)
+    }
+    let archivedTypes = Set(foundationInspections.flatMap { $0.body.recursiveObjectTypes }).sorted()
+    var shapeCounts: [String: Int] = [:]
+    var decodedIndex = 0
+    for event in document.events {
+        for _ in event.payloads {
+            if let foundation = decoded[decodedIndex]
+                .inspection(withID: StandardBodyInspectorID.foundationNSXPC),
+               let message = CoreDataXPCMessageDecoder.decode(foundation.body) {
+                let key = "\(event.role.rawValue) code \(message.code.map(String.init) ?? "?"): "
+                    + message.logicalBody.structuralShape
+                shapeCounts[key, default: 0] += 1
+            }
+            decodedIndex += 1
+        }
+    }
+    print(
+        "Decoded \(decoded.count) payloads from \(document.calls.count) calls, "
+            + "including \(bplist17Count) bplist17 bodies in \(foundationInspections.count) Foundation inspections "
+            + "and \(coreDataInspections.count) semantic Core Data inspections "
+            + "with \(bplist17Errors.count) structural errors, "
+            + "in \(started.duration(to: clock.now))"
+    )
+    print("Observed archived classes: \(archivedTypes.joined(separator: ", "))")
+    for (shape, count) in shapeCounts.sorted(by: { $0.key < $1.key }) {
+        print("\(count)× \(shape)")
+    }
+    #expect(decoded.count == inputs.count)
+    #expect(document.calls.count <= document.events.count)
+    #expect(bplist17Count > 0)
+    #expect(!foundationInspections.isEmpty)
+    #expect(!coreDataMessages.isEmpty)
 }
 
 private func makeRecord(direction: UInt16, sequence: UInt64, callID: UInt64, reply: Bool) -> Data {
@@ -133,6 +381,32 @@ private extension Data {
     }
 }
 
+private struct TestInspector: TraceBodyInspector {
+    let identifier: String
+    let parentIdentifier: String?
+    let priority: Int
+    let output: TraceValue
+
+    init(id: String, parent: String?, priority: Int, output: TraceValue) {
+        identifier = id
+        parentIdentifier = parent
+        self.priority = priority
+        self.output = output
+    }
+
+    func inspect(_ context: BodyInspectorContext) -> BodyInspection? {
+        if let parentIdentifier, context.inspection(parentIdentifier) == nil { return nil }
+        return BodyInspection(
+            id: identifier,
+            name: identifier,
+            priority: priority,
+            parentID: parentIdentifier,
+            body: output,
+            title: identifier
+        )
+    }
+}
+
 private extension TraceValue {
     var recursiveStrings: Set<String> {
         switch self {
@@ -144,24 +418,75 @@ private extension TraceValue {
             fields.reduce(into: Set([type] + fields.map(\.name))) {
                 $0.formUnion($1.value.recursiveStrings)
             }
+        case .data(_, let interpretation): interpretation?.recursiveStrings ?? []
+        case .sourced(_, let value): value.recursiveStrings
         default: []
         }
     }
 
+    var recursiveErrors: [String] {
+        switch self {
+        case .error(let message): [message]
+        case .array(let values): values.flatMap(\.recursiveErrors)
+        case .dictionary(let fields), .object(_, let fields): fields.flatMap { $0.value.recursiveErrors }
+        case .data(_, let interpretation): interpretation?.recursiveErrors ?? []
+        case .sourced(_, let value): value.recursiveErrors
+        default: []
+        }
+    }
+
+    var recursiveObjectTypes: Set<String> {
+        switch self {
+        case .array(let values): values.reduce(into: []) { $0.formUnion($1.recursiveObjectTypes) }
+        case .dictionary(let fields): fields.reduce(into: []) { $0.formUnion($1.value.recursiveObjectTypes) }
+        case .object(let type, let fields):
+            fields.reduce(into: Set([type])) { $0.formUnion($1.value.recursiveObjectTypes) }
+        case .data(_, let interpretation): interpretation?.recursiveObjectTypes ?? []
+        case .sourced(_, let value): value.recursiveObjectTypes
+        default: []
+        }
+    }
+
+    var structuralShape: String {
+        switch unsourced {
+        case .null: "null"
+        case .bool: "Bool"
+        case .signed: "Int"
+        case .unsigned: "UInt"
+        case .double: "Double"
+        case .string: "String"
+        case .data(let data, let interpretation):
+            interpretation.map { "Data(\(data.count)) → \($0.structuralShape)" } ?? "Data(\(data.count))"
+        case .array(let values):
+            "Array(\(values.count)) [\(values.prefix(5).map { $0.summary }.joined(separator: ", "))]"
+        case .dictionary(let fields):
+            "Dictionary {\(fields.prefix(5).map(\.name).joined(separator: ", "))}"
+        case .object(let type, _): type
+        case .reference: "Reference"
+        case .sourced: "Sourced"
+        case .error: "Error"
+        }
+    }
+
     func stringValue(at key: String) -> String? {
-        guard case .dictionary(let fields) = self,
-              case .string(let value)? = fields.first(where: { $0.name == key })?.value else { return nil }
+        guard case .dictionary(let fields) = unsourced,
+              case .string(let value)? = fields.first(where: { $0.name == key })?.value.unsourced else { return nil }
         return value
     }
 
     func integerValue(at key: String) -> Int64? {
-        guard case .dictionary(let fields) = self,
-              let value = fields.first(where: { $0.name == key })?.value else { return nil }
+        guard case .dictionary(let fields) = unsourced,
+              let value = fields.first(where: { $0.name == key })?.value.unsourced else { return nil }
         return switch value {
         case .signed(let number): number
         case .unsigned(let number): Int64(number)
         default: nil
         }
+    }
+
+    var unsourced: TraceValue {
+        if case .sourced(_, let value) = self { return value.unsourced }
+        return self
     }
 }
 

@@ -1,0 +1,251 @@
+import AppKit
+import SwiftUI
+import XniffViewerCore
+
+struct CallTableView: View {
+    @Bindable var store: TraceStore
+
+    var body: some View {
+        ZStack {
+            CallTableRepresentable(
+                calls: store.visibleCalls,
+                selection: $store.selectedCallID
+            )
+
+            if store.document != nil && store.visibleCalls.isEmpty && !store.isLoading {
+                ContentUnavailableView.search(text: store.query)
+            }
+        }
+    }
+}
+
+private struct CallTableRepresentable: NSViewRepresentable {
+    let calls: [TraceCall]
+    @Binding var selection: TraceCallID?
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(selection: $selection)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let table = NSTableView()
+        table.rowHeight = 24
+        table.usesAlternatingRowBackgroundColors = true
+        table.allowsMultipleSelection = false
+        table.allowsEmptySelection = true
+        table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        table.gridStyleMask = [.solidHorizontalGridLineMask]
+        table.intercellSpacing = NSSize(width: 8, height: 0)
+        table.delegate = context.coordinator
+        table.dataSource = context.coordinator
+
+        for specification in ColumnSpecification.all {
+            let column = NSTableColumn(identifier: specification.id)
+            column.title = specification.title
+            column.width = specification.width
+            column.minWidth = specification.minimumWidth
+            column.maxWidth = specification.maximumWidth
+            column.resizingMask = specification.resizingMask
+            table.addTableColumn(column)
+        }
+
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.documentView = table
+
+        context.coordinator.update(calls: calls, selection: $selection, table: table)
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let table = scrollView.documentView as? NSTableView else { return }
+        context.coordinator.update(calls: calls, selection: $selection, table: table)
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+        private var calls: [TraceCall] = []
+        private var callIDs: [TraceCallID] = []
+        private var selection: Binding<TraceCallID?>
+
+        init(selection: Binding<TraceCallID?>) {
+            self.selection = selection
+        }
+
+        func update(
+            calls: [TraceCall],
+            selection: Binding<TraceCallID?>,
+            table: NSTableView
+        ) {
+            self.selection = selection
+            let newIDs = calls.map(\.id)
+            if newIDs != callIDs {
+                self.calls = calls
+                callIDs = newIDs
+                table.reloadData()
+            }
+
+            let requestedRow = selection.wrappedValue.flatMap { callIDs.firstIndex(of: $0) } ?? -1
+            if table.selectedRow != requestedRow {
+                if requestedRow >= 0 {
+                    table.selectRowIndexes(IndexSet(integer: requestedRow), byExtendingSelection: false)
+                    table.scrollRowToVisible(requestedRow)
+                } else {
+                    table.deselectAll(nil)
+                }
+            }
+        }
+
+        func numberOfRows(in tableView: NSTableView) -> Int {
+            calls.count
+        }
+
+        func tableView(
+            _ tableView: NSTableView,
+            viewFor tableColumn: NSTableColumn?,
+            row: Int
+        ) -> NSView? {
+            guard calls.indices.contains(row), let tableColumn else { return nil }
+            let call = calls[row]
+            let identifier = tableColumn.identifier
+            let cell = tableView.makeView(withIdentifier: identifier, owner: nil) as? CallCellView
+                ?? CallCellView(identifier: identifier)
+            cell.configure(
+                text: ColumnSpecification.text(for: call, column: identifier),
+                color: ColumnSpecification.color(for: call, column: identifier),
+                monospaced: ColumnSpecification.isMonospaced(identifier),
+                alignment: identifier == ColumnSpecification.status.id ? .center : .left
+            )
+            return cell
+        }
+
+        func tableViewSelectionDidChange(_ notification: Notification) {
+            guard let table = notification.object as? NSTableView else { return }
+            let row = table.selectedRow
+            let newSelection = calls.indices.contains(row) ? calls[row].id : nil
+            if selection.wrappedValue != newSelection {
+                selection.wrappedValue = newSelection
+            }
+        }
+    }
+}
+
+@MainActor
+private final class CallCellView: NSTableCellView {
+    private let label = NSTextField(labelWithString: "")
+
+    init(identifier: NSUserInterfaceItemIdentifier) {
+        super.init(frame: .zero)
+        self.identifier = identifier
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -2),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func configure(
+        text: String,
+        color: NSColor,
+        monospaced: Bool,
+        alignment: NSTextAlignment
+    ) {
+        label.stringValue = text
+        label.textColor = color
+        label.alignment = alignment
+        label.font = monospaced
+            ? NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+            : NSFont.systemFont(ofSize: 12)
+        toolTip = text
+    }
+}
+
+private struct ColumnSpecification {
+    let id: NSUserInterfaceItemIdentifier
+    let title: String
+    let width: CGFloat
+    let minimumWidth: CGFloat
+    let maximumWidth: CGFloat
+    let resizingMask: NSTableColumn.ResizingOptions
+
+    static let status = ColumnSpecification("status", "", 24, minimum: 24, maximum: 24)
+    static let call = ColumnSpecification("call", "#", 65, minimum: 45, maximum: 90)
+    static let service = ColumnSpecification("service", "Service", 285, minimum: 140, maximum: 700, flexible: true)
+    static let function = ColumnSpecification("function", "Function", 310, minimum: 180, maximum: 700, flexible: true)
+    static let type = ColumnSpecification("type", "Type", 90, minimum: 72, maximum: 125)
+    static let time = ColumnSpecification("time", "Time", 105, minimum: 88, maximum: 130)
+    static let duration = ColumnSpecification("duration", "Duration", 90, minimum: 72, maximum: 115)
+    static let process = ColumnSpecification("pid", "PID", 70, minimum: 60, maximum: 90)
+    static let all = [status, call, service, function, type, time, duration, process]
+
+    init(
+        _ rawID: String,
+        _ title: String,
+        _ width: CGFloat,
+        minimum: CGFloat,
+        maximum: CGFloat,
+        flexible: Bool = false
+    ) {
+        id = NSUserInterfaceItemIdentifier(rawID)
+        self.title = title
+        self.width = width
+        minimumWidth = minimum
+        maximumWidth = maximum
+        resizingMask = flexible ? [.autoresizingMask, .userResizingMask] : [.userResizingMask]
+    }
+
+    static func text(for call: TraceCall, column: NSUserInterfaceItemIdentifier) -> String {
+        switch column {
+        case status.id: "●"
+        case self.call.id: call.id.callID.formatted()
+        case service.id: call.serviceName ?? "—"
+        case function.id: call.functionName
+        case type.id: call.role.label
+        case time.id: String(format: "+%.6f", call.relativeSeconds)
+        case duration.id: call.durationSeconds.map(formatDuration) ?? "—"
+        case process.id: call.processID.formatted()
+        default: ""
+        }
+    }
+
+    static func color(for call: TraceCall, column: NSUserInterfaceItemIdentifier) -> NSColor {
+        if column == status.id || column == type.id {
+            return statusColor(call)
+        }
+        if column == self.call.id || column == time.id || column == duration.id {
+            return .secondaryLabelColor
+        }
+        return .labelColor
+    }
+
+    static func isMonospaced(_ column: NSUserInterfaceItemIdentifier) -> Bool {
+        [call.id, time.id, duration.id, process.id].contains(column)
+    }
+
+    private static func statusColor(_ call: TraceCall) -> NSColor {
+        switch call.role {
+        case .request: call.isComplete ? .systemGreen : .systemOrange
+        case .response: .systemGreen
+        case .incoming: .systemBlue
+        case .oneWay: .systemPurple
+        case .mach: .secondaryLabelColor
+        case .metadata, .diagnostic: .systemGray
+        }
+    }
+
+    private static func formatDuration(_ seconds: Double) -> String {
+        if seconds < 0.001 { return String(format: "%.0f µs", seconds * 1_000_000) }
+        if seconds < 1 { return String(format: "%.2f ms", seconds * 1_000) }
+        return String(format: "%.3f s", seconds)
+    }
+}

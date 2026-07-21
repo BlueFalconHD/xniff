@@ -67,6 +67,8 @@ public enum XniffTraceParser {
             var serviceName: String?
             var callID: UInt64?
             var payloads: [TracePayloadSlice] = []
+            var backtracePCs: [UInt64] = []
+            var backtraceSymbols: [UInt64: BacktraceSymbol] = [:]
             var machMessageID: Int32?
             var diagnostic: String?
 
@@ -103,7 +105,7 @@ public enum XniffTraceParser {
                         machMessageID = Int32(bitPattern: try section.readUInt32())
                     }
                     payloads.append(.init(
-                        name: "Mach message",
+                        kind: .message,
                         format: 0,
                         originalLength: sectionLength,
                         isTruncated: false,
@@ -119,7 +121,7 @@ public enum XniffTraceParser {
                         let storedLength = min(Int(try section.readUInt32()), section.remaining)
                         let payloadStart = section.offset
                         payloads.append(.init(
-                            name: payloadName(slot),
+                            kind: TracePayloadKind(rawValue: slot) ?? .unknown,
                             format: format,
                             originalLength: originalLength,
                             isTruncated: serializedFlags & 1 != 0,
@@ -157,6 +159,19 @@ public enum XniffTraceParser {
                         let wireID = try section.readUInt64()
                         if wireID != 0 { callID = wireID }
                     }
+                case 11:
+                    if sectionLength >= 8 {
+                        var section = BinaryReader(data: data, offset: sectionStart, end: sectionEnd)
+                        let count = min(Int(try section.readUInt32()), 32)
+                        try section.skip(4)
+                        backtracePCs = try (0..<count).map { _ in try section.readUInt64() }
+                    }
+                case 12:
+                    backtraceSymbols = try parseBacktraceSymbols(
+                        data: data,
+                        start: sectionStart,
+                        end: sectionEnd
+                    )
                 default:
                     break
                 }
@@ -208,6 +223,16 @@ public enum XniffTraceParser {
                 returnValue: returnValue,
                 arguments: arguments,
                 payloads: payloads,
+                backtrace: backtracePCs.enumerated().map { index, pc in
+                    let symbol = backtraceSymbols[pc]
+                    return TraceFrame(
+                        id: index,
+                        programCounter: pc,
+                        symbolAddress: symbol?.address,
+                        symbolName: symbol?.name,
+                        imagePath: symbol?.image
+                    )
+                },
                 summary: summary
             ))
         }
@@ -232,20 +257,75 @@ public enum XniffTraceParser {
                 returnValue: item.returnValue,
                 arguments: item.arguments,
                 payloads: item.payloads,
+                backtrace: item.backtrace,
                 summary: item.summary
             )
         }
-        return TraceDocument(url: sourceURL, data: data, events: events)
+        return TraceDocument(
+            url: sourceURL,
+            data: data,
+            events: events,
+            calls: makeCalls(events)
+        )
     }
 
-    private static func payloadName(_ slot: UInt8) -> String {
-        switch slot {
-        case 1: "Message"
-        case 2: "Reply"
-        case 3: "Event"
-        default: "Payload \(slot)"
+    private static func makeCalls(_ events: [TraceEvent]) -> [TraceCall] {
+        var indexes: [TraceCallID: Int] = [:]
+        var grouped: [(id: TraceCallID, events: [TraceEvent])] = []
+        for event in events {
+            let id = TraceCallID(processID: event.processID, callID: event.callID ?? event.id)
+            if let index = indexes[id] {
+                grouped[index].events.append(event)
+            } else {
+                indexes[id] = grouped.count
+                grouped.append((id, [event]))
+            }
         }
+        return grouped.map { TraceCall(id: $0.id, events: $0.events) }
     }
+
+    private static func parseBacktraceSymbols(
+        data: Data,
+        start: Int,
+        end: Int
+    ) throws -> [UInt64: BacktraceSymbol] {
+        guard end - start >= 8 else { return [:] }
+        var reader = BinaryReader(data: data, offset: start, end: end)
+        let count = min(Int(try reader.readUInt32()), 32)
+        _ = try reader.readUInt32()
+        guard reader.remaining >= count * 24 else { return [:] }
+
+        var entries: [(pc: UInt64, address: UInt64, nameLength: Int, imageLength: Int)] = []
+        entries.reserveCapacity(count)
+        for _ in 0..<count {
+            entries.append((
+                try reader.readUInt64(),
+                try reader.readUInt64(),
+                Int(try reader.readUInt32()),
+                Int(try reader.readUInt32())
+            ))
+        }
+
+        var result: [UInt64: BacktraceSymbol] = [:]
+        for entry in entries {
+            guard entry.nameLength <= reader.remaining else { break }
+            let name = entry.nameLength == 0 ? nil : try reader.readString(count: entry.nameLength)
+            guard entry.imageLength <= reader.remaining else { break }
+            let image = entry.imageLength == 0 ? nil : try reader.readString(count: entry.imageLength)
+            result[entry.pc] = BacktraceSymbol(
+                address: entry.address == 0 ? nil : entry.address,
+                name: name,
+                image: image
+            )
+        }
+        return result
+    }
+}
+
+private struct BacktraceSymbol {
+    let address: UInt64?
+    let name: String?
+    let image: String?
 }
 
 private struct FallbackCallKey: Hashable {
@@ -271,5 +351,6 @@ private struct PendingEvent {
     let returnValue: UInt64
     let arguments: [UInt64]
     let payloads: [TracePayloadSlice]
+    let backtrace: [TraceFrame]
     let summary: String
 }

@@ -7,11 +7,12 @@ public indirect enum TraceValue: Sendable, Equatable {
     case unsigned(UInt64)
     case double(Double)
     case string(String)
-    case data(Data)
+    case data(Data, interpretation: TraceValue?)
     case array([TraceValue])
     case dictionary([TraceField])
     case object(type: String, fields: [TraceField])
     case reference(Int)
+    case sourced(range: Range<Int>, value: TraceValue)
     case error(String)
 
     public var summary: String {
@@ -22,11 +23,12 @@ public indirect enum TraceValue: Sendable, Equatable {
         case .unsigned(let value): String(value)
         case .double(let value): String(value)
         case .string(let value): value
-        case .data(let value): "\(value.count) bytes"
-        case .array(let values): "\(values.count) items"
-        case .dictionary(let fields): "\(fields.count) keys"
+        case .data(let value, _): "Data (\(value.count.formatted()) bytes)"
+        case .array(let values): "Array (\(values.count.formatted()) items)"
+        case .dictionary(let fields): "Dictionary (\(fields.count.formatted()) keys)"
         case .object(let type, _): type
         case .reference(let index): "reference \(index)"
+        case .sourced(_, let value): value.summary
         case .error(let message): message
         }
     }
@@ -85,16 +87,34 @@ public enum TraceRole: String, CaseIterable, Sendable, Hashable, Identifiable {
     }
 }
 
+public enum TracePayloadKind: UInt8, Sendable, Hashable {
+    case unknown = 0
+    case message = 1
+    case reply = 2
+    case event = 3
+
+    public var label: String {
+        switch self {
+        case .unknown: "Payload"
+        case .message: "Message"
+        case .reply: "Reply"
+        case .event: "Event"
+        }
+    }
+}
+
 public struct TracePayloadSlice: Sendable, Hashable, Identifiable {
     public let id: UUID
-    public let name: String
+    public let kind: TracePayloadKind
     public let format: UInt8
     public let originalLength: Int
     public let isTruncated: Bool
     public let range: Range<Int>
 
+    public var name: String { kind.label }
+
     public init(
-        name: String,
+        kind: TracePayloadKind,
         format: UInt8,
         originalLength: Int,
         isTruncated: Bool,
@@ -102,11 +122,24 @@ public struct TracePayloadSlice: Sendable, Hashable, Identifiable {
         id: UUID = UUID()
     ) {
         self.id = id
-        self.name = name
+        self.kind = kind
         self.format = format
         self.originalLength = originalLength
         self.isTruncated = isTruncated
         self.range = range
+    }
+}
+
+public struct TraceFrame: Sendable, Hashable, Identifiable {
+    public let id: Int
+    public let programCounter: UInt64
+    public let symbolAddress: UInt64?
+    public let symbolName: String?
+    public let imagePath: String?
+
+    public var offset: UInt64? {
+        guard let symbolAddress, programCounter >= symbolAddress else { return nil }
+        return programCounter - symbolAddress
     }
 }
 
@@ -128,6 +161,7 @@ public struct TraceEvent: Sendable, Identifiable, Hashable {
     public let returnValue: UInt64
     public let arguments: [UInt64]
     public let payloads: [TracePayloadSlice]
+    public let backtrace: [TraceFrame]
     public let summary: String
     public let searchableText: String
 
@@ -149,6 +183,7 @@ public struct TraceEvent: Sendable, Identifiable, Hashable {
         returnValue: UInt64,
         arguments: [UInt64],
         payloads: [TracePayloadSlice],
+        backtrace: [TraceFrame],
         summary: String
     ) {
         self.id = id
@@ -168,6 +203,7 @@ public struct TraceEvent: Sendable, Identifiable, Hashable {
         self.returnValue = returnValue
         self.arguments = arguments
         self.payloads = payloads
+        self.backtrace = backtrace
         self.summary = summary
         self.searchableText = [
             functionName,
@@ -180,15 +216,69 @@ public struct TraceEvent: Sendable, Identifiable, Hashable {
     }
 }
 
+public struct TraceCallID: Sendable, Hashable {
+    public let processID: UInt32
+    public let callID: UInt64
+
+    public init(processID: UInt32, callID: UInt64) {
+        self.processID = processID
+        self.callID = callID
+    }
+}
+
+public struct TraceCall: Sendable, Identifiable, Hashable {
+    public let id: TraceCallID
+    public let events: [TraceEvent]
+
+    public init(id: TraceCallID, events: [TraceEvent]) {
+        self.id = id
+        self.events = events.sorted { $0.sequence < $1.sequence }
+    }
+
+    public var request: TraceEvent? {
+        if let traffic = events.first(where: { [.request, .incoming, .oneWay].contains($0.role) }) {
+            return traffic
+        }
+        if events.first?.api != .xpc || events.contains(where: { $0.role == .metadata }) {
+            return events.first { $0.direction == .entry } ?? events.first
+        }
+        return nil
+    }
+
+    public var response: TraceEvent? {
+        events.first { $0.role == .response }
+            ?? events.last { $0.direction == .exit && $0.id != request?.id }
+    }
+
+    public var primaryEvent: TraceEvent { request ?? response ?? events[0] }
+    public var role: TraceRole { request?.role ?? response?.role ?? primaryEvent.role }
+    public var serviceName: String? {
+        events.lazy.compactMap(\.serviceName).first
+    }
+    public var functionName: String { primaryEvent.functionName }
+    public var processID: UInt32 { id.processID }
+    public var relativeSeconds: Double { events.first?.relativeSeconds ?? 0 }
+    public var durationSeconds: Double? {
+        guard let first = events.first, let last = events.last, first.id != last.id else { return nil }
+        return max(0, last.relativeSeconds - first.relativeSeconds)
+    }
+    public var isComplete: Bool { response != nil }
+    public var searchableText: String {
+        events.map(\.searchableText).joined(separator: " ")
+    }
+}
+
 public struct TraceDocument: Sendable {
     public let url: URL
     public let data: Data
     public let events: [TraceEvent]
+    public let calls: [TraceCall]
 
-    public init(url: URL, data: Data, events: [TraceEvent]) {
+    public init(url: URL, data: Data, events: [TraceEvent], calls: [TraceCall]) {
         self.url = url
         self.data = data
         self.events = events
+        self.calls = calls
     }
 
     public func data(for payload: TracePayloadSlice) -> Data {

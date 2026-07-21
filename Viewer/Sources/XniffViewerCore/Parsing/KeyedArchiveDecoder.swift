@@ -52,11 +52,10 @@ public enum KeyedArchiveDecoder {
     static func propertyListValue(_ value: Any, depth: Int = 0) -> TraceValue {
         guard depth < 128 else { return .error("Maximum nesting depth reached") }
         if let value = value as? String { return .string(value) }
-        if let value = value as? Data { return .data(value) }
+        if let value = value as? Data { return .data(value, interpretation: nil) }
         if let value = value as? Date { return .string(ISO8601DateFormatter().string(from: value)) }
         if let value = value as? NSNumber {
-            if CFGetTypeID(value) == CFBooleanGetTypeID() { return .bool(value.boolValue) }
-            return .double(value.doubleValue)
+            return numberValue(value)
         }
         if let values = value as? [Any] {
             return .array(values.map { propertyListValue($0, depth: depth + 1) })
@@ -87,6 +86,16 @@ public enum KeyedArchiveDecoder {
         let cfObject = unsafeBitCast(object, to: CFTypeRef.self)
         guard CFGetTypeID(cfObject) == uidFunctions.getTypeID() else { return nil }
         return uidFunctions.getValue(cfObject)
+    }
+
+    fileprivate static func numberValue(_ value: NSNumber) -> TraceValue {
+        if CFGetTypeID(value) == CFBooleanGetTypeID() { return .bool(value.boolValue) }
+        let encoding = String(cString: value.objCType)
+        if encoding == "f" || encoding == "d" { return .double(value.doubleValue) }
+        if ["C", "S", "I", "L", "Q"].contains(encoding) {
+            return .unsigned(value.uint64Value)
+        }
+        return .signed(value.int64Value)
     }
 
     private static func uidFromDescription(_ value: Any) -> Int? {
@@ -120,6 +129,8 @@ private struct ArchiveResolver {
         let className = className(for: fields["$class"])
 
         switch className {
+        case "NSNull":
+            return .null
         case "NSDictionary", "NSMutableDictionary":
             let keys = fields["NS.keys"] as? [Any] ?? []
             let values = fields["NS.objects"] as? [Any] ?? []
@@ -131,7 +142,7 @@ private struct ArchiveResolver {
             let values = fields["NS.objects"] as? [Any] ?? []
             return .array(values.map { resolve($0, depth: depth + 1) })
         case "NSData", "NSMutableData":
-            if let data = fields["NS.data"] as? Data { return .data(data) }
+            if let data = fields["NS.data"] as? Data { return .data(data, interpretation: nil) }
         case "NSDate":
             if let seconds = fields["NS.time"] as? NSNumber {
                 let date = Date(timeIntervalSinceReferenceDate: seconds.doubleValue)
@@ -158,11 +169,10 @@ private struct ArchiveResolver {
 
     private mutating func convert(_ value: Any, depth: Int) -> TraceValue {
         if let string = value as? String { return .string(string) }
-        if let data = value as? Data { return .data(data) }
+        if let data = value as? Data { return .data(data, interpretation: nil) }
         if let date = value as? Date { return .string(ISO8601DateFormatter().string(from: date)) }
         if let number = value as? NSNumber {
-            if CFGetTypeID(number) == CFBooleanGetTypeID() { return .bool(number.boolValue) }
-            return .double(number.doubleValue)
+            return KeyedArchiveDecoder.numberValue(number)
         }
         if let array = value as? [Any] {
             return .array(array.map { resolve($0, depth: depth + 1) })
@@ -195,7 +205,7 @@ public enum EmbeddedPayloadDecoder {
         do {
             let decoded = format == 1
                 ? try XPCSerializationDecoder.decode(data)
-                : .data(data)
+                : .data(data, interpretation: nil)
             return expandEmbeddedData(decoded)
         } catch {
             return .error(error.localizedDescription)
@@ -203,32 +213,118 @@ public enum EmbeddedPayloadDecoder {
     }
 
     public static func expandEmbeddedData(_ value: TraceValue) -> TraceValue {
+        expandEmbeddedData(value, sourceOffset: nil)
+    }
+
+    private static func expandEmbeddedData(
+        _ value: TraceValue,
+        sourceOffset: Int?
+    ) -> TraceValue {
         switch value {
-        case .data(let data):
-            if let archive = KeyedArchiveDecoder.decodeIfPresent(data) {
-                return .object(type: "NSKeyedArchiver", fields: [TraceField(name: "root", value: archive)])
-            }
-            if let json = try? JSONSerialization.jsonObject(with: data) {
-                return .object(type: "JSON", fields: [
-                    TraceField(name: "root", value: KeyedArchiveDecoder.propertyListValue(json))
-                ])
-            }
-            if let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) {
-                return .object(type: "Property list", fields: [
-                    TraceField(name: "root", value: KeyedArchiveDecoder.propertyListValue(plist))
-                ])
-            }
-            return value
+        case .data(let data, let existingInterpretation):
+            let interpretation = existingInterpretation
+                ?? interpretData(data, sourceOffset: sourceOffset.map { $0 + 8 })
+            return .data(
+                data,
+                interpretation: interpretation.map { expandEmbeddedData($0, sourceOffset: sourceOffset) }
+            )
         case .array(let values):
-            return .array(values.map(expandEmbeddedData))
+            return .array(values.map { expandEmbeddedData($0, sourceOffset: sourceOffset) })
         case .dictionary(let fields):
-            return .dictionary(fields.map { TraceField(name: $0.name, value: expandEmbeddedData($0.value), id: $0.id) })
+            return .dictionary(fields.map {
+                TraceField(
+                    name: $0.name,
+                    value: expandEmbeddedData($0.value, sourceOffset: sourceOffset),
+                    id: $0.id
+                )
+            })
         case .object(let type, let fields):
             return .object(type: type, fields: fields.map {
-                TraceField(name: $0.name, value: expandEmbeddedData($0.value), id: $0.id)
+                TraceField(
+                    name: $0.name,
+                    value: expandEmbeddedData($0.value, sourceOffset: sourceOffset),
+                    id: $0.id
+                )
             })
+        case .sourced(let range, let nested):
+            return .sourced(
+                range: range,
+                value: expandEmbeddedData(nested, sourceOffset: range.lowerBound)
+            )
         default:
             return value
+        }
+    }
+
+    private static func interpretData(_ data: Data, sourceOffset: Int?) -> TraceValue? {
+        guard !data.isEmpty else { return nil }
+        let offset = sourceOffset ?? 0
+
+        if data.starts(with: Data("bplist".utf8)) {
+            if data.starts(with: Data("bplist17".utf8)) {
+                let label = String(format: "Binary property list v17 at 0x%X", offset)
+                do {
+                    let decoded = try BPlist17Decoder.decode(data, sourceOffset: offset)
+                    return .object(type: label, fields: [
+                        TraceField(name: "Decoded value", value: decoded)
+                    ])
+                } catch {
+                    return .object(type: label, fields: [
+                        TraceField(name: "Decode error", value: .error(error.localizedDescription))
+                    ])
+                }
+            }
+
+            let label = String(format: "Binary property list v0 at 0x%X", offset)
+            if let archive = KeyedArchiveDecoder.decodeIfPresent(data) {
+                return .object(type: label, fields: [
+                    TraceField(name: "NSKeyedArchiver", value: archive)
+                ])
+            }
+            var format = PropertyListSerialization.PropertyListFormat.binary
+            if let plist = try? PropertyListSerialization.propertyList(
+                from: data,
+                options: [],
+                format: &format
+            ) {
+                return .object(
+                    type: label,
+                    fields: fields(for: KeyedArchiveDecoder.propertyListValue(plist))
+                )
+            }
+            return nil
+        }
+
+        let firstContentByte = data.first { ![0x09, 0x0A, 0x0D, 0x20].contains($0) }
+        if firstContentByte == UInt8(ascii: "{") || firstContentByte == UInt8(ascii: "[") {
+            if let json = try? JSONSerialization.jsonObject(with: data) {
+                return .object(
+                    type: String(format: "JSON at 0x%X", offset),
+                    fields: fields(for: KeyedArchiveDecoder.propertyListValue(json))
+                )
+            }
+        }
+
+        if firstContentByte == UInt8(ascii: "<") {
+            var format = PropertyListSerialization.PropertyListFormat.xml
+            if let plist = try? PropertyListSerialization.propertyList(
+                from: data,
+                options: [],
+                format: &format
+            ) {
+                return .object(
+                    type: String(format: "XML property list at 0x%X", offset),
+                    fields: fields(for: KeyedArchiveDecoder.propertyListValue(plist))
+                )
+            }
+        }
+        return nil
+    }
+
+    private static func fields(for value: TraceValue) -> [TraceField] {
+        switch value {
+        case .dictionary(let fields), .object(_, let fields): fields
+        default: [TraceField(name: "Value", value: value)]
         }
     }
 }
