@@ -113,7 +113,7 @@ import Testing
 
     var resultBuffer = Data()
     resultBuffer.appendCoreDataLE(UInt64(1))
-    resultBuffer.appendCoreDataLE(UInt64(0))
+    resultBuffer.appendCoreDataLE(UInt64(0xABCDEFAB))
     resultBuffer.appendCoreDataLE(UInt32(3))
     resultBuffer.appendCoreDataLE(UInt32(0))
     resultBuffer.appendCoreDataLE(UInt64(packedRows.count))
@@ -129,6 +129,61 @@ import Testing
     #expect(decoded.logicalBody.coreDataTestStrings.contains("Row sizes"))
     #expect(decoded.logicalBody.coreDataTestStrings.contains("Row 2"))
     #expect(decoded.logicalBody.coreDataTestStrings.contains("Encoded values"))
+}
+
+@Test func parsesObservedStructuredFetchRowsWithRequestContext() throws {
+    let request = try #require(CoreDataXPCMessageDecoder.decode(coreDataMessage(
+        code: 2,
+        body: try observedFetchBody(entity: "ScreenTimeSettings")
+    )))
+    let body = try archivedCoreDataValue([observedStructuredResultBuffer()])
+    let decoded = try #require(CoreDataXPCMessageDecoder.decode(
+        coreDataMessage(code: 0, body: body),
+        request: request
+    ))
+
+    #expect(decoded.operationName == "Fetch response")
+    #expect(decoded.logicalBody.coreDataTestStrings.contains("ScreenTimeSettings"))
+    #expect(decoded.logicalBody.coreDataTestStrings.contains("Structured fetch rows"))
+    #expect(decoded.logicalBody.coreDataTestStrings.contains("Buffer 0"))
+    #expect(decoded.logicalBody.coreDataTestStrings.contains("Row 0"))
+    #expect(decoded.logicalBody.coreDataTestStrings.contains("Row index"))
+    #expect(decoded.logicalBody.coreDataTestStrings.contains("SQL entity ID"))
+    #expect(decoded.logicalBody.coreDataTestStrings.contains("Primary key"))
+    #expect(decoded.logicalBody.coreDataTestStrings.contains("Encoded property storage"))
+    #expect(decoded.logicalBody.coreDataTestStrings.contains("Schema requirement"))
+    #expect(!decoded.logicalBody.coreDataTestStrings.contains("Buffer and size table"))
+}
+
+@Test func labelsObservedInlineObjectFaultSnapshotUsingPairedRequest() throws {
+    let objectID = "x-coredata://A293AEE7-854D-4F69-AFC0-5F3DE6AD1AE0/UserDeviceState/p1880"
+    let request = try #require(CoreDataXPCMessageDecoder.decode(coreDataMessage(
+        code: 5,
+        body: try archivedCoreDataValue([URL(string: objectID)!])
+    )))
+    let snapshot: [Any] = [
+        NSNull(),
+        1,
+        "D0EDFCCD-C8EB-5D18-A3A2-6C09D44B22B4",
+        NSNull(),
+        1,
+        0,
+        "STiCloudOrganization",
+        7,
+    ]
+    let responseBody = try archivedCoreDataValue([1, snapshot])
+    let decoded = try #require(CoreDataXPCMessageDecoder.decode(
+        coreDataMessage(code: 0, body: responseBody),
+        request: request
+    ))
+
+    #expect(decoded.operationName == "Object fault response")
+    #expect(decoded.logicalBody.coreDataTestStrings.contains("Core Data object fault response"))
+    #expect(decoded.logicalBody.coreDataTestStrings.contains("UserDeviceState"))
+    #expect(decoded.logicalBody.coreDataTestStrings.contains("Property slot 0"))
+    #expect(decoded.logicalBody.coreDataTestStrings.contains("Property slot 6"))
+    #expect(decoded.logicalBody.coreDataTestStrings.contains("Version"))
+    #expect(decoded.logicalBody.coreDataTestStrings.contains("Schema requirement"))
 }
 
 @Test func doesNotInventAResultSchemaForUnknownReplyData() throws {
@@ -167,6 +222,39 @@ import Testing
     #expect(inspection.details.contains { $0.label == "Context" && $0.value == "main" })
 }
 
+@Test func coreDataInspectorUsesPairedRequestToInterpretResponse() throws {
+    let objectID = "x-coredata://A293AEE7-854D-4F69-AFC0-5F3DE6AD1AE0/UserDeviceState/p1880"
+    let requestMessage = coreDataMessage(
+        code: 5,
+        body: try archivedCoreDataValue([URL(string: objectID)!])
+    )
+    let responseMessage = coreDataMessage(
+        code: 0,
+        body: try archivedCoreDataValue([1, ["value", 3]])
+    )
+    let foundation = BodyInspection(
+        id: StandardBodyInspectorID.foundationNSXPC,
+        name: "Foundation NSXPC",
+        priority: 100,
+        parentID: StandardBodyInspectorID.rawXPC,
+        content: .tree(foundationReply(arguments: [responseMessage, .null]))
+    )
+    let context = BodyInspectorContext(
+        originalBody: .null,
+        originalData: Data(),
+        inspections: [StandardBodyInspectorID.foundationNSXPC: foundation],
+        counterpartBody: .array([requestMessage, .null])
+    )
+
+    let inspection = try #require(CoreDataXPCBodyInspector().inspect(context))
+    #expect(inspection.name == "Core Data / NSXPCStore")
+    #expect(inspection.details.contains {
+        $0.label == "Operation" && $0.value == "Object fault response"
+    })
+    #expect(inspection.tree?.coreDataTestStrings.contains("Property slot 0") == true)
+    #expect(inspection.tree?.coreDataTestStrings.contains("UserDeviceState") == true)
+}
+
 private func observedFetchBody(entity: String, queryGeneration: String? = nil) throws -> TraceValue {
     let fetchData = try archivedData(observedFetchFields(entity: entity))
     var envelope: [Any] = [fetchData]
@@ -188,6 +276,42 @@ private func observedFetchFields(entity: String) -> [Any] {
         NSNull(),
         NSNull(),
     ]
+}
+
+private func observedStructuredResultBuffer() -> Data {
+    var row = Data()
+    row.appendCoreDataLE(UInt32(0))
+    row.appendCoreDataLE(UInt32.max)
+    row.appendCoreDataLE(UInt32(23))
+    row.appendCoreDataLE(UInt32(0))
+    row.appendCoreDataLE(UInt64(0))
+    row.appendCoreDataLE(UInt64(1))
+    row.append(contentsOf: [0x05, 0x30, 0x00, 0x00, 0x01, 0x00])
+
+    var result = Data()
+    result.appendCoreDataLE(UInt64(1))
+    result.appendCoreDataLE(UInt64(0xABCDEFAB))
+    result.appendCoreDataLE(UInt32(1))
+    result.appendCoreDataLE(UInt32(1))
+    result.appendCoreDataLE(UInt64(0xABCDEFAB))
+    result.appendCoreDataLE(UInt32(1))
+    result.appendCoreDataLE(UInt32(1))
+    result.appendCoreDataLE(UInt64(806_000_000))
+    result.appendCoreDataLE(UInt32(1))
+    result.appendCoreDataLE(UInt32(1))
+    result.appendCoreDataLE(UInt32(0))
+    result.appendCoreDataLE(UInt32(0))
+    result.appendCoreDataLE(UInt64(0))
+    result.appendCoreDataLE(UInt64(0))
+    result.appendCoreDataLE(UInt32(1))
+    result.appendCoreDataLE(UInt32(0))
+    for _ in 0..<5 { result.appendCoreDataLE(UInt64(0)) }
+    result.appendCoreDataLE(UInt64(0))
+    result.appendCoreDataLE(UInt64(0xABCDEFAB))
+    result.appendCoreDataLE(UInt64(row.count))
+    result.appendCoreDataLE(UInt64(160))
+    result.append(row)
+    return result
 }
 
 private func archivedData(_ root: Any) throws -> Data {

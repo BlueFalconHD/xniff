@@ -51,15 +51,18 @@ public struct BodyInspectorContext: Sendable {
     public let originalBody: TraceValue
     public let originalData: Data
     public let inspections: [String: BodyInspection]
+    public let counterpartBody: TraceValue?
 
     public init(
         originalBody: TraceValue,
         originalData: Data,
-        inspections: [String: BodyInspection]
+        inspections: [String: BodyInspection],
+        counterpartBody: TraceValue? = nil
     ) {
         self.originalBody = originalBody
         self.originalData = originalData
         self.inspections = inspections
+        self.counterpartBody = counterpartBody
     }
 
     public func inspection(_ id: String) -> BodyInspection? {

@@ -14,7 +14,7 @@ custom title-bar text or icons.
 The built-in chain is:
 
 ```text
-Hex (-100) -> Raw XPC (0) -> Foundation NSXPC (100) -> Core Data XPC (200)
+Hex (-100) -> Raw XPC (0) -> Foundation NSXPC (100) -> Core Data / NSXPCStore (200)
 ```
 
 To add a layer:
@@ -34,9 +34,21 @@ back to the smallest containing or overlapping node. Since Hex is the root
 inspection, the same chain also supports byte highlighting without a separate
 Hex tab.
 
-Core Data framing and operation semantics are separate. Add a focused
-`CoreDataOperationDecoder` and register it in `CoreDataOperationRegistry` to
-support another message code without changing the XPC message decoder.
+Core Data framing and operation semantics are separate. `NSCoreDataXPCMessage`
+is the envelope of Core Data's private `NSXPCStore` protocol; it is not part of
+Foundation NSXPC. Add a focused `CoreDataOperationDecoder` and register it in
+`CoreDataOperationRegistry` to support another message code without changing
+the envelope decoder. Reply interpretation can use the paired request through
+`BodyInspectorContext.counterpartBody`.
+
+Structured SQL fetch results are only partly self-describing. The wire header
+contains result-buffer offsets, sizes, row links, SQL entity IDs, and primary
+keys. Property boundaries, types, and names are omitted. Apple's decoder rebuilds
+those from the original fetch request and the `NSXPCStore`'s managed-object/SQL
+model. The viewer therefore exposes the structural row data and identifies the
+entity from the paired request, but does not guess property values without a
+model. Inline object-fault replies are labeled as model-ordered property slots
+for the same reason.
 
 ## Foundation NSXPC wire format
 
@@ -80,7 +92,5 @@ XPC replies also do not need request metadata such as `f`, `proxynum`, or
 
 ## Known reverse-engineering work
 
-- Map Core Data operation codes and the positional fields in each private row
-  schema. Count-prefixed replies are preserved as result arrays today, but their
-  row elements remain positional rather than guessed.
-- Decode the opaque Core Data row/result buffer variant.
+- Accept a compiled managed-object model (`.mom`/`.momd`) and use it to assign
+  property names and types to NSXPCStore result slots and SQL property storage.

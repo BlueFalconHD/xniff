@@ -17,12 +17,21 @@ public struct DecodedTracePayload: Sendable, Identifiable {
     public let value: TraceValue
     public let inspections: [BodyInspection]
 
-    public init(slice: TracePayloadSlice, data: Data, value: TraceValue) {
+    public init(
+        slice: TracePayloadSlice,
+        data: Data,
+        value: TraceValue,
+        counterpartBody: TraceValue? = nil
+    ) {
         self.id = slice.id
         self.slice = slice
         self.data = data
         self.value = value
-        self.inspections = BodyInspectorRegistry.standard.inspections(for: value, data: data)
+        self.inspections = BodyInspectorRegistry.standard.inspections(
+            for: value,
+            data: data,
+            counterpartBody: counterpartBody
+        )
     }
 
     public func inspection(withID id: String) -> BodyInspection? {
@@ -36,12 +45,16 @@ public struct DecodedTracePayload: Sendable, Identifiable {
 
 public enum TracePayloadDecoder {
     @concurrent
-    public static func decode(_ inputs: [TracePayloadInput]) async -> [DecodedTracePayload] {
+    public static func decode(
+        _ inputs: [TracePayloadInput],
+        counterpartBody: TraceValue? = nil
+    ) async -> [DecodedTracePayload] {
         inputs.map { input in
             DecodedTracePayload(
                 slice: input.slice,
                 data: input.data,
-                value: EmbeddedPayloadDecoder.decode(input.data, format: input.slice.format)
+                value: EmbeddedPayloadDecoder.decode(input.data, format: input.slice.format),
+                counterpartBody: counterpartBody
             )
         }
     }

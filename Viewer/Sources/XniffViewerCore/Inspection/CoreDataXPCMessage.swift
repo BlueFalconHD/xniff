@@ -27,7 +27,8 @@ public enum CoreDataXPCMessageDecoder {
 
     public static func decode(
         _ value: TraceValue,
-        operations: CoreDataOperationRegistry = .standard
+        operations: CoreDataOperationRegistry = .standard,
+        request: CoreDataXPCMessage? = nil
     ) -> CoreDataXPCMessage? {
         guard let message = findMessage(in: value),
               case .object(_, let fields) = message.coreDataUnwrapped else {
@@ -44,7 +45,7 @@ public enum CoreDataXPCMessageDecoder {
                 body: CoreDataArchiveRepresentation.decode(error)
             )
         } else {
-            operation = operations.decode(body, code: code)
+            operation = operations.decode(body, code: code, request: request)
         }
 
         return CoreDataXPCMessage(

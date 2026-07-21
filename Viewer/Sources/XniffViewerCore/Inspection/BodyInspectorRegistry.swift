@@ -14,7 +14,11 @@ public struct BodyInspectorRegistry: Sendable {
         self.inspectors = inspectors
     }
 
-    public func inspections(for body: TraceValue, data: Data) -> [BodyInspection] {
+    public func inspections(
+        for body: TraceValue,
+        data: Data,
+        counterpartBody: TraceValue? = nil
+    ) -> [BodyInspection] {
         var available: [String: BodyInspection] = [:]
         var pending = inspectors.sorted { lhs, rhs in
             if lhs.priority == rhs.priority { return lhs.identifier < rhs.identifier }
@@ -34,7 +38,8 @@ public struct BodyInspectorRegistry: Sendable {
                 let context = BodyInspectorContext(
                     originalBody: body,
                     originalData: data,
-                    inspections: available
+                    inspections: available,
+                    counterpartBody: counterpartBody
                 )
                 if let result = inspector.inspect(context) {
                     available[inspector.identifier] = result

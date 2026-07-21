@@ -16,7 +16,8 @@ struct CallInspectorView: View {
                             title: requestTitle(call),
                             side: .request,
                             document: document,
-                            event: call.request
+                            event: call.request,
+                            counterpartEvent: nil
                         )
                         .frame(minWidth: 420)
 
@@ -24,7 +25,8 @@ struct CallInspectorView: View {
                             title: "Response",
                             side: .response,
                             document: document,
-                            event: call.response
+                            event: call.response,
+                            counterpartEvent: call.request
                         )
                         .frame(minWidth: 420)
                     }

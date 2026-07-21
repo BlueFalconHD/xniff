@@ -51,6 +51,14 @@ public struct CoreDataOperationRegistry: Sendable {
     }
 
     public func decode(_ body: TraceValue?, code: Int64?) -> CoreDataOperation {
+        decode(body, code: code, request: nil)
+    }
+
+    func decode(
+        _ body: TraceValue?,
+        code: Int64?,
+        request: CoreDataXPCMessage?
+    ) -> CoreDataOperation {
         guard let code else {
             return CoreDataOperation(code: nil, name: "Message", body: body ?? .null)
         }
@@ -64,6 +72,14 @@ public struct CoreDataOperationRegistry: Sendable {
         // Reply code 8 means that processing produced neither a result nor an error.
         if code == 8 {
             return CoreDataOperation(code: code, name: "Empty response", body: body ?? .null)
+        }
+
+        if code == 0,
+           let response = NSXPCStoreResponseDecoder.decode(
+               body ?? .null,
+               for: request
+           ) {
+            return response
         }
 
         guard let decoder = decoders[code] else {

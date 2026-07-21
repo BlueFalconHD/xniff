@@ -34,6 +34,7 @@ private enum MessageDecodeState {
 
 private struct MessageDecodeIdentity: Hashable {
     let eventID: UInt64?
+    let counterpartEventID: UInt64?
     let payloadIDs: [UUID]
 }
 
@@ -42,6 +43,7 @@ struct MessagePaneView: View {
     let side: MessageSide
     let document: TraceDocument
     let event: TraceEvent?
+    let counterpartEvent: TraceEvent?
 
     @State private var selectedTab: MessageTab = .body
     @State private var decodeState: MessageDecodeState = .idle
@@ -71,7 +73,11 @@ struct MessagePaneView: View {
     }
 
     private var decodeIdentity: MessageDecodeIdentity {
-        MessageDecodeIdentity(eventID: event?.id, payloadIDs: payloads.map(\.id))
+        MessageDecodeIdentity(
+            eventID: event?.id,
+            counterpartEventID: counterpartEvent?.id,
+            payloadIDs: payloads.map(\.id)
+        )
     }
 
     private var paneHeader: some View {
@@ -234,7 +240,10 @@ struct MessagePaneView: View {
         let inputs = slices.map { slice in
             TracePayloadInput(slice: slice, data: document.data(for: slice))
         }
-        let decoded = await TracePayloadDecoder.decode(inputs)
+        let decoded = await TracePayloadDecoder.decode(
+            inputs,
+            counterpartBody: decodedCounterpartBody()
+        )
         guard !Task.isCancelled else { return }
         decodeState = .loaded(decoded)
         if !decoded.contains(where: { $0.id == selectedPayloadID }) {
@@ -243,5 +252,17 @@ struct MessagePaneView: View {
         if let payload = selectedPayload(from: decoded) {
             selectedInspectorID = payload.inspections.first?.id
         }
+    }
+
+    private func decodedCounterpartBody() -> TraceValue? {
+        guard side == .response, let counterpartEvent else { return nil }
+        let bodies = MessageSide.request.payloads(in: counterpartEvent).map { slice in
+            EmbeddedPayloadDecoder.decode(
+                document.data(for: slice),
+                format: slice.format
+            )
+        }
+        return bodies.first(where: { FoundationXPCEnvelopeDecoder.decode($0) != nil })
+            ?? bodies.first
     }
 }

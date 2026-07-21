@@ -10,13 +10,16 @@ public struct CoreDataXPCBodyInspector: TraceBodyInspector {
     public func inspect(_ context: BodyInspectorContext) -> BodyInspection? {
         guard let parentIdentifier,
               let parentBody = context.inspection(parentIdentifier)?.tree,
-              let message = CoreDataXPCMessageDecoder.decode(parentBody) else {
+              let message = CoreDataXPCMessageDecoder.decode(
+                  parentBody,
+                  request: context.counterpartBody.flatMap(Self.coreDataMessage)
+              ) else {
             return nil
         }
 
         return BodyInspection(
             id: identifier,
-            name: "Core Data",
+            name: "Core Data / NSXPCStore",
             priority: priority,
             parentID: parentIdentifier,
             content: .tree(message.logicalBody),
@@ -45,5 +48,12 @@ public struct CoreDataXPCBodyInspector: TraceBodyInspector {
             details.append(BodyInspectionDetail("Ancillary entities", value: "Allowed"))
         }
         return details
+    }
+
+    private static func coreDataMessage(in body: TraceValue) -> CoreDataXPCMessage? {
+        if let envelope = FoundationXPCEnvelopeDecoder.decode(body) {
+            return CoreDataXPCMessageDecoder.decode(envelope.logicalBody)
+        }
+        return CoreDataXPCMessageDecoder.decode(body)
     }
 }
