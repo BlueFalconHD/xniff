@@ -14,7 +14,13 @@ extern "C" {
 #define XNIFF_IPC_MAGIC 0x58495043u /* 'XIPC' */
 #define XNIFF_IPC_RING_MAGIC 0x58495247u /* 'XIRG' */
 #define XNIFF_IPC_RING_VERSION 1u
-#define XNIFF_IPC_RING_CAPACITY (1u << 20) /* 1 MiB stream buffer */
+#define XNIFF_IPC_RING_CAPACITY (1u << 23) /* 8 MiB stream buffer */
+
+enum {
+    XNIFF_CAPTURE_MODE_NONE = 0,
+    XNIFF_CAPTURE_MODE_MACH = (1u << 0),
+    XNIFF_CAPTURE_MODE_XPC  = (1u << 1),
+};
 
 // Event kinds for Mach message hooks
 enum {
@@ -41,9 +47,9 @@ typedef struct {
 typedef struct {
     uint32_t magic;        // XNIFF_IPC_RING_MAGIC
     uint16_t version;      // XNIFF_IPC_RING_VERSION
-    uint16_t reserved0;
+    uint16_t config_version;
     uint32_t capacity;     // bytes in data[]
-    uint32_t reserved1;
+    uint32_t capture_mode; // XNIFF_CAPTURE_MODE_* bits; zero until configured
     uint64_t write_idx;    // monotonic producer byte counter
     uint64_t read_idx;     // monotonic consumer byte counter
     uint64_t dropped_bytes;
@@ -128,6 +134,11 @@ enum {
     XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY = 4,
     XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC = 5,
     XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER    = 6,
+    XNIFF_XPC_FUNC_CONNECTION_CHECK_IN              = 7,
+    XNIFF_XPC_FUNC_DICTIONARY_SEND_REPLY            = 8,
+    XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE              = 9,
+    XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC = 10,
+    XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC = 11,
 };
 
 // TLV framing for attachments following the message bytes
@@ -142,6 +153,8 @@ enum {
     XNIFF_TLV_OOL_PORTS = 2, // value: xniff_ool_ports_t + bytes
     // value: xniff_xpc_serialized_t + bytes
     XNIFF_TLV_XPC_SERIALIZED = 0x100,
+    // value: xniff_xpc_conn_meta_t + name_public bytes + name_private bytes
+    XNIFF_TLV_XPC_CONN_META = 0x101,
 };
 
 typedef struct {
@@ -178,6 +191,56 @@ enum {
     // Output of private libxpc xpc_make_serialization() (version 5 container).
     XNIFF_XPC_SERIAL_FORMAT_LIBXPC_V5 = 1,
 };
+
+enum {
+    XNIFF_XPC_CONN_META_VERSION = 1,
+};
+
+enum {
+    XNIFF_XPC_CONN_META_HAS_NAME_PUBLIC       = (1u << 0),
+    XNIFF_XPC_CONN_META_HAS_NAME_PRIVATE      = (1u << 1),
+    XNIFF_XPC_CONN_META_HAS_PID_PUBLIC        = (1u << 2),
+    XNIFF_XPC_CONN_META_HAS_PID_PRIVATE       = (1u << 3),
+    XNIFF_XPC_CONN_META_HAS_INSTANCE          = (1u << 4),
+    XNIFF_XPC_CONN_META_HAS_PEER_INSTANCE     = (1u << 5),
+    XNIFF_XPC_CONN_META_HAS_FILTER_POLICY_ID  = (1u << 6),
+    XNIFF_XPC_CONN_META_HAS_EUID_PUBLIC       = (1u << 7),
+    XNIFF_XPC_CONN_META_HAS_EUID_PRIVATE      = (1u << 8),
+    XNIFF_XPC_CONN_META_HAS_EGID_PUBLIC       = (1u << 9),
+    XNIFF_XPC_CONN_META_HAS_EGID_PRIVATE      = (1u << 10),
+    XNIFF_XPC_CONN_META_HAS_CONTEXT_PUBLIC    = (1u << 11),
+    XNIFF_XPC_CONN_META_HAS_CONTEXT_PRIVATE   = (1u << 12),
+    XNIFF_XPC_CONN_META_HAS_BS_TYPE           = (1u << 13),
+    XNIFF_XPC_CONN_META_HAS_AUDIT_TOKEN       = (1u << 14),
+    XNIFF_XPC_CONN_META_HAS_ASID_PUBLIC       = (1u << 15),
+    XNIFF_XPC_CONN_META_HAS_ASID_PRIVATE      = (1u << 16),
+};
+
+typedef struct {
+    uint32_t version;          // XNIFF_XPC_CONN_META_VERSION
+    uint32_t flags;            // XNIFF_XPC_CONN_META_HAS_*
+
+    uint32_t pid_public;       // xpc_connection_get_pid()
+    uint32_t pid_private;      // _xpc_connection_get_pid() if present
+    uint32_t euid_public;      // xpc_connection_get_euid()
+    uint32_t euid_private;     // _xpc_connection_get_euid_0() if present
+    uint32_t egid_public;      // xpc_connection_get_egid()
+    uint32_t egid_private;     // _xpc_connection_get_egid_0() if present
+    uint32_t asid_public;      // xpc_connection_get_asid()
+    uint32_t asid_private;     // _xpc_connection_get_asid_0() if present
+
+    uint64_t instance;         // xpc_connection_get_instance()
+    uint64_t peer_instance;    // xpc_connection_get_peer_instance()
+    uint64_t filter_policy_id; // xpc_connection_get_filter_policy_id_4test()
+    uint64_t bs_type;          // xpc_connection_get_bs_type()
+    uint64_t context_public;   // xpc_connection_get_context()
+    uint64_t context_private;  // _xpc_connection_get_context_0()
+
+    uint32_t audit_token[8];   // _xpc_connection_get_audit_token_0()
+
+    uint32_t name_public_len;  // bytes after struct (not NUL-terminated)
+    uint32_t name_private_len; // bytes after public name bytes
+} xniff_xpc_conn_meta_t;
 
 // Payload for XNIFF_EVT_DEBUG_LOG, followed by msg_len bytes (not NUL-terminated).
 typedef struct {

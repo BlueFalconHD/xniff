@@ -24,6 +24,87 @@
 
 #define PATH_LIBSYS_PTHREAD_EXACT "/usr/lib/system/libsystem_pthread.dylib"
 #define PATH_LIBSYS_PTHREAD_SUB "libsystem_pthread"
+#define XNIFF_SYMBOL_WAIT_ATTEMPTS 100u
+
+static int xniff_resolve_symbol_flexible(mach_port_t task,
+                                         const char *exact_path,
+                                         const char *path_sub,
+                                         const char *symbol,
+                                         mach_vm_address_t *out_addr) {
+  if (!symbol || !out_addr) return -1;
+  if (exact_path && *exact_path &&
+      xniff_find_symbol_in_image_exact_path(task, exact_path, symbol, out_addr) == 0) {
+    return 0;
+  }
+  if (path_sub && *path_sub &&
+      xniff_find_symbol_in_image_path_contains(task, path_sub, symbol, out_addr) == 0) {
+    return 0;
+  }
+  if (xniff_find_symbol_in_task(task, symbol, out_addr) == 0) return 0;
+
+  // Some symbol tables omit or include the leading underscore depending on context.
+  if (symbol[0] == '_') {
+    if (xniff_find_symbol_in_task(task, symbol + 1, out_addr) == 0) return 0;
+  } else {
+    char alt[256];
+    int n = snprintf(alt, sizeof(alt), "_%s", symbol);
+    if (n > 0 && (size_t)n < sizeof(alt)) {
+      if (xniff_find_symbol_in_task(task, alt, out_addr) == 0) return 0;
+    }
+  }
+  return -1;
+}
+
+static int xniff_wait_for_symbol_flexible(mach_port_t task,
+                                          const char *exact_path,
+                                          const char *path_sub,
+                                          const char *symbol,
+                                          mach_vm_address_t *out_addr) {
+  unsigned long long tries = 0;
+  for (; tries < XNIFF_SYMBOL_WAIT_ATTEMPTS;) {
+    if (xniff_resolve_symbol_flexible(task, exact_path, path_sub, symbol, out_addr) == 0) {
+      return 0;
+    }
+    tries++;
+    if (tries <= 10 || (tries % 100) == 0) {
+      fprintf(stderr, "waiting for symbol %s in target...\n", symbol ? symbol : "<null>");
+    }
+    usleep(50 * 1000);
+  }
+  fprintf(stderr, "timed out waiting for symbol %s in target\n",
+          symbol ? symbol : "<null>");
+  return -1;
+}
+
+static int xniff_wait_for_create_symbol(mach_port_t task,
+                                        const char *exact_path,
+                                        const char *path_sub,
+                                        mach_vm_address_t *out_addr) {
+  unsigned long long tries = 0;
+  for (; tries < XNIFF_SYMBOL_WAIT_ATTEMPTS;) {
+    mach_vm_address_t from_mach = 0;
+    if (xniff_resolve_symbol_flexible(task, exact_path, path_sub,
+                                      "_pthread_create_from_mach_thread",
+                                      &from_mach) == 0) {
+      *out_addr = from_mach;
+      return 0;
+    }
+    mach_vm_address_t plain = 0;
+    if (xniff_resolve_symbol_flexible(task, exact_path, path_sub,
+                                      "_pthread_create",
+                                      &plain) == 0) {
+      *out_addr = plain;
+      return 0;
+    }
+    tries++;
+    if (tries <= 10 || (tries % 100) == 0) {
+      fprintf(stderr, "waiting for symbol _pthread_create*_ in target...\n");
+    }
+    usleep(50 * 1000);
+  }
+  fprintf(stderr, "timed out waiting for _pthread_create*_ in target\n");
+  return -1;
+}
 
 static void (*xniff_sign_remote_pc_fptr(mach_vm_address_t entry))(void) {
 #if XNIFF_HAS_PTRAUTH
@@ -53,10 +134,8 @@ int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path,
   const char *libdyld_sub = PATH_LIBDYLD_SUB;
 
   // look for dlopen
-  if (xniff_find_symbol_in_image_exact_path(task, libdyld_exact, "_dlopen",
-                                            &dlopen_addr) != 0 &&
-      xniff_find_symbol_in_image_path_contains(task, libdyld_sub, "_dlopen",
-                                               &dlopen_addr) != 0) {
+  if (xniff_wait_for_symbol_flexible(task, libdyld_exact, libdyld_sub, "_dlopen",
+                                     &dlopen_addr) != 0) {
     fprintf(stderr, "could not resolve dlopen in target\n");
     return -1;
   }
@@ -66,10 +145,8 @@ int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path,
 
   // look for pthread_exit
   // if not found, we can proceed without it and instead just infinite loop in the stub
-  if (xniff_find_symbol_in_image_exact_path(task, libpth_exact, "_pthread_exit",
-                                            &pthr_exit_addr) != 0 &&
-      xniff_find_symbol_in_image_path_contains(
-          task, libpth_sub, "_pthread_exit", &pthr_exit_addr) != 0) {
+  if (xniff_resolve_symbol_flexible(task, libpth_exact, libpth_sub, "_pthread_exit",
+                                    &pthr_exit_addr) != 0) {
     pthr_exit_addr = 0;
   }
 
@@ -122,29 +199,9 @@ int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path,
   }
 
   // look for pthread_create or pthread_create_from_mach_thread
-  mach_vm_address_t pthr_create_from_mach = 0, pthr_create = 0;
-  (void)xniff_find_symbol_in_image_exact_path(
-      task, libpth_exact, "_pthread_create_from_mach_thread",
-      &pthr_create_from_mach);
-
-  // try the substring path if exact failed
-  if (!pthr_create_from_mach)
-    (void)xniff_find_symbol_in_image_path_contains(
-        task, libpth_sub, "_pthread_create_from_mach_thread",
-        &pthr_create_from_mach);
-
-  // fallback to pthread_create if from_mach not found
-  if (!pthr_create_from_mach) {
-    (void)xniff_find_symbol_in_image_exact_path(
-        task, libpth_exact, "_pthread_create", &pthr_create);
-    if (!pthr_create)
-      (void)xniff_find_symbol_in_image_path_contains(
-          task, libpth_sub, "_pthread_create", &pthr_create);
-  }
-
-  // choose which pthread_create to use
-  mach_vm_address_t which_create =
-      pthr_create_from_mach ? pthr_create_from_mach : pthr_create;
+  mach_vm_address_t which_create = 0;
+  (void)xniff_wait_for_create_symbol(task, libpth_exact, libpth_sub,
+                                     &which_create);
   if (!which_create) {
     fprintf(stderr, "could not resolve pthread_create in target\n");
     goto fail_code;

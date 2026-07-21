@@ -1,9 +1,14 @@
--- XNIFF JSONL Wireshark plugin:
--- 1) custom FileHandler to open xniff JSONL directly
--- 2) dissector bound to a USER wtap_encap, with useful flow/reply fields
+-- XNIFF Wireshark plugin:
+-- 1) custom FileHandler for JSONL captures
+-- 2) custom FileHandler for binary .xniffbin captures
+-- 3) protocol split in packet list (XPC/MACH) for binary captures
 
-local XNIFF_ENCAP = (wtap and wtap.USER15) or (wtap and wtap.USER0)
-if not XNIFF_ENCAP then
+local XNIFF_JSON_ENCAP = (wtap and wtap.USER12) or (wtap and wtap.USER0)
+local XNIFF_DIAG_ENCAP = (wtap and wtap.USER13) or (wtap and wtap.USER0)
+local XNIFF_MACH_ENCAP = (wtap and wtap.USER14) or (wtap and wtap.USER0)
+local XNIFF_XPC_ENCAP = (wtap and wtap.USER15) or (wtap and wtap.USER0)
+local XNIFF_ENCAP = XNIFF_JSON_ENCAP
+if not XNIFF_JSON_ENCAP or not XNIFF_MACH_ENCAP or not XNIFF_XPC_ENCAP then
     return
 end
 
@@ -11,29 +16,41 @@ local json_dissector = Dissector.get("json")
 
 local xniff = Proto("xniff", "XNIFF JSONL")
 
-local f_schema = ProtoField.string("xniff.schema", "Schema")
-local f_event_id = ProtoField.uint32("xniff.event_id", "Event ID", base.DEC)
-local f_call_id = ProtoField.uint32("xniff.call_id", "Call ID", base.DEC)
-local f_entry_event_id = ProtoField.uint32("xniff.entry_event_id", "Entry Event ID", base.DEC)
-local f_kind = ProtoField.string("xniff.kind", "Kind")
-local f_pid = ProtoField.uint32("xniff.pid", "PID", base.DEC)
-local f_tid_low = ProtoField.uint32("xniff.tid_low", "Thread Low", base.HEX)
-local f_proc_name = ProtoField.string("xniff.proc_name", "Process Name")
-local f_flow = ProtoField.string("xniff.flow", "XPC Flow")
-local f_func_name = ProtoField.string("xniff.func_name", "XPC Function")
-local f_conn_seq = ProtoField.uint32("xniff.conn_seq", "Connection Sequence", base.DEC)
-local f_response_to_event_id = ProtoField.uint32("xniff.response_to_event_id", "Response To Event ID", base.DEC)
-local f_conn_pid = ProtoField.uint32("xniff.conn_pid", "Connection PID", base.DEC)
-local f_conn_name = ProtoField.string("xniff.conn_name", "Connection Name")
-local f_service_name = ProtoField.string("xniff.service_name", "Service Name")
-local f_conn_ptr = ProtoField.string("xniff.conn_ptr", "Connection Ptr")
-local f_msg_ptr = ProtoField.string("xniff.msg_ptr", "Message Ptr")
-local f_has_serialized_message = ProtoField.bool("xniff.has_serialized_message", "Has Serialized Message")
-local f_has_serialized_reply = ProtoField.bool("xniff.has_serialized_reply", "Has Serialized Reply")
-local f_has_serialized_event = ProtoField.bool("xniff.has_serialized_event", "Has Serialized Event")
-local f_serialized_message_len = ProtoField.uint32("xniff.serialized_message_len", "Serialized Message Length", base.DEC)
-local f_serialized_reply_len = ProtoField.uint32("xniff.serialized_reply_len", "Serialized Reply Length", base.DEC)
-local f_serialized_event_len = ProtoField.uint32("xniff.serialized_event_len", "Serialized Event Length", base.DEC)
+local function safe_field(make, ...)
+    local ok, v = pcall(make, ...)
+    if ok then return v end
+    return nil
+end
+
+local f_schema = safe_field(ProtoField.string, "xniff.schema", "Schema")
+local f_event_id = safe_field(ProtoField.uint32, "xniff.event_id", "Event ID", base.DEC)
+local f_call_id = safe_field(ProtoField.uint32, "xniff.call_id", "Call ID", base.DEC)
+local f_entry_event_id = safe_field(ProtoField.uint32, "xniff.entry_event_id", "Entry Event ID", base.DEC)
+local f_kind = safe_field(ProtoField.string, "xniff.kind", "Kind")
+local f_pid = safe_field(ProtoField.uint32, "xniff.pid", "PID", base.DEC)
+local f_tid_low = safe_field(ProtoField.uint32, "xniff.tid_low", "Thread Low", base.HEX)
+local f_proc_name = safe_field(ProtoField.string, "xniff.proc_name", "Process Name")
+local f_flow = safe_field(ProtoField.string, "xniff.flow", "XPC Flow")
+local f_role = safe_field(ProtoField.string, "xniff.role", "XPC Role")
+local f_func_name = safe_field(ProtoField.string, "xniff.func_name", "Function")
+local f_api = safe_field(ProtoField.uint32, "xniff.api", "API", base.DEC)
+local f_direction = safe_field(ProtoField.uint32, "xniff.direction", "Direction", base.DEC)
+local f_seq = safe_field(ProtoField.string, "xniff.seq", "Sequence")
+local f_function = safe_field(ProtoField.uint32, "xniff.function", "Function Code", base.DEC)
+local f_payload_view = safe_field(ProtoField.string, "xniff.payload_view", "Payload View")
+local f_conn_seq = safe_field(ProtoField.uint32, "xniff.conn_seq", "Connection Sequence", base.DEC)
+local f_response_to_event_id = safe_field(ProtoField.uint32, "xniff.response_to_event_id", "Response To Event ID", base.DEC)
+local f_conn_pid = safe_field(ProtoField.uint32, "xniff.conn_pid", "Connection PID", base.DEC)
+local f_conn_name = safe_field(ProtoField.string, "xniff.conn_name", "Connection Name")
+local f_service_name = safe_field(ProtoField.string, "xniff.service_name", "Service Name")
+local f_conn_ptr = safe_field(ProtoField.string, "xniff.conn_ptr", "Connection Ptr")
+local f_msg_ptr = safe_field(ProtoField.string, "xniff.msg_ptr", "Message Ptr")
+local f_has_serialized_message = safe_field(ProtoField.bool, "xniff.has_serialized_message", "Has Serialized Message")
+local f_has_serialized_reply = safe_field(ProtoField.bool, "xniff.has_serialized_reply", "Has Serialized Reply")
+local f_has_serialized_event = safe_field(ProtoField.bool, "xniff.has_serialized_event", "Has Serialized Event")
+local f_serialized_message_len = safe_field(ProtoField.uint32, "xniff.serialized_message_len", "Serialized Message Length", base.DEC)
+local f_serialized_reply_len = safe_field(ProtoField.uint32, "xniff.serialized_reply_len", "Serialized Reply Length", base.DEC)
+local f_serialized_event_len = safe_field(ProtoField.uint32, "xniff.serialized_event_len", "Serialized Event Length", base.DEC)
 
 xniff.fields = {
     f_schema,
@@ -45,7 +62,13 @@ xniff.fields = {
     f_tid_low,
     f_proc_name,
     f_flow,
+    f_role,
     f_func_name,
+    f_api,
+    f_direction,
+    f_seq,
+    f_function,
+    f_payload_view,
     f_conn_seq,
     f_response_to_event_id,
     f_conn_pid,
@@ -1587,11 +1610,15 @@ end
 register_filehandler(fh)
 
 local function add_if_num(tree, tvb, field, n)
-    if n ~= nil then tree:add(field, tvb(0, 0), n) end
+    if field ~= nil and n ~= nil then tree:add(field, tvb(0, 0), n) end
 end
 
 local function add_if_str(tree, tvb, field, s)
-    if s ~= nil and s ~= "" then tree:add(field, tvb(0, 0), s) end
+    if field ~= nil and s ~= nil and s ~= "" then tree:add(field, tvb(0, 0), s) end
+end
+
+local function add_if_bool(tree, tvb, field, v)
+    if field ~= nil and v ~= nil then tree:add(field, tvb(0, 0), v) end
 end
 
 function xniff.dissector(tvb, pinfo, tree)
@@ -1639,9 +1666,9 @@ function xniff.dissector(tvb, pinfo, tree)
     local has_msg, msg_len = slot_has_data(line, "message")
     local has_reply, reply_len = slot_has_data(line, "reply")
     local has_event, event_len = slot_has_data(line, "event")
-    tree:add(f_has_serialized_message, tvb(0, 0), has_msg)
-    tree:add(f_has_serialized_reply, tvb(0, 0), has_reply)
-    tree:add(f_has_serialized_event, tvb(0, 0), has_event)
+    add_if_bool(tree, tvb, f_has_serialized_message, has_msg)
+    add_if_bool(tree, tvb, f_has_serialized_reply, has_reply)
+    add_if_bool(tree, tvb, f_has_serialized_event, has_event)
     add_if_num(tree, tvb, f_serialized_message_len, msg_len)
     add_if_num(tree, tvb, f_serialized_reply_len, reply_len)
     add_if_num(tree, tvb, f_serialized_event_len, event_len)
@@ -1680,4 +1707,1109 @@ end
 local wtap_encap = DissectorTable.get("wtap_encap")
 if wtap_encap then
     wtap_encap:add(XNIFF_ENCAP, xniff)
+end
+
+-- Binary v2 capture support (.xniffbin / raw v2 stream)
+
+local XNIFF_BIN_FILE_MAGIC = 0x584e4246
+local XNIFF_BIN_FILE_VERSION = 2
+local XNIFF_IPC_V2_VERSION = 1
+
+local XNIFF_API_MACH_MSG = 1
+local XNIFF_API_MACH_MSG2 = 2
+local XNIFF_API_XPC_HL = 3
+local XNIFF_API_DEBUG = 4
+
+local XNIFF_DIR_ENTRY = 0
+local XNIFF_DIR_EXIT = 1
+
+local XNIFF_V2_SEC_MACH_HEADER_OPTIONS = 1
+local XNIFF_V2_SEC_MACH_INLINE_BYTES = 2
+local XNIFF_V2_SEC_MACH_TRAILER_BYTES = 3
+local XNIFF_V2_SEC_MACH_DESC_META = 4
+local XNIFF_V2_SEC_MACH_DESC_OOL_BYTES = 5
+local XNIFF_V2_SEC_MACH_DESC_PORT_ARRAY = 6
+local XNIFF_V2_SEC_XPC_SERIALIZED = 7
+local XNIFF_V2_SEC_XPC_CONN_META = 8
+local XNIFF_V2_SEC_HOOK_DIAG = 9
+local XNIFF_V2_SEC_XPC_CALL_META = 10
+local XNIFF_V2_SEC_BACKTRACE = 11
+local XNIFF_V2_SEC_BACKTRACE_SYMBOLS = 12
+local XNIFF_V2_SEC_CALL_ID = 13
+
+local XNIFF_XPC_FUNC_CONNECTION_CREATE = 1
+local XNIFF_XPC_FUNC_PIPE_ROUTINE = 2
+local XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE = 3
+local XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY = 4
+local XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC = 5
+local XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER = 6
+local XNIFF_XPC_FUNC_CONNECTION_CHECK_IN = 7
+local XNIFF_XPC_FUNC_DICTIONARY_SEND_REPLY = 8
+local XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE = 9
+local XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC = 10
+local XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC = 11
+
+local XNIFF_XPC_CONN_META_HAS_NAME_PUBLIC = (1 << 0)
+local XNIFF_XPC_CONN_META_HAS_PID_PUBLIC = (1 << 2)
+
+local MACH_SEND_MSG = 0x1
+local MACH_RCV_MSG = 0x2
+
+local g_bin_records_by_frame = {}
+
+local function le_u16(s, off0)
+    if not s or off0 < 0 or (off0 + 2) > #s then return nil end
+    local b1, b2 = s:byte(off0 + 1, off0 + 2)
+    return b1 + (b2 * 0x100)
+end
+
+local function le_u32(s, off0)
+    if not s or off0 < 0 or (off0 + 4) > #s then return nil end
+    local b1, b2, b3, b4 = s:byte(off0 + 1, off0 + 4)
+    return b1 + (b2 * 0x100) + (b3 * 0x10000) + (b4 * 0x1000000)
+end
+
+local function le_i32(s, off0)
+    local v = le_u32(s, off0)
+    if v == nil then return nil end
+    if v >= 0x80000000 then
+        return v - 0x100000000
+    end
+    return v
+end
+
+local function le_u64_parts(s, off0)
+    local lo = le_u32(s, off0)
+    local hi = le_u32(s, off0 + 4)
+    if lo == nil or hi == nil then return nil, nil end
+    return lo, hi
+end
+
+local function le_u64_number(s, off0)
+    local lo, hi = le_u64_parts(s, off0)
+    if lo == nil then return nil end
+    return (hi * 4294967296.0) + lo
+end
+
+local function le_u64_hex(s, off0)
+    local lo, hi = le_u64_parts(s, off0)
+    if lo == nil then return nil end
+    return u64_hex(hi, lo), lo, hi
+end
+
+local function make_hexdump(raw)
+    if not raw or #raw == 0 then return "" end
+    local out = {}
+    for i = 1, #raw, 16 do
+        local chunk = raw:sub(i, i + 15)
+        local hex_parts = {}
+        local ascii_parts = {}
+        for j = 1, #chunk do
+            local byte = chunk:byte(j)
+            hex_parts[#hex_parts + 1] = string.format("%02x", byte)
+            if byte >= 32 and byte <= 126 then
+                ascii_parts[#ascii_parts + 1] = string.char(byte)
+            else
+                ascii_parts[#ascii_parts + 1] = "."
+            end
+        end
+        local offset = i - 1
+        out[#out + 1] = string.format(
+            "%08x  %-48s  |%s|",
+            offset,
+            table.concat(hex_parts, " "),
+            table.concat(ascii_parts)
+        )
+    end
+    return table.concat(out, "\n")
+end
+
+local function xpc_func_name(func)
+    if func == XNIFF_XPC_FUNC_CONNECTION_CREATE then return "xpc_connection_create" end
+    if func == XNIFF_XPC_FUNC_PIPE_ROUTINE then return "xpc_pipe_routine" end
+    if func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE then return "xpc_connection_send_message" end
+    if func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY then return "xpc_connection_send_message_with_reply" end
+    if func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC then return "xpc_connection_send_message_with_reply_sync" end
+    if func == XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER then return "_xpc_connection_call_event_handler" end
+    if func == XNIFF_XPC_FUNC_CONNECTION_CHECK_IN then return "_xpc_connection_check_in" end
+    if func == XNIFF_XPC_FUNC_DICTIONARY_SEND_REPLY then return "xpc_dictionary_send_reply" end
+    if func == XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE then return "xpc_session_send_message" end
+    if func == XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC then return "xpc_session_send_message_with_reply_async" end
+    if func == XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC then return "xpc_session_send_message_with_reply_sync" end
+    return "unknown"
+end
+
+local function xpc_flow(func)
+    if func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE then return "send" end
+    if func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY then return "send" end
+    if func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC then return "send" end
+    if func == XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE then return "send" end
+    if func == XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC then return "send" end
+    if func == XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC then return "send" end
+    if func == XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER then return "recv" end
+    if func == XNIFF_XPC_FUNC_DICTIONARY_SEND_REPLY then return "reply" end
+    if func == XNIFF_XPC_FUNC_CONNECTION_CHECK_IN then return "rpc" end
+    if func == XNIFF_XPC_FUNC_PIPE_ROUTINE then return "rpc" end
+    if func == XNIFF_XPC_FUNC_CONNECTION_CREATE then return "meta" end
+    return "unknown"
+end
+
+local function xpc_role(func, direction)
+    if func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY or
+       func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC or
+       func == XNIFF_XPC_FUNC_PIPE_ROUTINE or
+       func == XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC or
+       func == XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC then
+        return (direction == XNIFF_DIR_ENTRY) and "request" or "response"
+    end
+    if func == XNIFF_XPC_FUNC_DICTIONARY_SEND_REPLY then return "response" end
+    if func == XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER then return "incoming" end
+    if func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE or
+       func == XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE then
+        return "one-way"
+    end
+    return "metadata"
+end
+
+local function xpc_slot_name(slot)
+    if slot == 1 then return "message" end
+    if slot == 2 then return "reply" end
+    if slot == 3 then return "event" end
+    return "slot_" .. tostring(slot)
+end
+
+local function xpc_format_name(fmt)
+    if fmt == 1 then return "libxpc_v5" end
+    return tostring(fmt)
+end
+
+local function entry_kind_name(api, direction)
+    if api == XNIFF_API_MACH_MSG then
+        return (direction == XNIFF_DIR_ENTRY) and "entry" or "exit"
+    elseif api == XNIFF_API_MACH_MSG2 then
+        return (direction == XNIFF_DIR_ENTRY) and "entry2" or "exit2"
+    elseif api == XNIFF_API_XPC_HL then
+        return (direction == XNIFF_DIR_ENTRY) and "xpc_entry" or "xpc_exit"
+    elseif api == XNIFF_API_DEBUG then
+        return "debug_log"
+    end
+    return "unknown"
+end
+
+local function mach_function_name(fn)
+    if fn == 1 then return "mach_msg_entry" end
+    if fn == 2 then return "mach_msg_exit" end
+    if fn == 3 then return "mach_msg2_entry" end
+    if fn == 4 then return "mach_msg2_exit" end
+    return "unknown"
+end
+
+local function xpc_string_field_names(kind, func)
+    local names = { nil, nil, nil, nil }
+    if func == XNIFF_XPC_FUNC_CONNECTION_CREATE then
+        if kind == "xpc_entry" then
+            names[1] = "target_service_name"
+        else
+            names[1] = "connection_name"
+        end
+    elseif func == XNIFF_XPC_FUNC_PIPE_ROUTINE then
+        names[1] = "pipe_description"
+        names[2] = "request_description"
+        if kind == "xpc_exit" then names[3] = "reply_description" end
+    elseif func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE or
+           func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY or
+           func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC then
+        names[1] = "connection_name"
+        names[2] = "message_description"
+        names[3] = "connection_description"
+        if kind == "xpc_exit" then names[4] = "reply_description" end
+    elseif func == XNIFF_XPC_FUNC_CONNECTION_CHECK_IN then
+        names[1] = "connection_name"
+    end
+    return names
+end
+
+local function xpc_arg_name(func, idx0)
+    if func == XNIFF_XPC_FUNC_CONNECTION_CREATE then
+        if idx0 == 0 then return "service_name_ptr" end
+        if idx0 == 1 then return "target_queue_ptr" end
+    elseif func == XNIFF_XPC_FUNC_PIPE_ROUTINE then
+        if idx0 == 0 then return "pipe_ptr" end
+        if idx0 == 1 then return "request_ptr_ptr" end
+        if idx0 == 2 then return "reply_ptr_ptr" end
+    elseif func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE then
+        if idx0 == 0 then return "connection_ptr" end
+        if idx0 == 1 then return "message_ptr" end
+    elseif func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY then
+        if idx0 == 0 then return "connection_ptr" end
+        if idx0 == 1 then return "message_ptr" end
+        if idx0 == 2 then return "reply_queue_ptr" end
+        if idx0 == 3 then return "reply_handler_ptr" end
+    elseif func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC then
+        if idx0 == 0 then return "connection_ptr" end
+        if idx0 == 1 then return "message_ptr" end
+    elseif func == XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER then
+        if idx0 == 0 then return "connection_ptr" end
+        if idx0 == 1 then return "event_ptr" end
+    elseif func == XNIFF_XPC_FUNC_CONNECTION_CHECK_IN then
+        if idx0 == 0 then return "connection_ptr" end
+    elseif func == XNIFF_XPC_FUNC_DICTIONARY_SEND_REPLY then
+        if idx0 == 0 then return "reply_ptr" end
+    elseif func == XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE then
+        if idx0 == 0 then return "session_ptr" end
+        if idx0 == 1 then return "message_ptr" end
+    elseif func == XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC then
+        if idx0 == 0 then return "session_ptr" end
+        if idx0 == 1 then return "message_ptr" end
+        if idx0 == 2 then return "reply_handler_ptr" end
+    elseif func == XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC then
+        if idx0 == 0 then return "session_ptr" end
+        if idx0 == 1 then return "message_ptr" end
+        if idx0 == 2 then return "error_out_ptr" end
+    end
+    return nil
+end
+
+local function ts_from_ns_for_frame(ns, state)
+    if not ns then return os.time(), 0 end
+    if not state.base_mono_ns then
+        state.base_mono_ns = ns
+        state.base_epoch = os.time()
+    end
+    local delta = ns - state.base_mono_ns
+    if delta < 0 then delta = 0 end
+    local whole = math.floor(delta / 1000000000.0)
+    local nsec = math.floor(delta - (whole * 1000000000.0) + 0.5)
+    if nsec >= 1000000000 then
+        whole = whole + 1
+        nsec = nsec - 1000000000
+    end
+    return state.base_epoch + whole, nsec
+end
+
+local function parse_v2_record(entry)
+    if not entry or #entry < 40 then
+        return nil, "entry too short"
+    end
+
+    local entry_len = le_u32(entry, 0)
+    local entry_type = le_u16(entry, 4)
+    local version = le_u16(entry, 6)
+    if not entry_len or not entry_type or not version then
+        return nil, "invalid entry header"
+    end
+    if entry_len ~= #entry then
+        return nil, "entry length mismatch"
+    end
+    if version ~= XNIFF_IPC_V2_VERSION then
+        return nil, "unsupported v2 version"
+    end
+
+    local seq_hex = le_u64_hex(entry, 8)
+    local pid = le_u32(entry, 16)
+    local tid_low = le_u32(entry, 20)
+    local ts_ns = le_u64_number(entry, 24)
+    local direction = le_u16(entry, 32)
+    local api = le_u16(entry, 34)
+    local function_code = le_u32(entry, 36)
+    if not pid or not tid_low or not direction or not api or not function_code then
+        return nil, "invalid fixed header"
+    end
+
+    local rec = {
+        entry_len = entry_len,
+        entry_type = entry_type,
+        version = version,
+        seq_hex = seq_hex or "0x0",
+        pid = pid,
+        tid_low = tid_low,
+        timestamp_ns = ts_ns,
+        direction = direction,
+        api = api,
+        function_code = function_code,
+        kind = entry_kind_name(api, direction),
+        sections = {},
+        backtrace = {},
+        backtrace_symbols = {},
+        mach = { descriptors = {} },
+        xpc = { serialized = {}, strings = {} },
+    }
+
+    local sec_off = 40
+    while (sec_off + 8) <= #entry do
+        local sec_type = le_u16(entry, sec_off)
+        local sec_flags = le_u16(entry, sec_off + 2)
+        local sec_len = le_u32(entry, sec_off + 4)
+        if not sec_type or not sec_flags or not sec_len then break end
+
+        local payload_off = sec_off + 8
+        if (payload_off + sec_len) > #entry then
+            break
+        end
+        local payload = entry:sub(payload_off + 1, payload_off + sec_len)
+        local sec = {
+            type = sec_type,
+            flags = sec_flags,
+            len = sec_len,
+            payload = payload,
+        }
+        rec.sections[#rec.sections + 1] = sec
+
+        if sec_type == XNIFF_V2_SEC_MACH_HEADER_OPTIONS and #payload >= 128 then
+            local mach = rec.mach
+            mach.api = le_u32(payload, 0)
+            mach.direction = le_u32(payload, 4)
+            mach.option_lo = le_u32(payload, 8)
+            mach.option_hi = le_u32(payload, 12)
+            mach.msgh_size = le_u32(payload, 16)
+            mach.copy_len = le_u32(payload, 20)
+            mach.msg_addr_hex = le_u64_hex(payload, 24)
+            mach.aux_addr_hex = le_u64_hex(payload, 32)
+            mach.ret_hex = le_u64_hex(payload, 40)
+            mach.desc_count = le_u32(payload, 48)
+            mach.priority = le_u32(payload, 52)
+            mach.timeout_hex = le_u64_hex(payload, 56)
+            mach.option64_hex = string.format("0x%08x%08x", mach.option_hi or 0, mach.option_lo or 0)
+            mach.is_send = ((mach.option_lo or 0) & MACH_SEND_MSG) ~= 0
+            mach.is_recv = ((mach.option_lo or 0) & MACH_RCV_MSG) ~= 0
+            mach.args = {}
+            for i = 0, 7 do
+                mach.args[i + 1] = le_u64_hex(payload, 64 + (i * 8)) or "0x0"
+            end
+        elseif sec_type == XNIFF_V2_SEC_MACH_INLINE_BYTES then
+            rec.mach.inline_bytes = payload
+            if #payload >= 24 then
+                rec.mach.msgh_bits = le_u32(payload, 0)
+                rec.mach.msgh_size_hdr = le_u32(payload, 4)
+                rec.mach.remote = le_u32(payload, 8)
+                rec.mach.local_port = le_u32(payload, 12)
+                rec.mach.voucher = le_u32(payload, 16)
+                rec.mach.msgh_id = le_i32(payload, 20)
+            end
+        elseif sec_type == XNIFF_V2_SEC_MACH_TRAILER_BYTES then
+            rec.mach.trailer_bytes = payload
+        elseif sec_type == XNIFF_V2_SEC_MACH_DESC_META and #payload >= 40 then
+            local desc = {
+                index = le_u32(payload, 0),
+                desc_type = le_u16(payload, 4),
+                desc_flags = le_u16(payload, 6),
+                address_hex = le_u64_hex(payload, 8),
+                size_bytes = le_u32(payload, 16),
+                count = le_u32(payload, 20),
+                elem_size = le_u32(payload, 24),
+                port_name = le_u32(payload, 28),
+                port_disposition = le_u32(payload, 32),
+            }
+            rec.mach.descriptors[#rec.mach.descriptors + 1] = desc
+        elseif sec_type == XNIFF_V2_SEC_MACH_DESC_OOL_BYTES or sec_type == XNIFF_V2_SEC_MACH_DESC_PORT_ARRAY then
+            local d = rec.mach.descriptors[#rec.mach.descriptors]
+            if d then
+                d.bytes = payload
+                d.bytes_kind = sec_type
+            end
+        elseif sec_type == XNIFF_V2_SEC_XPC_CALL_META and #payload >= 104 then
+            local xpc = rec.xpc
+            xpc.api = le_u32(payload, 0)
+            xpc.direction = le_u32(payload, 4)
+            xpc.func = le_u32(payload, 8)
+            xpc.conn_pid = le_u32(payload, 12)
+            xpc.ret_hex = le_u64_hex(payload, 16)
+            xpc.args = {}
+            for i = 0, 7 do
+                xpc.args[i + 1] = le_u64_hex(payload, 24 + (i * 8)) or "0x0"
+            end
+            xpc.str_lens = {
+                le_u32(payload, 88) or 0,
+                le_u32(payload, 92) or 0,
+                le_u32(payload, 96) or 0,
+                le_u32(payload, 100) or 0,
+            }
+            local so = 104
+            for i = 1, 4 do
+                local sl = xpc.str_lens[i] or 0
+                if sl > 0 and (so + sl) <= #payload then
+                    xpc.strings[i] = payload:sub(so + 1, so + sl)
+                    so = so + sl
+                else
+                    xpc.strings[i] = ""
+                end
+            end
+            xpc.func_name = xpc_func_name(xpc.func or rec.function_code)
+            xpc.flow = xpc_flow(xpc.func or rec.function_code)
+            xpc.role = xpc_role(xpc.func or rec.function_code, xpc.direction or rec.direction)
+            if xpc.args and #xpc.args >= 2 then
+                if (xpc.func or 0) == XNIFF_XPC_FUNC_CONNECTION_CREATE then
+                    xpc.conn_ptr = xpc.ret_hex
+                else
+                    xpc.conn_ptr = xpc.args[1]
+                end
+                xpc.msg_ptr = xpc.args[2]
+            end
+        elseif sec_type == XNIFF_V2_SEC_XPC_SERIALIZED and #payload >= 12 then
+            local slot = payload:byte(1) or 0
+            local fmt = payload:byte(2) or 0
+            local flags = le_u16(payload, 2) or 0
+            local original_len = le_u32(payload, 4) or 0
+            local stored_len = le_u32(payload, 8) or 0
+            local bytes_avail = #payload - 12
+            local keep = stored_len
+            if keep > bytes_avail then keep = bytes_avail end
+            if keep < 0 then keep = 0 end
+            local bytes = payload:sub(13, 12 + keep)
+            local slot_name = xpc_slot_name(slot)
+            rec.xpc.serialized[slot_name] = {
+                slot = slot,
+                format = fmt,
+                format_name = xpc_format_name(fmt),
+                flags = flags,
+                original_len = original_len,
+                stored_len = keep,
+                truncated = (flags & 1) ~= 0,
+                bytes = bytes,
+            }
+        elseif sec_type == XNIFF_V2_SEC_XPC_CONN_META and #payload >= 128 then
+            local cm = {}
+            cm.version = le_u32(payload, 0) or 0
+            cm.flags = le_u32(payload, 4) or 0
+            cm.pid_public = le_u32(payload, 8) or 0
+            cm.name_public_len = le_u32(payload, 120) or 0
+            cm.name_private_len = le_u32(payload, 124) or 0
+            local so = 128
+            if cm.name_public_len > 0 and (so + cm.name_public_len) <= #payload then
+                cm.name_public = payload:sub(so + 1, so + cm.name_public_len)
+                so = so + cm.name_public_len
+            end
+            if cm.name_private_len > 0 and (so + cm.name_private_len) <= #payload then
+                cm.name_private = payload:sub(so + 1, so + cm.name_private_len)
+            end
+            rec.xpc.conn_meta = cm
+            if (cm.flags & XNIFF_XPC_CONN_META_HAS_PID_PUBLIC) ~= 0 and (rec.xpc.conn_pid or 0) == 0 then
+                rec.xpc.conn_pid = cm.pid_public
+            end
+            if (cm.flags & XNIFF_XPC_CONN_META_HAS_NAME_PUBLIC) ~= 0 and cm.name_public and cm.name_public ~= "" then
+                rec.xpc.conn_name = cm.name_public
+            end
+        elseif sec_type == XNIFF_V2_SEC_HOOK_DIAG and #payload >= 8 then
+            local msg_len = le_u32(payload, 0) or 0
+            if msg_len > (#payload - 8) then msg_len = #payload - 8 end
+            rec.diag = payload:sub(9, 8 + msg_len)
+        elseif sec_type == XNIFF_V2_SEC_BACKTRACE and #payload >= 8 then
+            local count = le_u32(payload, 0) or 0
+            local avail = math.floor((#payload - 8) / 8)
+            if count > 32 then count = 32 end
+            if count > avail then count = avail end
+            local pcs = {}
+            for i = 0, count - 1 do
+                pcs[#pcs + 1] = le_u64_hex(payload, 8 + (i * 8)) or "0x0"
+            end
+            rec.backtrace = pcs
+        elseif sec_type == XNIFF_V2_SEC_BACKTRACE_SYMBOLS and #payload >= 8 then
+            local count = le_u32(payload, 0) or 0
+            local strings_len = le_u32(payload, 4) or 0
+            if count > 32 then count = 32 end
+            local rec_bytes = count * 24
+            local rec_off = 8
+            local str_off = rec_off + rec_bytes
+            local str_end = str_off + strings_len
+            if str_end > #payload then str_end = #payload end
+            if (rec_off + rec_bytes) <= #payload and str_off <= #payload then
+                local so = str_off
+                local syms = {}
+                for i = 0, count - 1 do
+                    local ro = rec_off + (i * 24)
+                    local pc = le_u64_hex(payload, ro) or "0x0"
+                    local sym_addr = le_u64_hex(payload, ro + 8) or "0x0"
+                    local name_len = le_u32(payload, ro + 16) or 0
+                    local image_len = le_u32(payload, ro + 20) or 0
+                    if (so + name_len + image_len) > str_end then break end
+                    local name = ""
+                    if name_len > 0 then
+                        name = payload:sub(so + 1, so + name_len)
+                        so = so + name_len
+                    end
+                    local image = ""
+                    if image_len > 0 then
+                        image = payload:sub(so + 1, so + image_len)
+                        so = so + image_len
+                    end
+                    syms[#syms + 1] = {
+                        pc = pc,
+                        sym_addr = sym_addr,
+                        name = name,
+                        image = image,
+                    }
+                end
+                rec.backtrace_symbols = syms
+            end
+        elseif sec_type == XNIFF_V2_SEC_CALL_ID and #payload >= 8 then
+            rec.wire_call_id = le_u64_hex(payload, 0)
+        end
+
+        sec_off = payload_off + sec_len
+    end
+
+    if not rec.xpc.func_name then
+        rec.xpc.func_name = xpc_func_name(rec.function_code)
+    end
+    if not rec.xpc.flow then
+        rec.xpc.flow = xpc_flow(rec.function_code)
+    end
+    if not rec.xpc.role then
+        rec.xpc.role = xpc_role(rec.function_code, rec.direction)
+    end
+
+    return rec
+end
+
+local function choose_payload_for_record(rec)
+    if not rec then return "", "none" end
+    if rec.api == XNIFF_API_MACH_MSG or rec.api == XNIFF_API_MACH_MSG2 then
+        if rec.mach and rec.mach.inline_bytes and #rec.mach.inline_bytes > 0 then
+            return rec.mach.inline_bytes, "mach.inline"
+        end
+    elseif rec.api == XNIFF_API_XPC_HL then
+        local order = nil
+        if rec.function_code == XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER then
+            order = { "event", "message", "reply" }
+        elseif rec.direction == XNIFF_DIR_EXIT then
+            order = { "reply", "message", "event" }
+        else
+            order = { "message", "event", "reply" }
+        end
+        for _, slot_name in ipairs(order) do
+            local slot = rec.xpc and rec.xpc.serialized and rec.xpc.serialized[slot_name]
+            if slot and slot.bytes and #slot.bytes > 0 then
+                return slot.bytes, "xpc.serialized." .. slot_name
+            end
+        end
+    elseif rec.api == XNIFF_API_DEBUG and rec.diag and #rec.diag > 0 then
+        return rec.diag, "diag.text"
+    end
+    return "", "none"
+end
+
+local function encap_for_record(rec)
+    if not rec then return XNIFF_JSON_ENCAP end
+    if rec.api == XNIFF_API_XPC_HL then return XNIFF_XPC_ENCAP end
+    if rec.api == XNIFF_API_MACH_MSG or rec.api == XNIFF_API_MACH_MSG2 then return XNIFF_MACH_ENCAP end
+    if rec.api == XNIFF_API_DEBUG then return XNIFF_DIAG_ENCAP end
+    if rec.entry_type == 2 then return XNIFF_XPC_ENCAP end
+    if rec.entry_type == 1 then return XNIFF_MACH_ENCAP end
+    return XNIFF_DIAG_ENCAP
+end
+
+local function assign_call_id(st, rec)
+    if not st or not rec then
+        return nil
+    end
+    if rec.wire_call_id then
+        local wire_key = tostring(rec.pid or 0) .. ":" .. rec.wire_call_id
+        local wire_id = st.wire_calls[wire_key]
+        if wire_id then return wire_id end
+        wire_id = st.next_call_id
+        st.next_call_id = st.next_call_id + 1
+        st.wire_calls[wire_key] = wire_id
+        return wire_id
+    end
+
+    local key = table.concat({
+        tostring(rec.pid or 0),
+        tostring(rec.tid_low or 0),
+        tostring(rec.api or 0),
+        tostring(rec.function_code or 0),
+    }, ":")
+    local id = nil
+    if rec.direction == XNIFF_DIR_ENTRY then
+        id = st.next_call_id
+        st.next_call_id = st.next_call_id + 1
+        local stack = st.inflight[key]
+        if not stack then
+            stack = {}
+            st.inflight[key] = stack
+        end
+        stack[#stack + 1] = id
+    elseif rec.direction == XNIFF_DIR_EXIT then
+        local stack = st.inflight[key]
+        if stack and #stack > 0 then
+            id = table.remove(stack)
+            if #stack == 0 then st.inflight[key] = nil end
+        else
+            id = st.next_call_id
+            st.next_call_id = st.next_call_id + 1
+        end
+    else
+        id = st.next_call_id
+        st.next_call_id = st.next_call_id + 1
+    end
+    return id
+end
+
+local function apply_record_to_frame(frame, rec, st)
+    local payload, payload_view = choose_payload_for_record(rec)
+    rec.payload_view = payload_view
+    rec.payload = payload
+
+    frame.encap = encap_for_record(rec)
+    frame.data = payload
+    frame.captured_length = #payload
+    frame.original_length = #payload
+
+    if rec.timestamp_ns then
+        local sec, nsec = ts_from_ns_for_frame(rec.timestamp_ns, st)
+        local t = nstime_new(sec, nsec)
+        if t then frame.time = t end
+    end
+end
+
+local function bin_read_record_at_current(file)
+    local offset = file:seek()
+    local h = file:read(16)
+    if not h then
+        return false
+    end
+    if #h ~= 16 then
+        return nil
+    end
+    local entry_len = le_u32(h, 0)
+    local version = le_u16(h, 6)
+    if not entry_len or not version then
+        return nil
+    end
+    if version ~= XNIFF_IPC_V2_VERSION then
+        return nil
+    end
+    if entry_len < 40 or entry_len > (64 * 1024 * 1024) then
+        return nil
+    end
+    local tail = file:read(entry_len - 16)
+    if not tail or #tail ~= (entry_len - 16) then
+        return nil
+    end
+    local entry = h .. tail
+    local rec, err = parse_v2_record(entry)
+    if not rec then
+        return nil, err
+    end
+    rec.offset = offset
+    return rec
+end
+
+local function bin_read_frame(file, capture, frame, is_seek)
+    local st = capture.private_table
+    if type(st) ~= "table" then
+        return false
+    end
+
+    if st.mode == "file" and not st.file_hdr_consumed then
+        local fh = file:read(8)
+        if not fh or #fh ~= 8 then
+            return false
+        end
+        st.file_hdr_consumed = true
+    end
+
+    local offset = file:seek()
+    local rec, err = bin_read_record_at_current(file)
+    if rec == false then
+        return false
+    end
+    if not rec then
+        if err then
+            return false
+        end
+        return false
+    end
+
+    local frame_no = nil
+    if is_seek then
+        frame_no = st.offset_to_frame[offset]
+    else
+        frame_no = st.next_frame_no
+        st.next_frame_no = st.next_frame_no + 1
+        st.offset_to_frame[offset] = frame_no
+    end
+    if not frame_no or frame_no <= 0 then
+        frame_no = st.next_frame_no
+        st.next_frame_no = st.next_frame_no + 1
+        st.offset_to_frame[offset] = frame_no
+    end
+
+    if not is_seek then
+        rec.event_id = frame_no
+        rec.call_id = assign_call_id(st, rec)
+        g_bin_records_by_frame[frame_no] = rec
+    else
+        local existing = g_bin_records_by_frame[frame_no]
+        if existing then
+            rec = existing
+        else
+            rec.event_id = frame_no
+            rec.call_id = nil
+            g_bin_records_by_frame[frame_no] = rec
+        end
+    end
+
+    apply_record_to_frame(frame, rec, st)
+    return offset
+end
+
+local fh_bin = FileHandler.new("XNIFF Binary", "xniff_bin", "XNIFF binary v2 capture reader", "rms")
+fh_bin.extensions = "xniffbin;xniff.bin"
+
+function fh_bin.read_open(file, capture)
+    local pos = file:seek()
+    local head = file:read(16) or ""
+    file:seek("set", pos)
+    if #head < 8 then
+        return false
+    end
+
+    local mode = nil
+    local magic = le_u32(head, 0)
+    local version = le_u16(head, 4)
+    if magic == XNIFF_BIN_FILE_MAGIC and version == XNIFF_BIN_FILE_VERSION then
+        mode = "file"
+    else
+        local entry_len = le_u32(head, 0)
+        local entry_ver = le_u16(head, 6)
+        if entry_len and entry_ver and entry_ver == XNIFF_IPC_V2_VERSION and entry_len >= 40 and entry_len <= (64 * 1024 * 1024) then
+            mode = "raw"
+        end
+    end
+
+    if not mode then
+        return false
+    end
+
+    capture.encap = XNIFF_DIAG_ENCAP
+    if wtap_file_tsprec and wtap_file_tsprec.NSEC then
+        capture.time_precision = wtap_file_tsprec.NSEC
+    end
+    capture.snapshot_length = 0
+    capture.user_app = "xniff-bin.lua"
+    capture.private_table = {
+        mode = mode,
+        file_hdr_consumed = false,
+        next_frame_no = 1,
+        offset_to_frame = {},
+        inflight = {},
+        wire_calls = {},
+        next_call_id = 1,
+        base_mono_ns = nil,
+        base_epoch = nil,
+    }
+
+    g_bin_records_by_frame = {}
+    return true
+end
+
+fh_bin.read = function(file, capture, frame)
+    return bin_read_frame(file, capture, frame, false)
+end
+
+function fh_bin.seek_read(file, capture, frame, offset)
+    local st = capture.private_table
+    if type(st) ~= "table" then return false end
+    if not file:seek("set", offset) then
+        return false
+    end
+    local frame_no = st.offset_to_frame[offset]
+    if frame_no and g_bin_records_by_frame[frame_no] then
+        apply_record_to_frame(frame, g_bin_records_by_frame[frame_no], st)
+        return true
+    end
+    local rc = bin_read_frame(file, capture, frame, true)
+    if rc == false then return false end
+    return true
+end
+
+register_filehandler(fh_bin)
+
+local xniff_mach = Proto("xniff_mach", "XNIFF Mach")
+local xniff_xpc = Proto("xniff_xpc", "XNIFF XPC")
+local xniff_diag = Proto("xniff_diag", "XNIFF Debug")
+
+local function add_common_record_fields(root, tvb, rec, func_name, flow)
+    add_if_num(root, tvb, f_event_id, rec.event_id)
+    add_if_num(root, tvb, f_call_id, rec.call_id)
+    add_if_num(root, tvb, f_pid, rec.pid)
+    add_if_num(root, tvb, f_tid_low, rec.tid_low)
+    add_if_num(root, tvb, f_api, rec.api)
+    add_if_num(root, tvb, f_direction, rec.direction)
+    add_if_num(root, tvb, f_function, rec.function_code)
+    add_if_str(root, tvb, f_seq, rec.seq_hex)
+    add_if_str(root, tvb, f_kind, rec.kind)
+    add_if_str(root, tvb, f_func_name, func_name)
+    add_if_str(root, tvb, f_flow, flow)
+    add_if_str(root, tvb, f_payload_view, rec.payload_view)
+end
+
+local function render_backtrace(root, tvb, rec)
+    if rec.backtrace and #rec.backtrace > 0 then
+        local bt = root:add(tvb(0, 0), "Backtrace")
+        for i, pc in ipairs(rec.backtrace) do
+            local sym = rec.backtrace_symbols and rec.backtrace_symbols[i] or nil
+            local line = "#" .. tostring(i - 1) .. " " .. tostring(pc)
+            if sym and sym.name and sym.name ~= "" then
+                line = line .. " " .. sym.name
+            end
+            if sym and sym.image and sym.image ~= "" then
+                line = line .. " (" .. sym.image .. ")"
+            end
+            bt:add(tvb(0, 0), line)
+        end
+    end
+end
+
+local function render_serialized_slot_bin(tree, tvb, slot_name, slot)
+    if not slot or not slot.bytes then return end
+    local st = tree:add(tvb(0, 0), "serialized." .. slot_name)
+    st:add(tvb(0, 0), "format: " .. tostring(slot.format_name or slot.format or "unknown"))
+    st:add(tvb(0, 0), "stored_len: " .. tostring(slot.stored_len or #slot.bytes))
+    st:add(tvb(0, 0), "original_len: " .. tostring(slot.original_len or 0))
+    st:add(tvb(0, 0), "truncated: " .. tostring(slot.truncated == true))
+    st:add(tvb(0, 0), "wire_hex_preview: " .. bytes_to_hex(slot.bytes, 64))
+
+    local decoded, derr = decode_xpc_serialized_bin(slot.bytes)
+    if decoded then
+        st:add(tvb(0, 0), "decode_mode: " .. tostring(decoded.mode))
+        st:add(tvb(0, 0), "nodes: " .. tostring(decoded.nodes))
+        st:add(tvb(0, 0), "consumed_bytes: " .. tostring(decoded.consumed))
+        if decoded.remaining and decoded.remaining > 0 then
+            st:add(tvb(0, 0), "remaining_bytes: " .. tostring(decoded.remaining))
+        end
+        render_xpc_obj(st, tvb, "root", decoded.root, 0)
+    else
+        st:add(tvb(0, 0), "xpc_decode_error: " .. tostring(derr))
+        local plist, perr = decode_bplist(slot.bytes)
+        if plist then
+            local p_tree = st:add(tvb(0, 0), "bplist_root")
+            render_bplist_meta(p_tree, tvb, plist)
+            render_bplist_obj(p_tree, tvb, "root", plist.top, 0)
+        else
+            st:add(tvb(0, 0), "bplist_decode_error: " .. tostring(perr))
+            maybe_decode_embedded_blob(st, tvb, slot.bytes, 0)
+        end
+    end
+
+    local dump = make_hexdump(slot.bytes)
+    if dump ~= "" then
+        local hd = st:add(tvb(0, 0), "hexdump")
+        hd:set_text(dump)
+    end
+end
+
+function xniff_mach.dissector(tvb, pinfo, tree)
+    local rec = g_bin_records_by_frame[pinfo.number]
+    pinfo.cols.protocol = "MACH"
+    local root = tree:add(xniff_mach, tvb(), "XNIFF Mach Event")
+    if not rec then
+        root:add(tvb(0, 0), "missing parsed metadata for frame")
+        return
+    end
+
+    local func_name = mach_function_name(rec.function_code)
+    add_common_record_fields(root, tvb, rec, func_name, nil)
+
+    local src = tostring(rec.pid or "?")
+    local dst = "?"
+    if rec.mach and rec.mach.remote then
+        dst = string.format("0x%08x", rec.mach.remote)
+    end
+    if rec.mach and rec.mach.is_recv then
+        src, dst = dst, src
+    end
+    pinfo.cols.src = src
+    pinfo.cols.dst = dst
+
+    local info = {}
+    info[#info + 1] = func_name
+    if rec.event_id then info[#info + 1] = "event=" .. tostring(rec.event_id) end
+    if rec.call_id then info[#info + 1] = "call=" .. tostring(rec.call_id) end
+    if rec.mach and rec.mach.msgh_id then info[#info + 1] = "msgh_id=" .. tostring(rec.mach.msgh_id) end
+    info[#info + 1] = "payload=" .. tostring(rec.payload_view or "none")
+    pinfo.cols.info = table.concat(info, " ")
+
+    local mach = rec.mach or {}
+    local mt = root:add(tvb(0, 0), "Mach Header/Options")
+    mt:add(tvb(0, 0), "option64: " .. tostring(mach.option64_hex or ""))
+    mt:add(tvb(0, 0), "msgh_size: " .. tostring(mach.msgh_size or mach.msgh_size_hdr or 0))
+    mt:add(tvb(0, 0), "copy_len: " .. tostring(mach.copy_len or 0))
+    mt:add(tvb(0, 0), "msg_addr: " .. tostring(mach.msg_addr_hex or ""))
+    mt:add(tvb(0, 0), "aux_addr: " .. tostring(mach.aux_addr_hex or ""))
+    mt:add(tvb(0, 0), "ret: " .. tostring(mach.ret_hex or ""))
+    mt:add(tvb(0, 0), "desc_count: " .. tostring(mach.desc_count or 0))
+    mt:add(tvb(0, 0), "priority: " .. tostring(mach.priority or 0))
+    mt:add(tvb(0, 0), "timeout: " .. tostring(mach.timeout_hex or ""))
+    mt:add(tvb(0, 0), "is_send: " .. tostring(mach.is_send == true))
+    mt:add(tvb(0, 0), "is_recv: " .. tostring(mach.is_recv == true))
+    if mach.msgh_bits then mt:add(tvb(0, 0), "msgh_bits: 0x" .. string.format("%08x", mach.msgh_bits)) end
+    if mach.msgh_size_hdr then mt:add(tvb(0, 0), "msgh_size_hdr: " .. tostring(mach.msgh_size_hdr)) end
+    if mach.msgh_id then mt:add(tvb(0, 0), "msgh_id: " .. tostring(mach.msgh_id)) end
+    if mach.remote then mt:add(tvb(0, 0), "remote: 0x" .. string.format("%08x", mach.remote)) end
+    if mach.local_port then mt:add(tvb(0, 0), "local: 0x" .. string.format("%08x", mach.local_port)) end
+    if mach.voucher then mt:add(tvb(0, 0), "voucher: 0x" .. string.format("%08x", mach.voucher)) end
+    if mach.args and #mach.args > 0 then
+        local at = mt:add(tvb(0, 0), "args")
+        for i, a in ipairs(mach.args) do
+            at:add(tvb(0, 0), "x" .. tostring(i - 1) .. ": " .. tostring(a))
+        end
+    end
+
+    if mach.inline_bytes and #mach.inline_bytes > 0 then
+        local inline_tree = root:add(tvb(0, 0), "Mach Inline Bytes (" .. tostring(#mach.inline_bytes) .. " bytes)")
+        inline_tree:add(tvb(0, 0), "hex_preview: " .. bytes_to_hex(mach.inline_bytes, 64))
+        maybe_decode_embedded_blob(inline_tree, tvb, mach.inline_bytes, 0)
+    end
+    if mach.trailer_bytes and #mach.trailer_bytes > 0 then
+        local tr = root:add(tvb(0, 0), "Mach Trailer Bytes (" .. tostring(#mach.trailer_bytes) .. " bytes)")
+        tr:add(tvb(0, 0), "hex_preview: " .. bytes_to_hex(mach.trailer_bytes, 64))
+    end
+
+    if mach.descriptors and #mach.descriptors > 0 then
+        local dt = root:add(tvb(0, 0), "Mach Descriptors")
+        for i, d in ipairs(mach.descriptors) do
+            local dnode = dt:add(tvb(0, 0), "descriptor[" .. tostring(i - 1) .. "]")
+            dnode:add(tvb(0, 0), "type: " .. tostring(d.desc_type or 0))
+            dnode:add(tvb(0, 0), "flags: " .. tostring(d.desc_flags or 0))
+            dnode:add(tvb(0, 0), "address: " .. tostring(d.address_hex or ""))
+            dnode:add(tvb(0, 0), "size_bytes: " .. tostring(d.size_bytes or 0))
+            dnode:add(tvb(0, 0), "count: " .. tostring(d.count or 0))
+            dnode:add(tvb(0, 0), "elem_size: " .. tostring(d.elem_size or 0))
+            dnode:add(tvb(0, 0), "port_name: " .. tostring(d.port_name or 0))
+            dnode:add(tvb(0, 0), "port_disposition: " .. tostring(d.port_disposition or 0))
+            if d.bytes and #d.bytes > 0 then
+                dnode:add(tvb(0, 0), "data_hex_preview: " .. bytes_to_hex(d.bytes, 64))
+                maybe_decode_embedded_blob(dnode, tvb, d.bytes, 1)
+            end
+        end
+    end
+
+    render_backtrace(root, tvb, rec)
+end
+
+function xniff_xpc.dissector(tvb, pinfo, tree)
+    local rec = g_bin_records_by_frame[pinfo.number]
+    pinfo.cols.protocol = "XPC"
+    local root = tree:add(xniff_xpc, tvb(), "XNIFF XPC Event")
+    if not rec then
+        root:add(tvb(0, 0), "missing parsed metadata for frame")
+        return
+    end
+
+    local xpc = rec.xpc or {}
+    local func_name = xpc.func_name or xpc_func_name(rec.function_code)
+    local flow = xpc.flow or xpc_flow(rec.function_code)
+    local role = xpc.role or xpc_role(rec.function_code, rec.direction)
+    add_common_record_fields(root, tvb, rec, func_name, flow)
+    add_if_str(root, tvb, f_role, role)
+
+    local conn_pid = xpc.conn_pid or 0
+    local src = tostring(rec.pid or "?")
+    local dst = (conn_pid ~= 0) and tostring(conn_pid) or "?"
+    if flow == "recv" then
+        src, dst = dst, src
+    end
+    pinfo.cols.src = src
+    pinfo.cols.dst = dst
+
+    local info = {}
+    info[#info + 1] = func_name
+    if rec.event_id then info[#info + 1] = "event=" .. tostring(rec.event_id) end
+    if rec.call_id then info[#info + 1] = "call=" .. tostring(rec.call_id) end
+    info[#info + 1] = "role=" .. tostring(role)
+    info[#info + 1] = "flow=" .. tostring(flow)
+    info[#info + 1] = "payload=" .. tostring(rec.payload_view or "none")
+    pinfo.cols.info = table.concat(info, " ")
+
+    add_if_num(root, tvb, f_conn_pid, conn_pid)
+    add_if_str(root, tvb, f_conn_name, xpc.conn_name)
+    add_if_str(root, tvb, f_conn_ptr, xpc.conn_ptr)
+    add_if_str(root, tvb, f_msg_ptr, xpc.msg_ptr)
+
+    local call_tree = root:add(tvb(0, 0), "XPC Call Metadata")
+    call_tree:add(tvb(0, 0), "func: " .. tostring(func_name))
+    call_tree:add(tvb(0, 0), "role: " .. tostring(role))
+    if rec.wire_call_id then
+        call_tree:add(tvb(0, 0), "wire_call_id: " .. tostring(rec.wire_call_id))
+    end
+    call_tree:add(tvb(0, 0), "ret: " .. tostring(xpc.ret_hex or ""))
+    if xpc.args and #xpc.args > 0 then
+        local arg_tree = call_tree:add(tvb(0, 0), "args")
+        for i, arg in ipairs(xpc.args) do
+            local arg_name = xpc_arg_name(rec.function_code, i - 1)
+            if arg_name then
+                arg_tree:add(tvb(0, 0), "arg." .. arg_name .. ": " .. tostring(arg))
+            else
+                arg_tree:add(tvb(0, 0), "arg[" .. tostring(i - 1) .. "]: " .. tostring(arg))
+            end
+        end
+    end
+
+    local names = xpc_string_field_names(rec.kind or "", rec.function_code)
+    for i = 1, 4 do
+        local s = xpc.strings and xpc.strings[i] or nil
+        if s and s ~= "" then
+            local label = names[i] or ("slot_" .. tostring(i - 1))
+            call_tree:add(tvb(0, 0), label .. ": " .. safe_ascii(s, 512))
+            if label == "target_service_name" or label == "connection_name" then
+                add_if_str(root, tvb, f_service_name, s)
+            end
+        end
+    end
+
+    if xpc.conn_meta then
+        local cm = xpc.conn_meta
+        local cmt = root:add(tvb(0, 0), "XPC Connection Metadata")
+        cmt:add(tvb(0, 0), "version: " .. tostring(cm.version or 0))
+        cmt:add(tvb(0, 0), "flags: 0x" .. string.format("%x", cm.flags or 0))
+        cmt:add(tvb(0, 0), "pid_public: " .. tostring(cm.pid_public or 0))
+        if cm.name_public and cm.name_public ~= "" then
+            cmt:add(tvb(0, 0), "name_public: " .. safe_ascii(cm.name_public, 512))
+        end
+        if cm.name_private and cm.name_private ~= "" then
+            cmt:add(tvb(0, 0), "name_private: " .. safe_ascii(cm.name_private, 512))
+        end
+    end
+
+    local has_message = xpc.serialized and xpc.serialized.message ~= nil
+    local has_reply = xpc.serialized and xpc.serialized.reply ~= nil
+    local has_event = xpc.serialized and xpc.serialized.event ~= nil
+    add_if_bool(root, tvb, f_has_serialized_message, has_message)
+    add_if_bool(root, tvb, f_has_serialized_reply, has_reply)
+    add_if_bool(root, tvb, f_has_serialized_event, has_event)
+    add_if_num(root, tvb, f_serialized_message_len, has_message and xpc.serialized.message.stored_len or nil)
+    add_if_num(root, tvb, f_serialized_reply_len, has_reply and xpc.serialized.reply.stored_len or nil)
+    add_if_num(root, tvb, f_serialized_event_len, has_event and xpc.serialized.event.stored_len or nil)
+
+    if has_message or has_reply or has_event then
+        local ser_tree = root:add(tvb(0, 0), "XPC Serialized Decode (xpcdesert-like)")
+        if has_message then render_serialized_slot_bin(ser_tree, tvb, "message", xpc.serialized.message) end
+        if has_reply then render_serialized_slot_bin(ser_tree, tvb, "reply", xpc.serialized.reply) end
+        if has_event then render_serialized_slot_bin(ser_tree, tvb, "event", xpc.serialized.event) end
+    end
+
+    render_backtrace(root, tvb, rec)
+end
+
+function xniff_diag.dissector(tvb, pinfo, tree)
+    local rec = g_bin_records_by_frame[pinfo.number]
+    pinfo.cols.protocol = "XNIFF-DBG"
+    local root = tree:add(xniff_diag, tvb(), "XNIFF Debug Event")
+    if not rec then
+        root:add(tvb(0, 0), "missing parsed metadata for frame")
+        return
+    end
+    add_common_record_fields(root, tvb, rec, "debug_log", nil)
+    local msg = rec.diag or ""
+    root:add(tvb(0, 0), "message: " .. safe_ascii(msg, 4096))
+    pinfo.cols.src = tostring(rec.pid or "?")
+    pinfo.cols.dst = "-"
+    pinfo.cols.info = "debug_log payload=" .. tostring(rec.payload_view or "none")
+end
+
+if wtap_encap then
+    wtap_encap:add(XNIFF_MACH_ENCAP, xniff_mach)
+    wtap_encap:add(XNIFF_XPC_ENCAP, xniff_xpc)
+    wtap_encap:add(XNIFF_DIAG_ENCAP, xniff_diag)
 end

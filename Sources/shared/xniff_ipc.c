@@ -4,6 +4,8 @@
 #include <pthread.h>
 #include <string.h>
 
+#include "xniff_capture_file.h"
+
 // In-target ring buffer transport polled by xniff-cli.
 
 __attribute__((visibility("default"), used)) xniff_ipc_ring_t xniff_ipc_ring = {
@@ -11,9 +13,9 @@ __attribute__((visibility("default"), used)) xniff_ipc_ring_t xniff_ipc_ring = {
         {
             .magic = XNIFF_IPC_RING_MAGIC,
             .version = XNIFF_IPC_RING_VERSION,
-            .reserved0 = 0,
+            .config_version = 1,
             .capacity = XNIFF_IPC_RING_CAPACITY,
-            .reserved1 = 0,
+            .capture_mode = XNIFF_CAPTURE_MODE_NONE,
             .write_idx = 0,
             .read_idx = 0,
             .dropped_bytes = 0,
@@ -79,5 +81,8 @@ static int ring_write_bytes(const void *buf, size_t len) {
 }
 
 int xniff_ipc_ring_write(const void *buf, size_t len) {
+    if (xniff_capture_file_is_configured()) {
+        return xniff_capture_file_write(buf, len);
+    }
     return ring_write_bytes(buf, len);
 }

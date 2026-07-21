@@ -8,6 +8,8 @@
 #include <stdbool.h>
 #include <string.h>
 #include <ctype.h>
+#include <execinfo.h>
+#include <dlfcn.h>
 
 #include <unistd.h>
 #include <sys/stat.h>
@@ -19,6 +21,7 @@
 #include <time.h>
 
 #include "../shared/xniff_ipc.h"
+#include "../shared/xniff_ipc_v2.h"
 #include "../shared/mach_private.h"
 
 #include <mach/mach.h>
@@ -26,7 +29,6 @@
 #include <mach/message.h>
 
 #include "xniff_hooks_emit.h"
-#include "xniff_hooks_ipc.h"
 
 typedef struct {
     uint32_t max_msg_copy;       // max inline bytes copied per event
@@ -51,12 +53,13 @@ static uint32_t env_u32(const char *name, uint32_t defv) {
 }
 
 static void limits_init_once(void) {
-    // Keep these conservative by default; tune via env vars when needed.
+    // Keep each record comfortably below the 8 MiB ring. Values remain tunable
+    // for targeted full-fidelity captures.
     g_limits.max_msg_copy     = env_u32("XNIFF_MAX_MSG_COPY",     256u * 1024u);
     g_limits.max_ool_total    = env_u32("XNIFF_MAX_OOL_TOTAL",    1024u * 1024u);
     g_limits.max_ool_per_desc = env_u32("XNIFF_MAX_OOL_PER_DESC", 256u * 1024u);
     g_limits.max_desc         = env_u32("XNIFF_MAX_DESCRIPTORS",  64u);
-    g_limits.max_payload      = env_u32("XNIFF_MAX_IPC_PAYLOAD",  4u * 1024u * 1024u);
+    g_limits.max_payload      = env_u32("XNIFF_MAX_IPC_PAYLOAD",  1024u * 1024u);
 }
 
 static const xniff_hook_limits_t *limits(void) {
@@ -79,6 +82,86 @@ static size_t xniff_safe_copy(const void *src, void *dst, size_t len) {
 }
 
 static inline uint32_t min_u32(uint32_t a, uint32_t b) { return a < b ? a : b; }
+
+static void xniff_add_backtrace_section(xniff_ipc_v2_builder_t *b) {
+    if (!b || !xniff_hooks_backtrace_is_enabled()) return;
+    xniff_ipc_v2_backtrace_t bt;
+    xniff_ipc_v2_backtrace_symbols_hdr_t sh;
+    xniff_ipc_v2_backtrace_symbol_t syms[XNIFF_V2_BACKTRACE_MAX_FRAMES];
+    const char *names[XNIFF_V2_BACKTRACE_MAX_FRAMES] = {0};
+    const char *images[XNIFF_V2_BACKTRACE_MAX_FRAMES] = {0};
+    void *captured[XNIFF_V2_BACKTRACE_MAX_FRAMES] = {0};
+    uint32_t captured_count = 0;
+
+    memset(&bt, 0, sizeof(bt));
+    memset(&sh, 0, sizeof(sh));
+    memset(syms, 0, sizeof(syms));
+
+    void *frames[XNIFF_V2_BACKTRACE_MAX_FRAMES + 8u] = {0};
+    int n = backtrace(frames, (int)(sizeof(frames) / sizeof(frames[0])));
+    if (n <= 0) return;
+
+    int skip = 2; // xniff_add_backtrace_section + immediate sender
+    for (int i = skip; i < n && bt.count < XNIFF_V2_BACKTRACE_MAX_FRAMES; i++) {
+        void *pc = frames[i];
+        captured[bt.count] = pc;
+        bt.pcs[bt.count++] = (uint64_t)(uintptr_t)pc;
+    }
+    captured_count = bt.count;
+    if (captured_count == 0) return;
+
+    (void)xniff_ipc_v2_add_section(b, XNIFF_V2_SEC_BACKTRACE, 0, &bt, sizeof(bt));
+
+    bool have_symbol_data = false;
+    sh.count = captured_count;
+    for (uint32_t i = 0; i < captured_count; i++) {
+        Dl_info info;
+        memset(&info, 0, sizeof(info));
+
+        syms[i].pc = (uint64_t)(uintptr_t)captured[i];
+        if (dladdr(captured[i], &info) == 0) continue;
+
+        if (info.dli_saddr) {
+            syms[i].sym_addr = (uint64_t)(uintptr_t)info.dli_saddr;
+            have_symbol_data = true;
+        }
+        if (info.dli_sname) {
+            syms[i].name_len = (uint32_t)strnlen(info.dli_sname, 255u);
+            names[i] = info.dli_sname;
+            if (syms[i].name_len != 0) have_symbol_data = true;
+        }
+        if (info.dli_fname) {
+            syms[i].image_len = (uint32_t)strnlen(info.dli_fname, 255u);
+            images[i] = info.dli_fname;
+            if (syms[i].image_len != 0) have_symbol_data = true;
+        }
+        sh.strings_len += syms[i].name_len + syms[i].image_len;
+    }
+
+    if (!have_symbol_data) return;
+
+    size_t sec_len = sizeof(sh) +
+                     ((size_t)captured_count * sizeof(syms[0])) +
+                     (size_t)sh.strings_len;
+    uint8_t *sec = (uint8_t *)malloc(sec_len);
+    if (!sec) return;
+
+    memcpy(sec, &sh, sizeof(sh));
+    memcpy(sec + sizeof(sh), syms, (size_t)captured_count * sizeof(syms[0]));
+    size_t off = sizeof(sh) + ((size_t)captured_count * sizeof(syms[0]));
+    for (uint32_t i = 0; i < captured_count; i++) {
+        if (syms[i].name_len != 0 && names[i]) {
+            memcpy(sec + off, names[i], syms[i].name_len);
+            off += syms[i].name_len;
+        }
+        if (syms[i].image_len != 0 && images[i]) {
+            memcpy(sec + off, images[i], syms[i].image_len);
+            off += syms[i].image_len;
+        }
+    }
+    (void)xniff_ipc_v2_add_section(b, XNIFF_V2_SEC_BACKTRACE_SYMBOLS, 0, sec, off);
+    free(sec);
+}
 
 static uint32_t clamp_ool_bytes(uint64_t want, uint32_t elem_size, uint32_t *total_left_io) {
     uint32_t max_u32 = UINT32_MAX;
@@ -120,46 +203,14 @@ static mach_msg_size_t safe_descriptor_count(const mach_msg_header_t *msg, uint3
     return dcount;
 }
 
-static size_t attachments_size_for_msg_limited(const mach_msg_header_t *msg, uint32_t msg_bound) {
-    if (!msg) return 0;
-
-    mach_msg_descriptor_t *desc = NULL;
-    mach_msg_size_t dcount = safe_descriptor_count(msg, msg_bound, NULL, NULL, &desc);
-    if (dcount == 0) return 0;
-
-    const xniff_hook_limits_t *lim = limits();
-    uint32_t total_left = lim->max_ool_total ? lim->max_ool_total : 0; // 0 == unlimited
-
-    size_t sum = 0;
-    for (mach_msg_size_t i = 0; i < dcount; i++, desc++) {
-        mach_msg_descriptor_type_t t = desc->type.type;
-        if (t == MACH_MSG_OOL_DESCRIPTOR) {
-            const mach_msg_ool_descriptor_t *ool = &desc->out_of_line;
-            uint32_t n = clamp_ool_bytes((uint64_t)ool->size, 0, &total_left);
-            if (n == 0) continue;
-            size_t tlv = sizeof(xniff_ipc_tlv_t) + sizeof(xniff_ool_data_t) + (size_t)n;
-            sum += tlv;
-        } else if (t == MACH_MSG_OOL_PORTS_DESCRIPTOR) {
-            const mach_msg_ool_ports_descriptor_t *op = &desc->ool_ports;
-            uint64_t ports_bytes64 = (uint64_t)op->count * (uint64_t)sizeof(mach_port_t);
-            uint32_t n = clamp_ool_bytes(ports_bytes64, (uint32_t)sizeof(mach_port_t), &total_left);
-            if (n == 0) continue;
-            size_t tlv = sizeof(xniff_ipc_tlv_t) + sizeof(xniff_ool_ports_t) + (size_t)n;
-            sum += tlv;
-        }
-    }
-    return sum;
-}
-
 static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
                               const mach_msg_header_t *msg,
                               uint32_t buf_size_hint) {
+    if (!xniff_hooks_capture_mode_enabled(XNIFF_CAPTURE_MODE_MACH)) return;
     if (!msg || !pl_in) return;
     uint8_t *msg_copy = NULL;
     uint8_t *scratch = NULL;
     size_t scratch_cap = 0;
-
-    xniff_hooks_ipc_lock();
 
     const xniff_hook_limits_t *lim = limits();
 
@@ -212,142 +263,124 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
         }
     }
 
-    // Compute attachment TLVs size from the safe message copy (bounded by what we copied).
     uint32_t msg_bound = 0;
     if (msgh_size_ok && copy_len != 0) {
         msg_bound = raw_msgh_size;
         if (buf_size_hint != 0 && msg_bound > buf_size_hint) msg_bound = buf_size_hint;
         if (msg_bound > copy_len) msg_bound = copy_len;
     }
-    size_t att_sz = (msgh_size_ok && msg_bound != 0 && msg_copy != NULL)
-                        ? attachments_size_for_msg_limited((const mach_msg_header_t *)msg_copy, msg_bound)
-                        : 0;
-
-    xniff_ipc_hdr_t hdr = {0};
-    hdr.magic = XNIFF_IPC_MAGIC;
-    hdr.version = XNIFF_IPC_VERSION;
-    hdr.kind = (uint16_t)kind;
-    hdr.pid = (uint32_t)getpid();
-    hdr.tid_low = (uint32_t)(uintptr_t)pthread_self();
-
-    uint64_t payload_len64 = (uint64_t)sizeof(xniff_ipc_mach_payload_t) + (uint64_t)copy_len + (uint64_t)att_sz;
-    if (lim->max_payload != 0 && payload_len64 > lim->max_payload) {
-        // Prefer truncating attachments first, then inline bytes.
-        uint64_t over = payload_len64 - lim->max_payload;
-        if (att_sz >= over) {
-            att_sz -= (size_t)over;
-        } else {
-            over -= att_sz;
-            att_sz = 0;
-            if (over >= copy_len) copy_len = 0;
-            else copy_len -= (uint32_t)over;
-        }
-        payload_len64 = (uint64_t)sizeof(xniff_ipc_mach_payload_t) + (uint64_t)copy_len + (uint64_t)att_sz;
-    }
-    if (payload_len64 > UINT32_MAX) {
-        // Hard fail-safe: keep within the wire format.
-        uint64_t max = UINT32_MAX;
-        if (payload_len64 > max) {
-            uint64_t keep = (uint64_t)sizeof(xniff_ipc_mach_payload_t);
-            if (keep > max) { xniff_hooks_ipc_unlock(); return; }
-            uint64_t left = max - keep;
-            uint64_t keep_inline = (copy_len > left) ? left : copy_len;
-            left -= keep_inline;
-            uint64_t keep_att = ((uint64_t)att_sz > left) ? left : (uint64_t)att_sz;
-            copy_len = (uint32_t)keep_inline;
-            att_sz = (size_t)keep_att;
-            payload_len64 = keep + keep_inline + keep_att;
-        }
-    }
-    hdr.payload_len = (uint32_t)payload_len64;
 
     xniff_ipc_mach_payload_t pl = *pl_in;
     pl.msgh_size = header_ok ? raw_msgh_size : 0;
     pl.copy_len = copy_len;
     pl.msg_addr = (uint64_t)(uintptr_t)msg;
+    mach_msg_descriptor_t *desc2 = NULL;
+    mach_msg_size_t dcount = 0;
+    if (msgh_size_ok && msg_bound != 0 && msg_copy) {
+        dcount = safe_descriptor_count((const mach_msg_header_t *)msg_copy, msg_bound, NULL, NULL, &desc2);
+        pl.desc_count = (uint32_t)dcount;
+    }
 
-    // Send header, payload, and inline bytes (blocking to ensure ordering)
-    if (xniff_hooks_ipc_write_locked(&hdr, sizeof(hdr)) != 0) goto out;
-    if (xniff_hooks_ipc_write_locked(&pl, sizeof(pl)) != 0) goto out;
-    if (copy_len && msg_copy && xniff_hooks_ipc_write_locked(msg_copy, copy_len) != 0) goto out;
+    xniff_ipc_v2_builder_t b;
+    xniff_ipc_v2_builder_init(&b);
+    if (xniff_ipc_v2_begin(&b,
+                           XNIFF_V2_ENTRY_MACH,
+                           (uint32_t)getpid(),
+                           (uint32_t)(uintptr_t)pthread_self(),
+                           0,
+                           (uint16_t)pl.direction,
+                           (uint16_t)pl.api,
+                           0) != 0) {
+        xniff_ipc_v2_builder_free(&b);
+        goto out;
+    }
+    (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_MACH_HEADER_OPTIONS, 0, &pl, sizeof(pl));
+    uint64_t call_id = xniff_hooks_current_call_id();
+    if (call_id != 0) {
+        (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_CALL_ID, 0, &call_id, sizeof(call_id));
+    }
+    xniff_add_backtrace_section(&b);
+    if (copy_len != 0 && msg_copy) {
+        (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_MACH_INLINE_BYTES, 0, msg_copy, copy_len);
+    }
+    if (header_ok && copy_len > raw_msgh_size) {
+        size_t trailer_off = (size_t)round_msg(raw_msgh_size);
+        if (trailer_off < copy_len) {
+            size_t trailer_len = (size_t)copy_len - trailer_off;
+            (void)xniff_ipc_v2_add_section(&b,
+                                           XNIFF_V2_SEC_MACH_TRAILER_BYTES,
+                                           0,
+                                           msg_copy + trailer_off,
+                                           trailer_len);
+        }
+    }
 
-    // Send attachments
-    if (att_sz != 0 && msgh_size_ok && msg_copy) {
-        mach_msg_descriptor_t *desc2 = NULL;
-        mach_msg_size_t dcount = safe_descriptor_count((const mach_msg_header_t *)msg_copy, msg_bound, NULL, NULL, &desc2);
+    if (dcount != 0 && desc2) {
+        mach_msg_descriptor_t *desc_it = desc2;
         uint32_t total_left = lim->max_ool_total ? lim->max_ool_total : 0;
-        size_t att_left = att_sz;
-        for (mach_msg_size_t i = 0; i < dcount; i++, desc2++) {
-            if (att_left < sizeof(xniff_ipc_tlv_t)) break;
-            mach_msg_descriptor_type_t t = desc2->type.type;
-            if (t == MACH_MSG_OOL_DESCRIPTOR) {
-                const mach_msg_ool_descriptor_t *ool = &desc2->out_of_line;
+        for (mach_msg_size_t i = 0; i < dcount; i++, desc_it++) {
+            mach_msg_descriptor_type_t t = desc_it->type.type;
+            xniff_ipc_v2_desc_meta_t md = {0};
+            md.index = (uint32_t)i;
+            md.desc_type = (uint16_t)t;
+
+            if (t == MACH_MSG_OOL_DESCRIPTOR || t == MACH_MSG_OOL_VOLATILE_DESCRIPTOR) {
+                const mach_msg_ool_descriptor_t *ool = &desc_it->out_of_line;
                 uint32_t n = clamp_ool_bytes((uint64_t)ool->size, 0, &total_left);
-                size_t overhead = sizeof(xniff_ipc_tlv_t) + sizeof(xniff_ool_data_t);
-                if (att_left <= overhead) break;
-                size_t max_data_sz = att_left - overhead;
-                if (max_data_sz < n) n = (uint32_t)max_data_sz;
-                if (n == 0) break;
-                if ((uint64_t)sizeof(xniff_ool_data_t) + (uint64_t)n > UINT32_MAX) continue;
-                xniff_ipc_tlv_t h = { .type = XNIFF_TLV_OOL_DATA, .length = (uint32_t)(sizeof(xniff_ool_data_t) + n) };
-                xniff_ool_data_t md = {0};
-                md.index = (uint32_t)i;
-                md.flags = (ool->deallocate ? 1u : 0u) | (ool->copy ? 2u : 0u);
+                md.desc_flags = (ool->deallocate ? 1u : 0u) | (ool->copy ? 2u : 0u);
                 md.address = (uint64_t)(uintptr_t)ool->address;
-                md.size = n;
-                if (xniff_hooks_ipc_write_locked(&h, sizeof(h)) != 0) goto out;
-                if (xniff_hooks_ipc_write_locked(&md, sizeof(md)) != 0) goto out;
-                if ((size_t)n > scratch_cap) {
-                    uint8_t *ns = (uint8_t *)realloc(scratch, (size_t)n);
-                    if (!ns) goto out;
-                    scratch = ns;
-                    scratch_cap = (size_t)n;
-                }
-                if (scratch && n) {
+                md.size_bytes = n;
+                (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_MACH_DESC_META, 0, &md, sizeof(md));
+                if (n != 0) {
+                    if ((size_t)n > scratch_cap) {
+                        uint8_t *ns = (uint8_t *)realloc(scratch, (size_t)n);
+                        if (!ns) continue;
+                        scratch = ns;
+                        scratch_cap = (size_t)n;
+                    }
                     memset(scratch, 0, (size_t)n);
                     if (ool->address) (void)xniff_safe_copy(ool->address, scratch, (size_t)n);
-                    if (xniff_hooks_ipc_write_locked(scratch, (size_t)n) != 0) goto out;
+                    (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_MACH_DESC_OOL_BYTES, 0, scratch, n);
                 }
-                att_left -= (overhead + (size_t)n);
             } else if (t == MACH_MSG_OOL_PORTS_DESCRIPTOR) {
-                const mach_msg_ool_ports_descriptor_t *op = &desc2->ool_ports;
+                const mach_msg_ool_ports_descriptor_t *op = &desc_it->ool_ports;
                 uint64_t ports_bytes64 = (uint64_t)op->count * (uint64_t)sizeof(mach_port_t);
                 uint32_t n = clamp_ool_bytes(ports_bytes64, (uint32_t)sizeof(mach_port_t), &total_left);
-                size_t overhead = sizeof(xniff_ipc_tlv_t) + sizeof(xniff_ool_ports_t);
-                if (att_left <= overhead) break;
-                size_t max_data_sz = att_left - overhead;
-                if (max_data_sz < n) n = (uint32_t)max_data_sz;
                 n -= (n % (uint32_t)sizeof(mach_port_t));
-                if (n == 0) break;
                 uint32_t send_count = n / (uint32_t)sizeof(mach_port_t);
-                if ((uint64_t)sizeof(xniff_ool_ports_t) + (uint64_t)n > UINT32_MAX) continue;
-                xniff_ipc_tlv_t h = { .type = XNIFF_TLV_OOL_PORTS, .length = (uint32_t)(sizeof(xniff_ool_ports_t) + n) };
-                xniff_ool_ports_t md = {0};
-                md.index = (uint32_t)i;
-                md.count = send_count;
+                md.desc_flags = (uint16_t)op->disposition;
                 md.address = (uint64_t)(uintptr_t)op->address;
+                md.size_bytes = n;
+                md.count = send_count;
                 md.elem_size = (uint32_t)sizeof(mach_port_t);
-                if (xniff_hooks_ipc_write_locked(&h, sizeof(h)) != 0) goto out;
-                if (xniff_hooks_ipc_write_locked(&md, sizeof(md)) != 0) goto out;
-                if ((size_t)n > scratch_cap) {
-                    uint8_t *ns = (uint8_t *)realloc(scratch, (size_t)n);
-                    if (!ns) goto out;
-                    scratch = ns;
-                    scratch_cap = (size_t)n;
-                }
-                if (scratch && n) {
+                (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_MACH_DESC_META, 0, &md, sizeof(md));
+                if (n != 0) {
+                    if ((size_t)n > scratch_cap) {
+                        uint8_t *ns = (uint8_t *)realloc(scratch, (size_t)n);
+                        if (!ns) continue;
+                        scratch = ns;
+                        scratch_cap = (size_t)n;
+                    }
                     memset(scratch, 0, (size_t)n);
                     if (op->address) (void)xniff_safe_copy(op->address, scratch, (size_t)n);
-                    if (xniff_hooks_ipc_write_locked(scratch, (size_t)n) != 0) goto out;
+                    (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_MACH_DESC_PORT_ARRAY, 0, scratch, n);
                 }
-                att_left -= (overhead + (size_t)n);
+            } else if (t == MACH_MSG_PORT_DESCRIPTOR) {
+                const mach_msg_port_descriptor_t *pd = &desc_it->port;
+                md.port_name = pd->name;
+                md.port_disposition = pd->disposition;
+                (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_MACH_DESC_META, 0, &md, sizeof(md));
+            } else {
+                (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_MACH_DESC_META, 0, &md, sizeof(md));
             }
         }
     }
+
+    (void)xniff_ipc_v2_write(&b);
+    xniff_ipc_v2_builder_free(&b);
 out:
     if (scratch) free(scratch);
     if (msg_copy) free(msg_copy);
-    xniff_hooks_ipc_unlock();
 }
 
 void xniff_emit_mach_msg_entry(const uint64_t args[8]) {

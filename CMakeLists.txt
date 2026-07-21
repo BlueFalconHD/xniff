@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(xniff VERSION 0.1.0 LANGUAGES C ASM)
+enable_testing()
 
 # Force arm64 build on macOS to assemble AArch64 trampolines
 if(APPLE)
@@ -78,11 +79,15 @@ file(GLOB XNIFF_HOOKS_SOURCES CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/Sources/xniff-hooks/*.c"
 )
 if(XNIFF_HOOKS_SOURCES)
-    add_library(xniff-hooks SHARED ${XNIFF_HOOKS_SOURCES} ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_ipc.c)
+    add_library(xniff-hooks SHARED
+        ${XNIFF_HOOKS_SOURCES}
+        ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_capture_file.c
+        ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_ipc.c
+        ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_ipc_v2.c)
     target_include_directories(xniff-hooks PUBLIC 
         ${PROJECT_SOURCE_DIR}/Sources/xniff-hooks 
         ${PROJECT_SOURCE_DIR}/Sources/shared)
-    target_compile_options(xniff-hooks PRIVATE -fvisibility=hidden)
+    target_compile_options(xniff-hooks PRIVATE -fvisibility=hidden -fblocks)
     if(APPLE)
         # libxpc is commonly provided via the dyld shared cache and may not be linkable
         # as a standalone library in all SDK/runtime setups. Allow unresolved xpc_*
@@ -100,13 +105,24 @@ file(GLOB XNIFF_CLI_SOURCES CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/Sources/xniff-cli/*.S"
 )
 
-add_executable(xniff-cli ${XNIFF_CLI_SOURCES} ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_ipc.c)
+add_executable(xniff-cli
+    ${XNIFF_CLI_SOURCES}
+    ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_capture_file.c
+    ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_ipc.c
+    ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_ipc_v2.c)
 target_link_libraries(xniff-cli PRIVATE xniff xpcdesert)
 target_include_directories(xniff-cli PRIVATE 
     ${PROJECT_SOURCE_DIR}/Sources/libxniff/include
     ${PROJECT_SOURCE_DIR}/Sources/shared
     ${PROJECT_SOURCE_DIR}/Sources/xpcdesert)
 xniff_enable_arm64e(xniff-cli)
+if(TARGET xniff-hooks AND APPLE)
+    add_dependencies(xniff-cli xniff-hooks)
+    set_property(TARGET xniff-cli APPEND PROPERTY
+        LINK_DEPENDS "$<TARGET_FILE:xniff-hooks>")
+    target_link_options(xniff-cli PRIVATE
+        "LINKER:-sectcreate,__DATA,__xniff_hooks,$<TARGET_FILE:xniff-hooks>")
+endif()
 
 file(GLOB XNIFF_TEST_SOURCES CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/Sources/xniff-tests/*.c"
@@ -114,10 +130,26 @@ file(GLOB XNIFF_TEST_SOURCES CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/Sources/xniff-tests/*.S"
 )
 
-add_executable(xniff-test ${XNIFF_TEST_SOURCES} ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_ipc.c)
+add_executable(xniff-test
+    ${XNIFF_TEST_SOURCES}
+    ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_capture_file.c
+    ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_ipc.c
+    ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_ipc_v2.c)
 target_link_libraries(xniff-test PRIVATE)
 target_include_directories(xniff-test PRIVATE
     ${PROJECT_SOURCE_DIR}/Sources/shared)
+add_test(NAME xniff-ipc-ring COMMAND xniff-test --ipc-ring)
+add_test(NAME xniff-ipc-drop COMMAND xniff-test --ipc-drop)
+add_test(NAME xniff-v2-call-id COMMAND xniff-test --v2-call-id)
+
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME xniff-python-renderer
+        COMMAND ${Python3_EXECUTABLE} -m unittest discover
+                -s ${PROJECT_SOURCE_DIR}/scripts/tests -p "test_*.py")
+    set_tests_properties(xniff-python-renderer PROPERTIES
+        ENVIRONMENT "PYTHONPATH=${PROJECT_SOURCE_DIR}/scripts")
+endif()
 
 # XPC stress harness (multi-process, multi-threaded)
 file(GLOB XNIFF_XPC_STRESS_SOURCES CONFIGURE_DEPENDS
@@ -128,7 +160,7 @@ file(GLOB XNIFF_XPC_STRESS_SOURCES CONFIGURE_DEPENDS
 add_executable(xniff-xpc-stress ${XNIFF_XPC_STRESS_SOURCES})
 target_compile_options(xniff-xpc-stress PRIVATE -fblocks)
 
-# xpcdesert shared library + CLI
+# XPC wire decoder used by xniff-cli.
 set(XPCDESERT_DIR "${PROJECT_SOURCE_DIR}/Sources/xpcdesert")
 set(XPCDESERT_LIB_SOURCES
     "${XPCDESERT_DIR}/xpcdesert.c"
@@ -138,12 +170,6 @@ add_library(xpcdesert SHARED ${XPCDESERT_LIB_SOURCES})
 target_include_directories(xpcdesert PUBLIC ${XPCDESERT_DIR})
 set_target_properties(xpcdesert PROPERTIES OUTPUT_NAME xpcdesert)
 xniff_enable_arm64e(xpcdesert)
-
-# CLI builds on the same sources as before but now links against the library
-add_executable(xpcdesert-cli "${XPCDESERT_DIR}/xpcdesert_cli.c")
-target_include_directories(xpcdesert-cli PRIVATE ${XPCDESERT_DIR})
-target_link_libraries(xpcdesert-cli PRIVATE xpcdesert xniff)
-xniff_enable_arm64e(xpcdesert-cli)
 
 # macOS codesigning with JIT entitlements (for testing self-modifying code)
 if(APPLE)
@@ -177,11 +203,6 @@ if(APPLE)
             add_custom_command(TARGET xpcdesert POST_BUILD
                 COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xpcdesert>"
                 COMMENT "Codesigning xpcdesert (lib) with JIT entitlements")
-        endif()
-        if(TARGET xpcdesert-cli)
-            add_custom_command(TARGET xpcdesert-cli POST_BUILD
-                COMMAND codesign --force -s - --options runtime --entitlements "${XNIFF_ENTITLEMENTS}" "$<TARGET_FILE:xpcdesert-cli>"
-                COMMENT "Codesigning xpcdesert-cli with JIT entitlements")
         endif()
     else()
         message(WARNING "macos.entitlements.plist not found; binaries will not be codesigned.")

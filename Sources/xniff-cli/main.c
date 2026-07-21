@@ -14,7 +14,7 @@
 #include <unistd.h>
 #include <limits.h>
 #include <libproc.h>
-#include <spawn.h>
+#include <poll.h>
 
 #include <mach/mach.h>
 #include <mach/task_info.h>
@@ -24,73 +24,32 @@
 #include <sys/stat.h>
 
 #include "../shared/xniff_ipc.h"
+#include "../shared/xniff_ipc_v2.h"
 #include "../shared/mach_private.h"
 
 #include <xniff/macho.h>
 #include <xniff/inject.h>
 
-// New combined workflow command
-#include "sniff_xpc_cmd.h"
+#include "cli_options.h"
+#include "embedded_hooks.h"
+#include "launch_environment.h"
 // XPC wire parser (shared library)
 #include "../xpcdesert/xpcdesert.h"
 
 extern char **environ;
 
-typedef struct {
-    bool jsonl;
-    bool dump_files;
-    bool parse_xpc;
-    bool xpc_only;
-    size_t hex_preview_len;
-} listener_opts_t;
-
 enum {
-    XNIFF_HOOK_MODE_MACH = 1,
-    XNIFF_HOOK_MODE_XPC  = 2,
+    XNIFF_HOOK_MODE_MACH = XNIFF_CAPTURE_MODE_MACH,
+    XNIFF_HOOK_MODE_XPC  = XNIFF_CAPTURE_MODE_XPC,
 };
 
-static listener_opts_t g_listener_opts = {
-    .jsonl = false,
-    .dump_files = true,
-    .parse_xpc = true,
-    .xpc_only = false,
-    .hex_preview_len = 64,
-};
+static listener_opts_t g_listener_opts;
 
 static FILE *xniff_diag_stream(void) {
-    return g_listener_opts.jsonl ? stderr : stdout;
+    return stderr;
 }
 
 #define XNIFF_DIAGF(...) fprintf(xniff_diag_stream(), __VA_ARGS__)
-
-static int parse_listener_flags(listener_opts_t *opts, int argc, char **argv, int start_idx) {
-    if (!opts) return -1;
-    for (int i = start_idx; i < argc; i++) {
-        const char *a = argv[i];
-        if (!a) continue;
-        // hook-xpc/sniff-xpc mode flags (not listener flags)
-        if (strcmp(a, "--mach") == 0 || strcmp(a, "--xpc") == 0) {
-            continue;
-        }
-        if (strcmp(a, "--jsonl") == 0 || strcmp(a, "--format=jsonl") == 0) {
-            opts->jsonl = true;
-        } else if (strcmp(a, "--text") == 0 || strcmp(a, "--format=text") == 0) {
-            opts->jsonl = false;
-        } else if (strcmp(a, "--no-dump") == 0) {
-            opts->dump_files = false;
-        } else if (strcmp(a, "--no-xpc") == 0) {
-            opts->parse_xpc = false;
-        } else if (strcmp(a, "--xpc-only") == 0 || strcmp(a, "--no-mach-output") == 0) {
-            opts->xpc_only = true;
-        } else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
-            return 1;
-        } else {
-            fprintf(stderr, "unknown listen flag: %s\n", a);
-            return -1;
-        }
-    }
-    return 0;
-}
 
 static int attach_and_get_task(pid_t pid, mach_port_t *out_task) {
     // Attempt to get the task port first; if allowed, we can avoid ptrace.
@@ -229,145 +188,48 @@ static int stage_dylib_for_sandbox(const char *src_abs_path,
     return -1;
 }
 
-static void usage(const char *prog) {
-    fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  %s hook-xpc <pid> <hooks.dylib> [--mach|--xpc]  Inject hooks and install either mach_msg* or libxpc XPC APIs.\n", prog);
-    fprintf(stderr, "  %s listen <pid> [flags]          Listen for events from target via in-memory ring buffer.\n", prog);
-    fprintf(stderr, "  %s sniff-xpc <pid> <hooks.dylib> [--mach|--xpc] [flags] Start listener, inject hooks, and install automatically.\n", prog);
-    fprintf(stderr, "  %s sniff-xpc-launch <hooks.dylib> [--mach|--xpc] [flags] -- <program> [args...]\n", prog);
-    fprintf(stderr, "                                   Launch suspended, install hooks before process starts, then resume.\n");
-    fprintf(stderr, "  %s sniff-xpc-wait <process_name> <hooks.dylib> [--mach|--xpc] [flags]\n", prog);
-    fprintf(stderr, "                                   Poll for process name, stop on first match, inject, then resume.\n");
-    fprintf(stderr, "\nNotes:\n");
-    fprintf(stderr, "- Hooks are installed in-process via frida-gum after injection.\n");
-    fprintf(stderr, "\nListen flags:\n");
-    fprintf(stderr, "  --jsonl           Emit JSON Lines (one event per line)\n");
-    fprintf(stderr, "  --text            Human-readable output (default)\n");
-    fprintf(stderr, "  --no-dump         Do not write /tmp/xniff/<pid>/* files\n");
-    fprintf(stderr, "  --no-xpc          Disable XPC payload parsing/formatting\n");
-    fprintf(stderr, "  --xpc-only        Suppress Mach API events; emit only high-level XPC hook events\n");
-    fprintf(stderr, "  --no-mach-output  Alias for --xpc-only\n");
-}
-
-// Forward declare subcommand implementation
-static int cmd_hook_xpc(pid_t pid, const char *dylib_path, int mode);
-static int cmd_listen(pid_t pid);
-static int cmd_sniff_xpc_launch(const char *dylib_path, int mode, char *const launch_argv[]);
-static int cmd_sniff_xpc_wait(const char *process_name, const char *dylib_path, int mode);
-
-static int find_double_dash(int argc, char **argv, int start_idx) {
-    for (int i = start_idx; i < argc; i++) {
-        if (argv[i] && strcmp(argv[i], "--") == 0) return i;
-    }
-    return -1;
-}
-
-static int parse_hook_mode_flags(int argc, char **argv, int start_idx, int end_idx, int *mode_out) {
-    bool saw_mach = false, saw_xpc = false;
-    if (end_idx < 0 || end_idx > argc) end_idx = argc;
-    for (int i = start_idx; i < end_idx; i++) {
-        const char *a = argv[i];
-        if (!a) continue;
-        if (strcmp(a, "--mach") == 0) saw_mach = true;
-        else if (strcmp(a, "--xpc") == 0) saw_xpc = true;
-    }
-    if (saw_mach && saw_xpc) return -1;
-    int mode = XNIFF_HOOK_MODE_MACH;
-    if (saw_xpc) mode = XNIFF_HOOK_MODE_XPC;
-    if (mode_out) *mode_out = mode;
-    return 0;
-}
+static int install_hooks(pid_t pid, const char *dylib_path, int mode);
+static int cmd_attach(pid_t pid, const char *dylib_path, int mode);
+static int cmd_launch(const char *dylib_path, int mode, char *const launch_argv[]);
 
 int main(int argc, char **argv) {
-    if (argc < 2) { usage(argv[0]); return 2; }
+    xniff_cli_options_t options;
+    int parse_result = xniff_cli_parse(argc, argv, &options);
+    if (parse_result != 0) {
+        xniff_cli_usage(argv[0]);
+        return parse_result > 0 ? 0 : 2;
+    }
+    g_listener_opts = options.listener;
 
-    // Subcommand: listen <pid>
-    if (strcmp(argv[1], "listen") == 0) {
-        if (argc < 3) { usage(argv[0]); return 2; }
-        pid_t pid = (pid_t)strtol(argv[2], NULL, 10);
-        if (pid <= 0) { usage(argv[0]); return 2; }
-        int prc = parse_listener_flags(&g_listener_opts, argc, argv, 3);
-        if (prc != 0) { usage(argv[0]); return prc > 0 ? 0 : 2; }
-        int rc = cmd_listen(pid);
-        return (rc == 0) ? 0 : 1;
+    char embedded_hooks[PATH_MAX] = {0};
+    const char *hooks_path = options.hooks_path;
+    if (hooks_path == NULL) {
+        if (xniff_extract_embedded_hooks(embedded_hooks, sizeof(embedded_hooks)) != 0) {
+            fprintf(stderr, "failed to extract embedded hooks: %s\n", strerror(errno));
+            return 1;
+        }
+        hooks_path = embedded_hooks;
     }
 
-    // Subcommand: sniff-xpc <pid> <hooks.dylib>
-    if (strcmp(argv[1], "sniff-xpc") == 0) {
-        if (argc < 4) { usage(argv[0]); return 2; }
-        pid_t pid = (pid_t)strtol(argv[2], NULL, 10);
-        if (pid <= 0) { usage(argv[0]); return 2; }
-        const char *path = argv[3];
-        int mode = XNIFF_HOOK_MODE_MACH;
-        if (parse_hook_mode_flags(argc, argv, 4, argc, &mode) != 0) {
-            fprintf(stderr, "sniff-xpc: choose exactly one of --mach or --xpc\n");
-            return 2;
-        }
-        int prc = parse_listener_flags(&g_listener_opts, argc, argv, 4);
-        if (prc != 0) { usage(argv[0]); return prc > 0 ? 0 : 2; }
-        int rc = cmd_sniff_xpc(pid, path, mode);
-        return (rc == 0) ? 0 : 1;
+    int rc = -1;
+    switch (options.command) {
+        case XNIFF_CLI_ATTACH:
+            rc = cmd_attach(options.pid, hooks_path, options.capture_mode);
+            break;
+        case XNIFF_CLI_LAUNCH:
+            rc = cmd_launch(hooks_path, options.capture_mode,
+                            (char *const *)options.launch_argv);
+            break;
+        default:
+            break;
     }
-
-    // Subcommand: sniff-xpc-launch <hooks.dylib> [--mach|--xpc] [flags] -- <program> [args...]
-    if (strcmp(argv[1], "sniff-xpc-launch") == 0) {
-        if (argc < 5) { usage(argv[0]); return 2; }
-        const char *path = argv[2];
-        int sep = find_double_dash(argc, argv, 3);
-        if (sep < 0 || (sep + 1) >= argc) {
-            fprintf(stderr, "sniff-xpc-launch: missing target program; use -- <program> [args...]\n");
-            usage(argv[0]);
-            return 2;
-        }
-        int mode = XNIFF_HOOK_MODE_MACH;
-        if (parse_hook_mode_flags(argc, argv, 3, sep, &mode) != 0) {
-            fprintf(stderr, "sniff-xpc-launch: choose exactly one of --mach or --xpc\n");
-            return 2;
-        }
-        int prc = parse_listener_flags(&g_listener_opts, sep, argv, 3);
-        if (prc != 0) { usage(argv[0]); return prc > 0 ? 0 : 2; }
-        int rc = cmd_sniff_xpc_launch(path, mode, &argv[sep + 1]);
-        return (rc == 0) ? 0 : 1;
-    }
-
-    // Subcommand: sniff-xpc-wait <process_name> <hooks.dylib> [--mach|--xpc] [flags]
-    if (strcmp(argv[1], "sniff-xpc-wait") == 0) {
-        if (argc < 4) { usage(argv[0]); return 2; }
-        const char *process_name = argv[2];
-        const char *path = argv[3];
-        int mode = XNIFF_HOOK_MODE_MACH;
-        if (parse_hook_mode_flags(argc, argv, 4, argc, &mode) != 0) {
-            fprintf(stderr, "sniff-xpc-wait: choose exactly one of --mach or --xpc\n");
-            return 2;
-        }
-        int prc = parse_listener_flags(&g_listener_opts, argc, argv, 4);
-        if (prc != 0) { usage(argv[0]); return prc > 0 ? 0 : 2; }
-        int rc = cmd_sniff_xpc_wait(process_name, path, mode);
-        return (rc == 0) ? 0 : 1;
-    }
-
-    // Subcommand: hook-xpc <pid> <hooks.dylib>
-    if (strcmp(argv[1], "hook-xpc") == 0) {
-        if (argc < 4) { usage(argv[0]); return 2; }
-        pid_t pid = (pid_t)strtol(argv[2], NULL, 10);
-        if (pid <= 0) { usage(argv[0]); return 2; }
-        const char *path = argv[3];
-        int mode = XNIFF_HOOK_MODE_MACH;
-        if (parse_hook_mode_flags(argc, argv, 4, argc, &mode) != 0) {
-            fprintf(stderr, "hook-xpc: choose exactly one of --mach or --xpc\n");
-            return 2;
-        }
-        int rc = cmd_hook_xpc(pid, path, mode);
-        return (rc == 0) ? 0 : 1;
-    }
-
-    usage(argv[0]);
-    return 2;
+    if (embedded_hooks[0] != '\0') unlink(embedded_hooks);
+    return rc == 0 ? 0 : 1;
 }
 
-static bool payload_len_sane(uint32_t payload_len) {
-    if (payload_len < sizeof(uint32_t)) return false;
-    if (payload_len > (64u * 1024u * 1024u)) return false;
+static bool entry_len_sane(uint32_t entry_len) {
+    if (entry_len < sizeof(xniff_ipc_v2_entry_hdr_t) + sizeof(xniff_ipc_v2_fixed_hdr_t)) return false;
+    if (entry_len > (64u * 1024u * 1024u)) return false;
     return true;
 }
 
@@ -406,75 +268,21 @@ static const char* kind_to_tag(int kind) {
     return "unknown";
 }
 
-typedef struct pending_call {
-    uint32_t pid;
-    uint32_t tid_low;
-    uint32_t api;
-    uint32_t sub;
-    uint64_t call_id;
-    unsigned long long entry_event_id;
-    struct pending_call *next;
-} pending_call_t;
-
-static pending_call_t *g_pending_calls = NULL;
-static uint64_t g_next_call_id = 1;
-
-static void pending_calls_clear_pid(uint32_t pid) {
-    pending_call_t **pp = &g_pending_calls;
-    while (*pp) {
-        pending_call_t *c = *pp;
-        if (c->pid == pid) {
-            *pp = c->next;
-            free(c);
-            continue;
-        }
-        pp = &c->next;
+static uint16_t v2_kind_from_fixed(const xniff_ipc_v2_fixed_hdr_t *fh) {
+    if (!fh) return 0;
+    if (fh->api == XNIFF_API_XPC_HL) {
+        return (fh->direction == XNIFF_DIR_EXIT) ? XNIFF_EVT_XPC_EXIT : XNIFF_EVT_XPC_ENTRY;
     }
-}
-
-static void pending_calls_drop_one(uint32_t pid, uint32_t tid_low, uint32_t api, uint32_t sub) {
-    pending_call_t **pp = &g_pending_calls;
-    while (*pp) {
-        pending_call_t *c = *pp;
-        if (c->pid == pid && c->tid_low == tid_low && c->api == api && c->sub == sub) {
-            *pp = c->next;
-            free(c);
-            return;
-        }
-        pp = &c->next;
+    if (fh->api == XNIFF_API_MACH_MSG) {
+        return (fh->direction == XNIFF_DIR_EXIT) ? XNIFF_EVT_MACH_EXIT : XNIFF_EVT_MACH_ENTRY;
     }
-}
-
-static uint64_t pending_calls_push(uint32_t pid, uint32_t tid_low, uint32_t api, uint32_t sub, unsigned long long entry_event_id) {
-    pending_calls_drop_one(pid, tid_low, api, sub); // avoid unbounded growth if an exit event is dropped
-    pending_call_t *c = (pending_call_t *)calloc(1, sizeof(*c));
-    if (!c) return 0;
-    c->pid = pid;
-    c->tid_low = tid_low;
-    c->api = api;
-    c->sub = sub;
-    c->call_id = g_next_call_id++;
-    if (c->call_id == 0) c->call_id = g_next_call_id++;
-    c->entry_event_id = entry_event_id;
-    c->next = g_pending_calls;
-    g_pending_calls = c;
-    return c->call_id;
-}
-
-static bool pending_calls_pop(uint32_t pid, uint32_t tid_low, uint32_t api, uint32_t sub, uint64_t *call_id_out, unsigned long long *entry_event_id_out) {
-    pending_call_t **pp = &g_pending_calls;
-    while (*pp) {
-        pending_call_t *c = *pp;
-        if (c->pid == pid && c->tid_low == tid_low && c->api == api && c->sub == sub) {
-            *pp = c->next;
-            if (call_id_out) *call_id_out = c->call_id;
-            if (entry_event_id_out) *entry_event_id_out = c->entry_event_id;
-            free(c);
-            return true;
-        }
-        pp = &c->next;
+    if (fh->api == XNIFF_API_MACH_MSG2) {
+        return (fh->direction == XNIFF_DIR_EXIT) ? XNIFF_EVT_MACH2_EXIT : XNIFF_EVT_MACH2_ENTRY;
     }
-    return false;
+    if (fh->api == XNIFF_API_DEBUG) {
+        return XNIFF_EVT_DEBUG_LOG;
+    }
+    return 0;
 }
 
 static const char *proc_name_cached(pid_t pid);
@@ -493,7 +301,9 @@ typedef struct xniff_conn_meta {
 
 typedef struct {
     const char *flow;             // send / recv / rpc / meta
+    const char *role;             // request / response / incoming / one-way / metadata
     const char *peer_role;        // sender / recipient / unknown
+    uint64_t call_id;
     uint64_t conn_ptr;
     uint64_t msg_ptr;
     uint64_t conn_seq;
@@ -519,6 +329,13 @@ typedef struct {
     xniff_xpc_serial_item_t reply;
     xniff_xpc_serial_item_t event;
 } xniff_xpc_serialized_set_t;
+
+typedef struct {
+    bool present;
+    xniff_xpc_conn_meta_t meta;
+    char *name_public;
+    char *name_private;
+} xniff_xpc_conn_meta_item_t;
 
 static xniff_conn_meta_t *g_conn_meta = NULL;
 
@@ -550,7 +367,10 @@ static uint64_t xpc_msg_ptr_for_event(const xniff_ipc_xpc_payload_t *pl) {
     if (pl->func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE ||
         pl->func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY ||
         pl->func == XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC ||
-        pl->func == XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER) {
+        pl->func == XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER ||
+        pl->func == XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE ||
+        pl->func == XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC ||
+        pl->func == XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC) {
         return pl->args[1];
     }
     if (pl->func == XNIFF_XPC_FUNC_PIPE_ROUTINE) {
@@ -565,6 +385,9 @@ static const char *xpc_flow_for_event(const xniff_ipc_xpc_payload_t *pl) {
         case XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE:
         case XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY:
         case XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC:
+        case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE:
+        case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC:
+        case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC:
             return "send";
         case XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER:
             return "recv";
@@ -572,14 +395,39 @@ static const char *xpc_flow_for_event(const xniff_ipc_xpc_payload_t *pl) {
             return "rpc";
         case XNIFF_XPC_FUNC_CONNECTION_CREATE:
             return "meta";
+        case XNIFF_XPC_FUNC_DICTIONARY_SEND_REPLY:
+            return "reply";
     }
     return "unknown";
+}
+
+static const char *xpc_role_for_event(const xniff_ipc_xpc_payload_t *pl) {
+    if (!pl) return "unknown";
+    switch (pl->func) {
+        case XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY:
+        case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC:
+            return pl->direction == XNIFF_DIR_ENTRY ? "request" : "response";
+        case XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC:
+        case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC:
+        case XNIFF_XPC_FUNC_PIPE_ROUTINE:
+            return pl->direction == XNIFF_DIR_ENTRY ? "request" : "response";
+        case XNIFF_XPC_FUNC_DICTIONARY_SEND_REPLY:
+            return "response";
+        case XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER:
+            return "incoming";
+        case XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE:
+        case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE:
+            return "one-way";
+        default:
+            return "metadata";
+    }
 }
 
 static const char *xpc_peer_role_for_flow(const char *flow) {
     if (!flow) return "unknown";
     if (strcmp(flow, "send") == 0) return "recipient";
     if (strcmp(flow, "recv") == 0) return "sender";
+    if (strcmp(flow, "reply") == 0) return "requester";
     return "unknown";
 }
 
@@ -618,6 +466,7 @@ static void analyze_xpc_event(
     }
 
     out->flow = xpc_flow_for_event(pl);
+    out->role = xpc_role_for_event(pl);
     out->peer_role = xpc_peer_role_for_flow(out->flow);
     out->conn_ptr = xpc_conn_ptr_for_event(ihdr, pl);
     out->msg_ptr = xpc_msg_ptr_for_event(pl);
@@ -638,20 +487,6 @@ static void analyze_xpc_event(
             out->conn_seq = m->next_seq;
         }
 
-        if (ihdr->kind == XNIFF_EVT_XPC_ENTRY && strcmp(out->flow, "recv") == 0) {
-            m->last_recv_event_id = event_id;
-            m->last_recv_tid_low = ihdr->tid_low;
-            m->last_recv_mono_s = mono_s;
-        } else if (ihdr->kind == XNIFF_EVT_XPC_ENTRY && strcmp(out->flow, "send") == 0) {
-            if (m->last_recv_event_id != 0 &&
-                ihdr->tid_low == m->last_recv_tid_low &&
-                mono_s >= m->last_recv_mono_s &&
-                (mono_s - m->last_recv_mono_s) <= 2.0) {
-                out->response_to_event_id = m->last_recv_event_id;
-                m->last_recv_event_id = 0;
-            }
-        }
-
         out->peer_pid = (m->peer_pid != 0) ? m->peer_pid : pl->conn_pid;
         out->service_name = str_nonempty(m->service) ? m->service : NULL;
     } else {
@@ -660,41 +495,6 @@ static void analyze_xpc_event(
     }
 
     out->peer_name = (out->peer_pid != 0) ? proc_name_cached((pid_t)out->peer_pid) : NULL;
-}
-
-static void json_write_escaped(FILE *out, const char *s) {
-    fputc('"', out);
-    if (s) {
-        for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-            unsigned char c = *p;
-            switch (c) {
-                case '"':  fputs("\\\"", out); break;
-                case '\\': fputs("\\\\", out); break;
-                case '\b': fputs("\\b", out); break;
-                case '\f': fputs("\\f", out); break;
-                case '\n': fputs("\\n", out); break;
-                case '\r': fputs("\\r", out); break;
-                case '\t': fputs("\\t", out); break;
-                default:
-                    if (c < 0x20) fprintf(out, "\\u%04x", (unsigned)c);
-                    else fputc((int)c, out);
-                    break;
-            }
-        }
-    }
-    fputc('"', out);
-}
-
-static void json_write_hex(FILE *out, const uint8_t *p, size_t len) {
-    fputc('"', out);
-    for (size_t i = 0; i < len; i++) fprintf(out, "%02x", p[i]);
-    fputc('"', out);
-}
-
-static void json_write_hex_u64(FILE *out, uint64_t v) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)v);
-    json_write_escaped(out, buf);
 }
 
 static uint32_t u32le_at(const uint8_t *p) {
@@ -778,44 +578,73 @@ static void xpc_serialized_free(xniff_xpc_serialized_set_t *xs) {
     memset(xs, 0, sizeof(*xs));
 }
 
-static void xpc_serialized_parse_tlvs(const uint8_t *buf, size_t total, size_t off, xniff_xpc_serialized_set_t *xs) {
-    if (!buf || !xs) return;
-    while (off + sizeof(xniff_ipc_tlv_t) <= total) {
-        xniff_ipc_tlv_t tlv = {0};
-        memcpy(&tlv, buf + off, sizeof(tlv));
-        off += sizeof(tlv);
-        if (off + tlv.length > total) break;
-        const uint8_t *val = buf + off;
-        size_t val_len = tlv.length;
+static void xpc_conn_meta_init(xniff_xpc_conn_meta_item_t *cm) {
+    if (!cm) return;
+    memset(cm, 0, sizeof(*cm));
+}
 
-        if (tlv.type == XNIFF_TLV_XPC_SERIALIZED && val_len >= sizeof(xniff_xpc_serialized_t)) {
-            xniff_xpc_serialized_t md = {0};
-            memcpy(&md, val, sizeof(md));
-            if (md.stored_len > UINT32_MAX - (uint32_t)sizeof(md)) {
-                off += val_len;
-                continue;
+static void xpc_conn_meta_free(xniff_xpc_conn_meta_item_t *cm) {
+    if (!cm) return;
+    if (cm->name_public) free(cm->name_public);
+    if (cm->name_private) free(cm->name_private);
+    memset(cm, 0, sizeof(*cm));
+}
+
+static void xpc_parse_section(uint16_t sec_type,
+                              const uint8_t *val,
+                              size_t val_len,
+                              xniff_xpc_serialized_set_t *xs,
+                              xniff_xpc_conn_meta_item_t *cm) {
+    if (!val || !xs) return;
+    if (sec_type == XNIFF_V2_SEC_XPC_SERIALIZED && val_len >= sizeof(xniff_xpc_serialized_t)) {
+        xniff_xpc_serialized_t md = {0};
+        memcpy(&md, val, sizeof(md));
+        size_t bytes_avail = val_len - sizeof(md);
+        size_t stored = md.stored_len;
+        if (stored > bytes_avail) stored = bytes_avail;
+
+        xniff_xpc_serial_item_t *dst = xpc_serial_item_for_slot(xs, md.slot);
+        if (!dst) return;
+
+        dst->present = true;
+        dst->slot = md.slot;
+        dst->format = md.format;
+        dst->flags = md.flags;
+        dst->original_len = md.original_len;
+        dst->stored_len = (uint32_t)stored;
+        dst->bytes = val + sizeof(md);
+        if (dst->pretty) { free(dst->pretty); dst->pretty = NULL; }
+        if (g_listener_opts.parse_xpc) {
+            dst->pretty = xpc_serial_pretty_from_blob(dst->bytes, stored, dst->format);
+        }
+        return;
+    }
+
+    if (cm && sec_type == XNIFF_V2_SEC_XPC_CONN_META && val_len >= sizeof(xniff_xpc_conn_meta_t)) {
+        xniff_xpc_conn_meta_t md = {0};
+        memcpy(&md, val, sizeof(md));
+        size_t str_off = sizeof(md);
+        cm->present = true;
+        cm->meta = md;
+
+        if (cm->name_public) { free(cm->name_public); cm->name_public = NULL; }
+        if (cm->name_private) { free(cm->name_private); cm->name_private = NULL; }
+
+        if (md.name_public_len != 0 && str_off + md.name_public_len <= val_len) {
+            cm->name_public = (char *)malloc((size_t)md.name_public_len + 1);
+            if (cm->name_public) {
+                memcpy(cm->name_public, val + str_off, md.name_public_len);
+                cm->name_public[md.name_public_len] = '\0';
             }
-            size_t bytes_avail = val_len - sizeof(md);
-            size_t stored = md.stored_len;
-            if (stored > bytes_avail) stored = bytes_avail;
-
-            xniff_xpc_serial_item_t *dst = xpc_serial_item_for_slot(xs, md.slot);
-            if (dst) {
-                dst->present = true;
-                dst->slot = md.slot;
-                dst->format = md.format;
-                dst->flags = md.flags;
-                dst->original_len = md.original_len;
-                dst->stored_len = (uint32_t)stored;
-                dst->bytes = val + sizeof(md);
-                if (dst->pretty) { free(dst->pretty); dst->pretty = NULL; }
-                if (g_listener_opts.parse_xpc) {
-                    dst->pretty = xpc_serial_pretty_from_blob(dst->bytes, stored, dst->format);
-                }
+            str_off += md.name_public_len;
+        }
+        if (md.name_private_len != 0 && str_off + md.name_private_len <= val_len) {
+            cm->name_private = (char *)malloc((size_t)md.name_private_len + 1);
+            if (cm->name_private) {
+                memcpy(cm->name_private, val + str_off, md.name_private_len);
+                cm->name_private[md.name_private_len] = '\0';
             }
         }
-
-        off += val_len;
     }
 }
 
@@ -900,139 +729,6 @@ typedef struct {
     char path[600];
 } xniff_att_meta_t;
 
-static void jsonl_print_event(
-    unsigned long long event_id,
-    uint64_t call_id,
-    unsigned long long entry_event_id,
-    const xniff_ipc_hdr_t *ihdr,
-    const xniff_ipc_mach_payload_t *pl,
-    const uint8_t *msg_bytes,
-    size_t msg_len,
-    const char *tbuf,
-    double mono_s,
-    const char *msg_path,
-    const xniff_att_meta_t *atts,
-    size_t att_count)
-{
-    const mach_msg_header_t *mh = NULL;
-    if (msg_bytes && msg_len >= sizeof(mach_msg_header_t)) mh = (const mach_msg_header_t *)msg_bytes;
-
-    uint64_t option64 = ((uint64_t)pl->option_hi << 32) | (uint64_t)pl->option_lo;
-    bool is_send = false, is_recv = false;
-    if (pl->api == XNIFF_API_MACH_MSG) {
-        is_send = (pl->option_lo & MACH_SEND_MSG) != 0;
-        is_recv = (pl->option_lo & MACH_RCV_MSG) != 0;
-    } else {
-        is_send = (option64 & MACH64_SEND_MSG) != 0;
-        is_recv = (option64 & MACH64_RCV_MSG) != 0;
-    }
-
-    size_t xpc_offset = 0;
-    char *xpc_pretty = NULL;
-    if (g_listener_opts.parse_xpc && msg_bytes && msg_len >= 16) {
-        if (xpcd_find_payload(msg_bytes, msg_len, 512, &xpc_offset) == 0) {
-            xpcd_object_t *root = xpcd_parse(msg_bytes + xpc_offset, msg_len - xpc_offset);
-            if (root) {
-                xpc_pretty = xpcd_format(root);
-                xpcd_free(root);
-            }
-        }
-    }
-
-    fputc('{', stdout);
-    fputs("\"schema\":\"xniff.event.v1\",", stdout);
-    fputs("\"event_id\":", stdout); fprintf(stdout, "%llu,", event_id);
-    fputs("\"call_id\":", stdout); fprintf(stdout, "%llu,", (unsigned long long)call_id);
-    fputs("\"entry_event_id\":", stdout); fprintf(stdout, "%llu,", entry_event_id);
-    fputs("\"kind\":", stdout); json_write_escaped(stdout, kind_to_tag((int)ihdr->kind)); fputc(',', stdout);
-    fputs("\"pid\":", stdout); fprintf(stdout, "%u,", ihdr->pid);
-    const char *proc_name = proc_name_cached((pid_t)ihdr->pid);
-    fputs("\"proc_name\":", stdout); if (proc_name) json_write_escaped(stdout, proc_name); else fputs("null", stdout); fputc(',', stdout);
-    fputs("\"tid_low\":", stdout); fprintf(stdout, "%u,", ihdr->tid_low);
-    fputs("\"ts_real\":", stdout); json_write_escaped(stdout, tbuf); fputc(',', stdout);
-    fputs("\"ts_mono_s\":", stdout); fprintf(stdout, "%.9f,", mono_s);
-
-    fputs("\"mach\":{", stdout);
-    fputs("\"api\":", stdout); fprintf(stdout, "%u,", pl->api);
-    fputs("\"direction\":", stdout); fprintf(stdout, "%u,", pl->direction);
-    fputs("\"is_send\":", stdout); fputs(is_send ? "true," : "false,", stdout);
-    fputs("\"is_recv\":", stdout); fputs(is_recv ? "true," : "false,", stdout);
-    fputs("\"msgh_id\":", stdout); fprintf(stdout, "%d,", mh ? mh->msgh_id : -1);
-    fputs("\"msgh_bits\":", stdout); fprintf(stdout, "%u,", mh ? (unsigned)mh->msgh_bits : 0u);
-    fputs("\"remote\":", stdout); fprintf(stdout, "%u,", mh ? (unsigned)mh->msgh_remote_port : 0u);
-    fputs("\"local\":", stdout); fprintf(stdout, "%u,", mh ? (unsigned)mh->msgh_local_port : 0u);
-
-    uint32_t peer_pid = 0;
-    const char *peer_role = "unknown";
-    if (pl->direction == XNIFF_DIR_EXIT && is_recv && pl->ret_value == 0) {
-        peer_role = "sender";
-        uint32_t sz = pl->msgh_size;
-        if (sz == 0 && mh) sz = (uint32_t)mh->msgh_size;
-        if (sz != 0) (void)mach_extract_sender_pid_from_trailer(msg_bytes, msg_len, sz, &peer_pid);
-    } else if (is_send) {
-        peer_role = "recipient";
-    }
-    const char *peer_name = (peer_pid != 0) ? proc_name_cached((pid_t)peer_pid) : NULL;
-    fputs("\"peer_role\":", stdout); json_write_escaped(stdout, peer_role); fputc(',', stdout);
-    fputs("\"peer_pid\":", stdout); if (peer_pid) fprintf(stdout, "%u,", peer_pid); else fputs("null,", stdout);
-    fputs("\"peer_name\":", stdout); if (peer_name) json_write_escaped(stdout, peer_name); else fputs("null", stdout);
-    fputc(',', stdout);
-
-    fputs("\"msg_addr\":", stdout); json_write_hex_u64(stdout, pl->msg_addr); fputc(',', stdout);
-    fputs("\"aux_addr\":", stdout); json_write_hex_u64(stdout, pl->aux_addr); fputc(',', stdout);
-    fputs("\"option64\":", stdout); json_write_hex_u64(stdout, option64); fputc(',', stdout);
-    fputs("\"ret\":", stdout); fprintf(stdout, "%llu,", (unsigned long long)pl->ret_value);
-    fputs("\"priority\":", stdout); fprintf(stdout, "%u,", pl->priority);
-    fputs("\"timeout\":", stdout); fprintf(stdout, "%llu,", (unsigned long long)pl->timeout);
-    fputs("\"msgh_size\":", stdout); fprintf(stdout, "%u,", pl->msgh_size);
-    fputs("\"copy_len\":", stdout); fprintf(stdout, "%u,", pl->copy_len);
-    fputs("\"msg_len\":", stdout); fprintf(stdout, "%zu", msg_len);
-    fputs("},", stdout);
-
-    fputs("\"dump\":{", stdout);
-    fputs("\"msg_path\":", stdout); if (msg_path) json_write_escaped(stdout, msg_path); else fputs("null", stdout);
-    fputs(",\"msg_hex\":", stdout);
-    size_t preview = g_listener_opts.hex_preview_len;
-    if (preview > msg_len) preview = msg_len;
-    if (msg_bytes && preview) json_write_hex(stdout, msg_bytes, preview);
-    else fputs("\"\"", stdout);
-    fputs(",\"attachments\":[", stdout);
-    for (size_t i = 0; i < att_count; i++) {
-        if (i) fputc(',', stdout);
-        fputc('{', stdout);
-        fputs("\"type\":", stdout);
-        if (atts[i].type == XNIFF_TLV_OOL_DATA) json_write_escaped(stdout, "ool_data");
-        else if (atts[i].type == XNIFF_TLV_OOL_PORTS) json_write_escaped(stdout, "ool_ports");
-        else json_write_escaped(stdout, "unknown");
-        fputs(",\"index\":", stdout); fprintf(stdout, "%u", atts[i].index);
-        fputs(",\"address\":", stdout); json_write_hex_u64(stdout, atts[i].address);
-        if (atts[i].type == XNIFF_TLV_OOL_DATA) {
-            fputs(",\"size\":", stdout); fprintf(stdout, "%u", atts[i].size_bytes);
-        } else if (atts[i].type == XNIFF_TLV_OOL_PORTS) {
-            fputs(",\"count\":", stdout); fprintf(stdout, "%u", atts[i].count);
-            fputs(",\"elem_size\":", stdout); fprintf(stdout, "%u", atts[i].elem_size);
-            fputs(",\"size\":", stdout); fprintf(stdout, "%u", atts[i].size_bytes);
-        }
-        fputs(",\"path\":", stdout); json_write_escaped(stdout, atts[i].path);
-        fputc('}', stdout);
-    }
-    fputs("]}", stdout);
-
-    if (xpc_pretty) {
-        fputs(",\"xpc\":{", stdout);
-        fputs("\"offset\":", stdout); fprintf(stdout, "%zu,", xpc_offset);
-        fputs("\"pretty\":", stdout); json_write_escaped(stdout, xpc_pretty);
-        fputc('}', stdout);
-    }
-
-    fputs("}\n", stdout);
-    fflush(stdout);
-    if (xpc_pretty) free(xpc_pretty);
-}
-
-static void json_write_escaped(FILE *out, const char *s);
-static void json_write_hex_u64(FILE *out, uint64_t v);
-
 static const char *xpc_func_to_name(uint32_t func) {
     switch (func) {
         case XNIFF_XPC_FUNC_CONNECTION_CREATE: return "xpc_connection_create";
@@ -1041,6 +737,11 @@ static const char *xpc_func_to_name(uint32_t func) {
         case XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY: return "xpc_connection_send_message_with_reply";
         case XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC: return "xpc_connection_send_message_with_reply_sync";
         case XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER: return "_xpc_connection_call_event_handler";
+        case XNIFF_XPC_FUNC_CONNECTION_CHECK_IN: return "_xpc_connection_check_in";
+        case XNIFF_XPC_FUNC_DICTIONARY_SEND_REPLY: return "xpc_dictionary_send_reply";
+        case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE: return "xpc_session_send_message";
+        case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC: return "xpc_session_send_message_with_reply_async";
+        case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC: return "xpc_session_send_message_with_reply_sync";
     }
     return "unknown";
 }
@@ -1068,6 +769,9 @@ static xpc_string_schema_t xpc_string_schema_for_event(uint16_t kind, uint32_t f
         case XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE:
         case XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY:
         case XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC:
+        case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE:
+        case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC:
+        case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC:
             sc.slot_name[0] = "connection_name";
             sc.slot_name[1] = "message_description";
             sc.slot_name[2] = "connection_description";
@@ -1085,6 +789,23 @@ static const char *xpc_arg_name(uint32_t func, size_t idx) {
         case XNIFF_XPC_FUNC_CONNECTION_CREATE:
             if (idx == 0) return "service_name_ptr";
             if (idx == 1) return "target_queue_ptr";
+            return NULL;
+        case XNIFF_XPC_FUNC_DICTIONARY_SEND_REPLY:
+            if (idx == 0) return "reply_ptr";
+            return NULL;
+        case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE:
+            if (idx == 0) return "session_ptr";
+            if (idx == 1) return "message_ptr";
+            return NULL;
+        case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC:
+            if (idx == 0) return "session_ptr";
+            if (idx == 1) return "message_ptr";
+            if (idx == 2) return "reply_handler_ptr";
+            return NULL;
+        case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC:
+            if (idx == 0) return "session_ptr";
+            if (idx == 1) return "message_ptr";
+            if (idx == 2) return "error_out_ptr";
             return NULL;
         case XNIFF_XPC_FUNC_PIPE_ROUTINE:
             if (idx == 0) return "pipe_ptr";
@@ -1111,73 +832,6 @@ static const char *xpc_arg_name(uint32_t func, size_t idx) {
             return NULL;
     }
     return NULL;
-}
-
-static void jsonl_write_xpc_string_fields(uint16_t kind, uint32_t func,
-                                          const char *s0, const char *s1,
-                                          const char *s2, const char *s3) {
-    const char *vals[4] = {s0, s1, s2, s3};
-    xpc_string_schema_t sc = xpc_string_schema_for_event(kind, func);
-    bool first = true;
-    fputc('{', stdout);
-    for (size_t i = 0; i < 4; i++) {
-        const char *name = sc.slot_name[i];
-        const char *val = vals[i];
-        if (!name || !val) continue;
-        if (!first) fputc(',', stdout);
-        json_write_escaped(stdout, name);
-        fputc(':', stdout);
-        json_write_escaped(stdout, val);
-        first = false;
-    }
-    fputc('}', stdout);
-}
-
-static void jsonl_write_xpc_named_args(uint32_t func, const uint64_t args[8]) {
-    bool first = true;
-    fputc('{', stdout);
-    for (size_t i = 0; i < 8; i++) {
-        const char *name = xpc_arg_name(func, i);
-        if (!name) continue;
-        if (!first) fputc(',', stdout);
-        json_write_escaped(stdout, name);
-        fputc(':', stdout);
-        json_write_hex_u64(stdout, args[i]);
-        first = false;
-    }
-    fputc('}', stdout);
-}
-
-static void jsonl_write_xpc_serial_item(const xniff_xpc_serial_item_t *it) {
-    if (!it || !it->present) {
-        fputs("null", stdout);
-        return;
-    }
-    fputc('{', stdout);
-    fputs("\"slot\":", stdout); json_write_escaped(stdout, xpc_serial_slot_name(it->slot)); fputc(',', stdout);
-    fputs("\"format\":", stdout); json_write_escaped(stdout, xpc_serial_format_name(it->format)); fputc(',', stdout);
-    fputs("\"format_id\":", stdout); fprintf(stdout, "%u,", (unsigned)it->format);
-    fputs("\"flags\":", stdout); fprintf(stdout, "%u,", (unsigned)it->flags);
-    fputs("\"truncated\":", stdout); fputs((it->flags & 1u) ? "true," : "false,", stdout);
-    fputs("\"original_len\":", stdout); fprintf(stdout, "%u,", it->original_len);
-    fputs("\"stored_len\":", stdout); fprintf(stdout, "%u,", it->stored_len);
-    fputs("\"wire_hex\":", stdout);
-    if (it->bytes && it->stored_len) json_write_hex(stdout, it->bytes, it->stored_len);
-    else fputs("\"\"", stdout);
-    fputs(",\"pretty\":", stdout);
-    if (it->pretty) json_write_escaped(stdout, it->pretty); else fputs("null", stdout);
-    fputc('}', stdout);
-}
-
-static void jsonl_write_xpc_serialized(const xniff_xpc_serialized_set_t *xs) {
-    fputc('{', stdout);
-    fputs("\"message\":", stdout);
-    if (xs) jsonl_write_xpc_serial_item(&xs->message); else fputs("null", stdout);
-    fputs(",\"reply\":", stdout);
-    if (xs) jsonl_write_xpc_serial_item(&xs->reply); else fputs("null", stdout);
-    fputs(",\"event\":", stdout);
-    if (xs) jsonl_write_xpc_serial_item(&xs->event); else fputs("null", stdout);
-    fputc('}', stdout);
 }
 
 static void print_xpc_serial_item(const xniff_xpc_serial_item_t *it) {
@@ -1234,82 +888,12 @@ static char *wire_copy_str(const uint8_t *buf, size_t total, size_t *off_io, uin
     return s;
 }
 
-static void jsonl_print_xpc_event(
-    unsigned long long event_id,
-    uint64_t call_id,
-    unsigned long long entry_event_id,
-    const xniff_ipc_hdr_t *ihdr,
-    const xniff_ipc_xpc_payload_t *pl,
-    const xniff_xpc_analysis_t *xa,
-    const xniff_xpc_serialized_set_t *xs,
-    const char *s0,
-    const char *s1,
-    const char *s2,
-    const char *s3,
-    const char *tbuf,
-    double mono_s)
-{
-    fputc('{', stdout);
-    fputs("\"schema\":\"xniff.event.v1\",", stdout);
-    fputs("\"event_id\":", stdout); fprintf(stdout, "%llu,", event_id);
-    fputs("\"call_id\":", stdout); fprintf(stdout, "%llu,", (unsigned long long)call_id);
-    fputs("\"entry_event_id\":", stdout); fprintf(stdout, "%llu,", entry_event_id);
-    fputs("\"kind\":", stdout); json_write_escaped(stdout, kind_to_tag((int)ihdr->kind)); fputc(',', stdout);
-    fputs("\"pid\":", stdout); fprintf(stdout, "%u,", ihdr->pid);
-    const char *proc_name = proc_name_cached((pid_t)ihdr->pid);
-    fputs("\"proc_name\":", stdout); if (proc_name) json_write_escaped(stdout, proc_name); else fputs("null", stdout); fputc(',', stdout);
-    fputs("\"tid_low\":", stdout); fprintf(stdout, "%u,", ihdr->tid_low);
-    fputs("\"ts_real\":", stdout); json_write_escaped(stdout, tbuf); fputc(',', stdout);
-    fputs("\"ts_mono_s\":", stdout); fprintf(stdout, "%.9f,", mono_s);
-
-    fputs("\"xpc\":{", stdout);
-    fputs("\"direction\":", stdout); fprintf(stdout, "%u,", pl->direction);
-    fputs("\"func\":", stdout); fprintf(stdout, "%u,", pl->func);
-    fputs("\"func_name\":", stdout); json_write_escaped(stdout, xpc_func_to_name(pl->func)); fputc(',', stdout);
-    const char *flow = (xa && xa->flow) ? xa->flow : "unknown";
-    const char *peer_role = (xa && xa->peer_role) ? xa->peer_role : "unknown";
-    uint64_t conn_ptr = xa ? xa->conn_ptr : 0;
-    uint64_t msg_ptr = xa ? xa->msg_ptr : 0;
-    uint64_t conn_seq = xa ? xa->conn_seq : 0;
-    unsigned long long response_to_event_id = xa ? xa->response_to_event_id : 0;
-    uint32_t conn_pid = xa ? xa->peer_pid : pl->conn_pid;
-    const char *conn_name = (xa && xa->peer_name) ? xa->peer_name : ((conn_pid != 0) ? proc_name_cached((pid_t)conn_pid) : NULL);
-    const char *service_name = (xa && xa->service_name) ? xa->service_name : (str_nonempty(s0) ? s0 : NULL);
-
-    fputs("\"flow\":", stdout); json_write_escaped(stdout, flow); fputc(',', stdout);
-    fputs("\"peer_role\":", stdout); json_write_escaped(stdout, peer_role); fputc(',', stdout);
-    fputs("\"conn_ptr\":", stdout); json_write_hex_u64(stdout, conn_ptr); fputc(',', stdout);
-    fputs("\"msg_ptr\":", stdout); json_write_hex_u64(stdout, msg_ptr); fputc(',', stdout);
-    fputs("\"conn_seq\":", stdout); if (conn_seq != 0) fprintf(stdout, "%llu,", (unsigned long long)conn_seq); else fputs("null,", stdout);
-    fputs("\"response_to_event_id\":", stdout); if (response_to_event_id != 0) fprintf(stdout, "%llu,", response_to_event_id); else fputs("null,", stdout);
-    fputs("\"service_name\":", stdout); if (service_name) json_write_escaped(stdout, service_name); else fputs("null", stdout); fputc(',', stdout);
-    fputs("\"conn_pid\":", stdout); fprintf(stdout, "%u,", conn_pid);
-    fputs("\"conn_name\":", stdout); if (conn_name) json_write_escaped(stdout, conn_name); else fputs("null", stdout); fputc(',', stdout);
-    fputs("\"ret\":", stdout); json_write_hex_u64(stdout, pl->ret_value); fputc(',', stdout);
-    fputs("\"args\":[", stdout);
-    for (int i = 0; i < 8; i++) {
-        if (i) fputc(',', stdout);
-        json_write_hex_u64(stdout, pl->args[i]);
-    }
-    fputs("],", stdout);
-    fputs("\"args_named\":", stdout); jsonl_write_xpc_named_args(pl->func, pl->args); fputc(',', stdout);
-    fputs("\"string_fields\":", stdout); jsonl_write_xpc_string_fields(ihdr->kind, pl->func, s0, s1, s2, s3); fputc(',', stdout);
-    fputs("\"serialized\":", stdout); jsonl_write_xpc_serialized(xs); fputc(',', stdout);
-    fputs("\"str0\":", stdout); if (s0) json_write_escaped(stdout, s0); else fputs("null", stdout);
-    fputs(",\"str1\":", stdout); if (s1) json_write_escaped(stdout, s1); else fputs("null", stdout);
-    fputs(",\"str2\":", stdout); if (s2) json_write_escaped(stdout, s2); else fputs("null", stdout);
-    fputs(",\"str3\":", stdout); if (s3) json_write_escaped(stdout, s3); else fputs("null", stdout);
-    fputc('}', stdout);
-
-    fputs("}\n", stdout);
-    fflush(stdout);
-}
-
 static void print_xpc_event(
     const xniff_ipc_hdr_t *ihdr,
     const xniff_ipc_xpc_payload_t *pl,
     const xniff_xpc_analysis_t *xa,
     const xniff_xpc_serialized_set_t *xs,
+    const xniff_xpc_conn_meta_item_t *cm,
     const char *s0,
     const char *s1,
     const char *s2,
@@ -1324,6 +908,7 @@ static void print_xpc_event(
     uint32_t peer_pid = xa ? xa->peer_pid : pl->conn_pid;
     const char *peer_name = (xa && xa->peer_name) ? xa->peer_name : ((peer_pid != 0) ? proc_name_cached((pid_t)peer_pid) : NULL);
     const char *flow = (xa && xa->flow) ? xa->flow : "unknown";
+    const char *role = (xa && xa->role) ? xa->role : "unknown";
     const char *service_name = (xa && xa->service_name) ? xa->service_name : (str_nonempty(s0) ? s0 : NULL);
     uint64_t conn_ptr = xa ? xa->conn_ptr : 0;
     uint64_t msg_ptr = xa ? xa->msg_ptr : 0;
@@ -1331,6 +916,10 @@ static void print_xpc_event(
     printf("[%s][+%0.6fs] %s\n", tbuf, mono_s, kstr);
     printf("  xpc.func: %s (%u)\n", xpc_func_to_name(pl->func), pl->func);
     printf("  xpc.flow: %s\n", flow);
+    printf("  xpc.role: %s\n", role);
+    if (xa && xa->call_id != 0) {
+        printf("  xpc.call_id: %llu\n", (unsigned long long)xa->call_id);
+    }
     printf("  xpc.conn_ptr: 0x%llx\n", (unsigned long long)conn_ptr);
     printf("  xpc.msg_ptr: 0x%llx\n", (unsigned long long)msg_ptr);
     printf("  xpc.conn_pid: %u\n", peer_pid);
@@ -1341,6 +930,20 @@ static void print_xpc_event(
     printf("  xpc.ret: 0x%llx\n", (unsigned long long)pl->ret_value);
     print_xpc_named_args(pl->func, pl->args);
     print_xpc_string_fields(ihdr->kind, pl->func, s0, s1, s2, s3);
+    if (cm && cm->present) {
+        const xniff_xpc_conn_meta_t *md = &cm->meta;
+        printf("  xpc.conn_meta.flags: 0x%x\n", md->flags);
+        if (md->flags & XNIFF_XPC_CONN_META_HAS_NAME_PUBLIC) {
+            printf("  xpc.conn_meta.name_public: %s\n", cm->name_public ? cm->name_public : "");
+        }
+        if (md->flags & XNIFF_XPC_CONN_META_HAS_NAME_PRIVATE) {
+            printf("  xpc.conn_meta.name_private: %s\n", cm->name_private ? cm->name_private : "");
+        }
+        if (md->flags & XNIFF_XPC_CONN_META_HAS_PID_PUBLIC) printf("  xpc.conn_meta.pid_public: %u\n", md->pid_public);
+        if (md->flags & XNIFF_XPC_CONN_META_HAS_INSTANCE) printf("  xpc.conn_meta.instance: 0x%llx\n", (unsigned long long)md->instance);
+        if (md->flags & XNIFF_XPC_CONN_META_HAS_PEER_INSTANCE) printf("  xpc.conn_meta.peer_instance: 0x%llx\n", (unsigned long long)md->peer_instance);
+        if (md->flags & XNIFF_XPC_CONN_META_HAS_BS_TYPE) printf("  xpc.conn_meta.bs_type: 0x%llx\n", (unsigned long long)md->bs_type);
+    }
     if (xs) {
         print_xpc_serial_item(&xs->message);
         print_xpc_serial_item(&xs->reply);
@@ -1461,6 +1064,13 @@ static bool env_var_enabled(const char *name) {
     return (v && *v && strcmp(v, "0") != 0);
 }
 
+static int write_bin_record(FILE *fp, const uint8_t *entry, size_t entry_len) {
+    if (!fp || !entry || entry_len == 0) return -1;
+    if (fwrite(entry, 1, entry_len, fp) != entry_len) return -1;
+    if (fflush(fp) != 0) return -1;
+    return 0;
+}
+
 static int resolve_remote_ring_addr(mach_port_t task, mach_vm_address_t *out_addr) {
     if (!out_addr) return -1;
     mach_vm_address_t addr = 0;
@@ -1472,23 +1082,70 @@ static int resolve_remote_ring_addr(mach_port_t task, mach_vm_address_t *out_add
     return -1;
 }
 
-static int cmd_listen(pid_t pid) {
+static int configure_remote_capture_mode(mach_port_t task, uint32_t mode) {
+    mach_vm_address_t ring_addr = 0;
+    for (int i = 0; i < 80; i++) {
+        if (resolve_remote_ring_addr(task, &ring_addr) == 0) break;
+        usleep(25 * 1000);
+    }
+    if (ring_addr == 0) return -1;
+
+    mach_vm_address_t mode_addr =
+        ring_addr + (mach_vm_address_t)offsetof(xniff_ipc_ring_t, hdr) +
+        (mach_vm_address_t)offsetof(xniff_ipc_ring_hdr_t, capture_mode);
+    return task_write_exact(task, mode_addr, &mode, sizeof(mode));
+}
+
+static bool target_process_alive(pid_t pid) {
+    struct proc_bsdinfo info;
+    int n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info));
+    return n == (int)sizeof(info);
+}
+
+static int capture_ring(pid_t pid, int ready_fd) {
     mach_port_t task = MACH_PORT_NULL;
     kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
     if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "listen: task_for_pid failed for %d: %d (%s)\n",
+        fprintf(stderr, "capture: task_for_pid failed for %d: %d (%s)\n",
                 (int)pid, kr, mach_error_string(kr));
         return -1;
     }
+    if (ready_fd >= 0) {
+        const uint8_t ready = 1;
+        (void)write(ready_fd, &ready, sizeof(ready));
+        close(ready_fd);
+    }
     const bool handle_hook_debug_logs = env_var_enabled("XNIFF_HOOKS_DEBUG");
+    FILE *out_bin_fp = NULL;
+    const bool bin_only = g_listener_opts.out_bin;
+    if (bin_only) {
+        if (strcmp(g_listener_opts.out_bin_path, "-") == 0) {
+            out_bin_fp = stdout;
+        } else {
+            out_bin_fp = fopen(g_listener_opts.out_bin_path, "wb");
+            if (!out_bin_fp) {
+                fprintf(stderr, "capture: failed opening --out path '%s': %s\n",
+                        g_listener_opts.out_bin_path, strerror(errno));
+                return -1;
+            }
+        }
+        xniff_bin_file_hdr_t fh = {0};
+        fh.magic = XNIFF_BIN_FILE_MAGIC;
+        fh.version = XNIFF_BIN_FILE_VERSION;
+        if (fwrite(&fh, sizeof(fh), 1, out_bin_fp) != 1 || fflush(out_bin_fp) != 0) {
+            fprintf(stderr, "capture: failed writing binary stream header\n");
+            if (out_bin_fp != stdout) fclose(out_bin_fp);
+            return -1;
+        }
+    }
 
     mach_vm_address_t ring_addr = 0;
-    for (int i = 0; i < 400; i++) { // up to ~20s while parent injects hooks
+    for (int i = 0; i < 4000; i++) { // up to ~20s while parent loads hooks
         if (resolve_remote_ring_addr(task, &ring_addr) == 0) break;
-        usleep(50 * 1000);
+        usleep(5 * 1000);
     }
     if (ring_addr == 0) {
-        fprintf(stderr, "listen: failed to resolve remote xniff ring symbol in pid %d\n", (int)pid);
+        fprintf(stderr, "capture: failed to resolve remote xniff ring symbol in pid %d\n", (int)pid);
         return -1;
     }
 
@@ -1497,7 +1154,7 @@ static int cmd_listen(pid_t pid) {
     mach_vm_address_t ring_read_idx_addr =
         ring_hdr_addr + (mach_vm_address_t)offsetof(xniff_ipc_ring_hdr_t, read_idx);
 
-    XNIFF_DIAGF("listening on ring buffer: target_pid=%d ring=0x%llx\n",
+    XNIFF_DIAGF("capture: streaming target_pid=%d ring=0x%llx\n",
                 (int)pid, (unsigned long long)ring_addr);
 
     // Prepare dump directory for this pid
@@ -1513,17 +1170,39 @@ static int cmd_listen(pid_t pid) {
     uint8_t *stream = NULL;
     size_t stream_len = 0;
     size_t stream_cap = 0;
+    uint64_t last_dropped_events = 0;
+    uint64_t last_dropped_bytes = 0;
+    unsigned int consecutive_read_failures = 0;
 
     for (;;) {
         xniff_ipc_ring_hdr_t rmeta = {0};
         if (task_read_exact(task, ring_hdr_addr, &rmeta, sizeof(rmeta)) != 0) {
+            consecutive_read_failures++;
+            if (consecutive_read_failures >= 5 && !target_process_alive(pid)) {
+                XNIFF_DIAGF("capture: target pid %d exited; capture complete\n", (int)pid);
+                if (out_bin_fp && out_bin_fp != stdout) fclose(out_bin_fp);
+                free(stream);
+                return 0;
+            }
             usleep(10 * 1000);
             continue;
         }
+        consecutive_read_failures = 0;
         if (rmeta.magic != XNIFF_IPC_RING_MAGIC || rmeta.version != XNIFF_IPC_RING_VERSION ||
             rmeta.capacity == 0 || rmeta.capacity > XNIFF_IPC_RING_CAPACITY) {
             usleep(10 * 1000);
             continue;
+        }
+        if (rmeta.dropped_events != last_dropped_events || rmeta.dropped_bytes != last_dropped_bytes) {
+            uint64_t event_delta = rmeta.dropped_events - last_dropped_events;
+            uint64_t byte_delta = rmeta.dropped_bytes - last_dropped_bytes;
+            XNIFF_DIAGF("capture: warning: target dropped %llu events (%llu bytes); totals=%llu/%llu\n",
+                        (unsigned long long)event_delta,
+                        (unsigned long long)byte_delta,
+                        (unsigned long long)rmeta.dropped_events,
+                        (unsigned long long)rmeta.dropped_bytes);
+            last_dropped_events = rmeta.dropped_events;
+            last_dropped_bytes = rmeta.dropped_bytes;
         }
         if (local_read_idx == UINT64_MAX) local_read_idx = rmeta.read_idx;
 
@@ -1547,7 +1226,8 @@ static int cmd_listen(pid_t pid) {
                 while (new_cap < need) new_cap *= 2;
                 uint8_t *tmp = (uint8_t *)realloc(stream, new_cap);
                 if (!tmp) {
-                    fprintf(stderr, "listen: oom while growing stream buffer\n");
+                    fprintf(stderr, "capture: out of memory while growing stream buffer\n");
+                    if (out_bin_fp && out_bin_fp != stdout) fclose(out_bin_fp);
                     free(stream);
                     return -1;
                 }
@@ -1569,158 +1249,180 @@ static int cmd_listen(pid_t pid) {
             (void)task_write_exact(task, ring_read_idx_addr, &local_read_idx, sizeof(local_read_idx));
         }
 
-        while (stream_len >= sizeof(xniff_ipc_hdr_t)) {
-            xniff_ipc_hdr_t hdr;
-            memcpy(&hdr, stream, sizeof(hdr));
-            if (hdr.magic != XNIFF_IPC_MAGIC || hdr.version != XNIFF_IPC_VERSION ||
-                !payload_len_sane(hdr.payload_len)) {
+        while (stream_len >= sizeof(xniff_ipc_v2_entry_hdr_t)) {
+            xniff_ipc_v2_entry_hdr_t eh = {0};
+            memcpy(&eh, stream, sizeof(eh));
+            if (eh.version != XNIFF_IPC_V2_VERSION || !entry_len_sane(eh.entry_len)) {
                 memmove(stream, stream + 1, stream_len - 1);
                 stream_len -= 1;
                 continue;
             }
-            size_t frame_len = sizeof(hdr) + (size_t)hdr.payload_len;
+            size_t frame_len = (size_t)eh.entry_len;
             if (stream_len < frame_len) break;
 
-            uint8_t *buf = NULL;
-            if (hdr.payload_len != 0) {
-                buf = (uint8_t *)malloc(hdr.payload_len);
-                if (!buf) {
-                    fprintf(stderr, "oom %u\n", hdr.payload_len);
+            if (bin_only) {
+                if (write_bin_record(out_bin_fp, stream, frame_len) != 0) {
+                    fprintf(stderr, "capture: failed writing binary record\n");
+                    if (out_bin_fp && out_bin_fp != stdout) fclose(out_bin_fp);
                     free(stream);
                     return -1;
                 }
-                memcpy(buf, stream + sizeof(hdr), hdr.payload_len);
-            }
-
-            if (hdr.kind == XNIFF_EVT_DEBUG_LOG) {
-                if (handle_hook_debug_logs && hdr.payload_len >= sizeof(xniff_ipc_debug_payload_t)) {
-                    xniff_ipc_debug_payload_t *dpl = (xniff_ipc_debug_payload_t *)buf;
-                    size_t off = sizeof(*dpl);
-                    uint32_t msg_len = dpl->msg_len;
-                    if (msg_len > hdr.payload_len - off) msg_len = (uint32_t)(hdr.payload_len - off);
-                    char *line = wire_copy_str(buf, hdr.payload_len, &off, msg_len);
-                    char tbuf[64];
-                    double mono_s = 0.0;
-                    format_time(tbuf, sizeof(tbuf), &mono_s);
-                    append_hook_debug_log(hdr.pid, hdr.tid_low, tbuf, mono_s, line ? line : "");
-                    if (!g_listener_opts.jsonl && line && *line) {
-                        printf("[hook-debug][pid=%u][tid=0x%x] %s\n", hdr.pid, hdr.tid_low, line);
-                    }
-                    if (line) free(line);
-                }
-                if (buf) free(buf);
+                evt_idx++;
                 memmove(stream, stream + frame_len, stream_len - frame_len);
                 stream_len -= frame_len;
                 continue;
             }
 
-            uint32_t api = 0;
-            if (hdr.payload_len >= sizeof(api)) memcpy(&api, buf, sizeof(api));
+            size_t body_len = frame_len - sizeof(eh);
+            if (body_len < sizeof(xniff_ipc_v2_fixed_hdr_t)) {
+                memmove(stream, stream + frame_len, stream_len - frame_len);
+                stream_len -= frame_len;
+                continue;
+            }
+            const uint8_t *body = stream + sizeof(eh);
+            xniff_ipc_v2_fixed_hdr_t fh = {0};
+            memcpy(&fh, body, sizeof(fh));
+            uint16_t kind = v2_kind_from_fixed(&fh);
 
-            if (g_listener_opts.xpc_only && api != XNIFF_API_XPC_HL) {
-                if (buf) free(buf);
+            size_t sec_off = sizeof(fh);
+            if (handle_hook_debug_logs && kind == XNIFF_EVT_DEBUG_LOG) {
+                while (sec_off + sizeof(xniff_ipc_v2_section_hdr_t) <= body_len) {
+                    xniff_ipc_v2_section_hdr_t sh = {0};
+                    memcpy(&sh, body + sec_off, sizeof(sh));
+                    sec_off += sizeof(sh);
+                    if (sec_off + sh.sec_len > body_len) break;
+                    const uint8_t *val = body + sec_off;
+                    if (sh.sec_type == XNIFF_V2_SEC_HOOK_DIAG && sh.sec_len >= sizeof(xniff_ipc_v2_diag_t)) {
+                        xniff_ipc_v2_diag_t d = {0};
+                        memcpy(&d, val, sizeof(d));
+                        size_t avail = sh.sec_len - sizeof(d);
+                        uint32_t msg_len = d.msg_len;
+                        if (msg_len > avail) msg_len = (uint32_t)avail;
+                        char *line = (char *)malloc((size_t)msg_len + 1);
+                        if (line) {
+                            memcpy(line, val + sizeof(d), msg_len);
+                            line[msg_len] = '\0';
+                            char tbuf[64];
+                            double mono_s = 0.0;
+                            format_time(tbuf, sizeof(tbuf), &mono_s);
+                            append_hook_debug_log(fh.pid, fh.tid_low, tbuf, mono_s, line);
+                            if (*line) printf("[hook-debug][pid=%u][tid=0x%x] %s\n", fh.pid, fh.tid_low, line);
+                            free(line);
+                        }
+                    }
+                    sec_off += sh.sec_len;
+                }
+                memmove(stream, stream + frame_len, stream_len - frame_len);
+                stream_len -= frame_len;
+                continue;
+            }
+
+            if (g_listener_opts.xpc_only && fh.api != XNIFF_API_XPC_HL) {
                 memmove(stream, stream + frame_len, stream_len - frame_len);
                 stream_len -= frame_len;
                 continue;
             }
 
             unsigned long long cur_evt_id = evt_idx;
-            uint64_t call_id = 0;
-            unsigned long long entry_evt_id = 0;
+            if (fh.api == XNIFF_API_XPC_HL) {
+                xniff_ipc_xpc_payload_t pl;
+                memset(&pl, 0, sizeof(pl));
+                pl.api = fh.api;
+                pl.direction = fh.direction;
+                pl.func = fh.function;
 
-            if (api == XNIFF_API_XPC_HL) {
-                if (hdr.payload_len >= sizeof(xniff_ipc_xpc_payload_t)) {
-                    xniff_ipc_xpc_payload_t *pl = (xniff_ipc_xpc_payload_t *)buf;
-                    size_t off = sizeof(*pl);
-                    char *s0 = wire_copy_str(buf, hdr.payload_len, &off, pl->str0_len);
-                    char *s1 = wire_copy_str(buf, hdr.payload_len, &off, pl->str1_len);
-                    char *s2 = wire_copy_str(buf, hdr.payload_len, &off, pl->str2_len);
-                    char *s3 = wire_copy_str(buf, hdr.payload_len, &off, pl->str3_len);
-                    xniff_xpc_serialized_set_t xser;
-                    xpc_serialized_init(&xser);
-                    xpc_serialized_parse_tlvs(buf, hdr.payload_len, off, &xser);
+                char *s0 = NULL, *s1 = NULL, *s2 = NULL, *s3 = NULL;
+                uint64_t call_id = 0;
+                xniff_xpc_serialized_set_t xser;
+                xniff_xpc_conn_meta_item_t xcm;
+                xpc_serialized_init(&xser);
+                xpc_conn_meta_init(&xcm);
 
-                    bool is_entry = (hdr.kind == XNIFF_EVT_XPC_ENTRY);
-                    bool is_exit = (hdr.kind == XNIFF_EVT_XPC_EXIT);
-                    if (is_entry) {
-                        call_id = pending_calls_push(hdr.pid, hdr.tid_low, pl->api, pl->func, cur_evt_id);
-                    } else if (is_exit) {
-                        (void)pending_calls_pop(hdr.pid, hdr.tid_low, pl->api, pl->func,
-                                                &call_id, &entry_evt_id);
-                    }
-
-                    char tbuf[64];
-                    double mono_s = 0.0;
-                    format_time(tbuf, sizeof(tbuf), &mono_s);
-
-                    xniff_xpc_analysis_t xa;
-                    analyze_xpc_event(cur_evt_id, &hdr, pl, s0, mono_s, &xa);
-
-                    if (g_listener_opts.jsonl) {
-                        jsonl_print_xpc_event(cur_evt_id, call_id, entry_evt_id, &hdr, pl,
-                                              &xa, &xser, s0, s1, s2, s3, tbuf, mono_s);
+                sec_off = sizeof(fh);
+                while (sec_off + sizeof(xniff_ipc_v2_section_hdr_t) <= body_len) {
+                    xniff_ipc_v2_section_hdr_t sh = {0};
+                    memcpy(&sh, body + sec_off, sizeof(sh));
+                    sec_off += sizeof(sh);
+                    if (sec_off + sh.sec_len > body_len) break;
+                    const uint8_t *val = body + sec_off;
+                    if (sh.sec_type == XNIFF_V2_SEC_XPC_CALL_META &&
+                        sh.sec_len >= sizeof(xniff_ipc_xpc_payload_t)) {
+                        memcpy(&pl, val, sizeof(pl));
+                        size_t voff = sizeof(pl);
+                        s0 = wire_copy_str(val, sh.sec_len, &voff, pl.str0_len);
+                        s1 = wire_copy_str(val, sh.sec_len, &voff, pl.str1_len);
+                        s2 = wire_copy_str(val, sh.sec_len, &voff, pl.str2_len);
+                        s3 = wire_copy_str(val, sh.sec_len, &voff, pl.str3_len);
+                    } else if (sh.sec_type == XNIFF_V2_SEC_CALL_ID &&
+                               sh.sec_len >= sizeof(call_id)) {
+                        memcpy(&call_id, val, sizeof(call_id));
                     } else {
-                        print_xpc_event(&hdr, pl, &xa, &xser, s0, s1, s2, s3, tbuf, mono_s);
+                        xpc_parse_section(sh.sec_type, val, sh.sec_len, &xser, &xcm);
                     }
-                    xpc_serialized_free(&xser);
-                    free(s0);
-                    free(s1);
-                    free(s2);
-                    free(s3);
-                    evt_idx++;
+                    sec_off += sh.sec_len;
                 }
-                if (buf) free(buf);
+
+                xniff_ipc_hdr_t ihdr = {0};
+                ihdr.kind = kind;
+                ihdr.pid = fh.pid;
+                ihdr.tid_low = fh.tid_low;
+
+                char tbuf[64];
+                double mono_s = 0.0;
+                format_time(tbuf, sizeof(tbuf), &mono_s);
+
+                xniff_xpc_analysis_t xa;
+                analyze_xpc_event(cur_evt_id, &ihdr, &pl, s0, mono_s, &xa);
+                xa.call_id = call_id;
+                print_xpc_event(&ihdr, &pl, &xa, &xser, &xcm, s0, s1, s2, s3, tbuf, mono_s);
+
+                xpc_serialized_free(&xser);
+                xpc_conn_meta_free(&xcm);
+                free(s0);
+                free(s1);
+                free(s2);
+                free(s3);
+                evt_idx++;
+
                 memmove(stream, stream + frame_len, stream_len - frame_len);
                 stream_len -= frame_len;
                 continue;
             }
 
-            if (hdr.payload_len >= sizeof(xniff_ipc_mach_payload_t)) {
-                xniff_ipc_mach_payload_t *pl = (xniff_ipc_mach_payload_t *)buf;
-                uint8_t *msg_bytes = buf + sizeof(*pl);
-                size_t msg_avail = 0;
-                if (hdr.payload_len > sizeof(*pl)) msg_avail = (size_t)hdr.payload_len - sizeof(*pl);
-                size_t msg_len = pl->copy_len;
-                if (msg_len > msg_avail) msg_len = msg_avail;
+            if (fh.api == XNIFF_API_MACH_MSG || fh.api == XNIFF_API_MACH_MSG2) {
+                xniff_ipc_mach_payload_t pl;
+                memset(&pl, 0, sizeof(pl));
+                pl.api = fh.api;
+                pl.direction = fh.direction;
 
-                bool is_entry = (hdr.kind == XNIFF_EVT_MACH_ENTRY || hdr.kind == XNIFF_EVT_MACH2_ENTRY);
-                bool is_exit = (hdr.kind == XNIFF_EVT_MACH_EXIT || hdr.kind == XNIFF_EVT_MACH2_EXIT);
-                if (is_entry) {
-                    call_id = pending_calls_push(hdr.pid, hdr.tid_low, pl->api, 0, cur_evt_id);
-                } else if (is_exit) {
-                    (void)pending_calls_pop(hdr.pid, hdr.tid_low, pl->api, 0, &call_id, &entry_evt_id);
-                }
-
-                // Dump inline message bytes + attachments to files (optional), and collect metadata for JSONL.
-                char prefix[512] = {0};
-                char pmsg[600] = {0};
-                const char *msg_path = NULL;
+                const uint8_t *msg_bytes = NULL;
+                size_t msg_len = 0;
                 xniff_att_meta_t *atts = NULL;
                 size_t att_count = 0, att_cap = 0;
+                xniff_ipc_v2_desc_meta_t last_desc = {0};
+                bool have_last_desc = false;
 
-                if (g_listener_opts.dump_files) {
-                    snprintf(prefix, sizeof(prefix), "%s/%s_%06llu", base_dir, kind_to_tag(hdr.kind), evt_idx);
-                    if (msg_len) {
-                        snprintf(pmsg, sizeof(pmsg), "%s_msg.bin", prefix);
-                        FILE *fp = fopen(pmsg, "wb");
-                        if (fp) {
-                            fwrite(msg_bytes, 1, msg_len, fp);
-                            fclose(fp);
-                            msg_path = pmsg;
-                        }
-                    }
-                }
+                sec_off = sizeof(fh);
+                while (sec_off + sizeof(xniff_ipc_v2_section_hdr_t) <= body_len) {
+                    xniff_ipc_v2_section_hdr_t sh = {0};
+                    memcpy(&sh, body + sec_off, sizeof(sh));
+                    sec_off += sizeof(sh);
+                    if (sec_off + sh.sec_len > body_len) break;
+                    const uint8_t *val = body + sec_off;
 
-                // Parse TLVs already contained in payload and dump them
-                size_t offset = sizeof(*pl) + msg_len;
-                while (offset + sizeof(xniff_ipc_tlv_t) <= hdr.payload_len) {
-                    xniff_ipc_tlv_t *tlv = (xniff_ipc_tlv_t *)(buf + offset);
-                    offset += sizeof(*tlv);
-                    if (offset + tlv->length > hdr.payload_len) break; // malformed
-                    uint8_t *val = buf + offset;
-
-                    if ((tlv->type == XNIFF_TLV_OOL_DATA && tlv->length >= sizeof(xniff_ool_data_t)) ||
-                        (tlv->type == XNIFF_TLV_OOL_PORTS && tlv->length >= sizeof(xniff_ool_ports_t))) {
+                    if (sh.sec_type == XNIFF_V2_SEC_MACH_HEADER_OPTIONS &&
+                        sh.sec_len >= sizeof(xniff_ipc_mach_payload_t)) {
+                        memcpy(&pl, val, sizeof(pl));
+                    } else if (sh.sec_type == XNIFF_V2_SEC_MACH_INLINE_BYTES) {
+                        msg_bytes = val;
+                        msg_len = sh.sec_len;
+                    } else if (sh.sec_type == XNIFF_V2_SEC_MACH_DESC_META &&
+                               sh.sec_len >= sizeof(xniff_ipc_v2_desc_meta_t)) {
+                        memcpy(&last_desc, val, sizeof(last_desc));
+                        have_last_desc = true;
+                    } else if ((sh.sec_type == XNIFF_V2_SEC_MACH_DESC_OOL_BYTES ||
+                                sh.sec_type == XNIFF_V2_SEC_MACH_DESC_PORT_ARRAY) &&
+                               have_last_desc) {
                         if (att_count == att_cap) {
                             size_t new_cap = att_cap ? att_cap * 2 : 8;
                             xniff_att_meta_t *tmp = (xniff_att_meta_t *)realloc(atts, new_cap * sizeof(*atts));
@@ -1730,61 +1432,68 @@ static int cmd_listen(pid_t pid) {
                         }
                         xniff_att_meta_t *m = &atts[att_count++];
                         memset(m, 0, sizeof(*m));
-                        m->type = tlv->type;
-                        if (tlv->type == XNIFF_TLV_OOL_DATA) {
-                            xniff_ool_data_t *md = (xniff_ool_data_t *)val;
-                            m->index = md->index;
-                            m->address = md->address;
-                            m->size_bytes = md->size;
-                            if (g_listener_opts.dump_files) {
-                                snprintf(m->path, sizeof(m->path), "%s_ool%u.bin", prefix, md->index);
-                                const uint8_t *bytes = val + sizeof(*md);
-                                FILE *fp = fopen(m->path, "wb");
-                                if (fp) {
-                                    fwrite(bytes, 1, md->size, fp);
-                                    fclose(fp);
-                                }
-                            } else {
-                                m->path[0] = '\0';
-                            }
-                        } else if (tlv->type == XNIFF_TLV_OOL_PORTS) {
-                            xniff_ool_ports_t *md = (xniff_ool_ports_t *)val;
-                            m->index = md->index;
-                            m->address = md->address;
-                            m->count = md->count;
-                            m->elem_size = md->elem_size;
-                            size_t bytes_len = (size_t)md->count * (size_t)md->elem_size;
-                            m->size_bytes = (uint32_t)bytes_len;
-                            if (g_listener_opts.dump_files) {
-                                snprintf(m->path, sizeof(m->path), "%s_ool_ports%u.bin", prefix, md->index);
-                                const uint8_t *bytes = val + sizeof(*md);
-                                FILE *fp = fopen(m->path, "wb");
-                                if (fp) {
-                                    fwrite(bytes, 1, bytes_len, fp);
-                                    fclose(fp);
-                                }
-                            } else {
-                                m->path[0] = '\0';
-                            }
+                        m->type = (sh.sec_type == XNIFF_V2_SEC_MACH_DESC_PORT_ARRAY) ? XNIFF_TLV_OOL_PORTS : XNIFF_TLV_OOL_DATA;
+                        m->index = last_desc.index;
+                        m->address = last_desc.address;
+                        m->size_bytes = (uint32_t)sh.sec_len;
+                        m->count = last_desc.count;
+                        m->elem_size = last_desc.elem_size;
+                    }
+                    sec_off += sh.sec_len;
+                }
+
+                char prefix[512] = {0};
+                if (g_listener_opts.dump_files) {
+                    snprintf(prefix, sizeof(prefix), "%s/%s_%06llu", base_dir, kind_to_tag(kind), evt_idx);
+                    if (msg_bytes && msg_len != 0) {
+                        char pmsg[600];
+                        snprintf(pmsg, sizeof(pmsg), "%s_msg.bin", prefix);
+                        FILE *fp = fopen(pmsg, "wb");
+                        if (fp) {
+                            fwrite(msg_bytes, 1, msg_len, fp);
+                            fclose(fp);
                         }
                     }
-                    offset += tlv->length;
+
+                    sec_off = sizeof(fh);
+                    xniff_ipc_v2_desc_meta_t dump_desc = {0};
+                    bool have_dump_desc = false;
+                    while (sec_off + sizeof(xniff_ipc_v2_section_hdr_t) <= body_len) {
+                        xniff_ipc_v2_section_hdr_t sh = {0};
+                        memcpy(&sh, body + sec_off, sizeof(sh));
+                        sec_off += sizeof(sh);
+                        if (sec_off + sh.sec_len > body_len) break;
+                        const uint8_t *val = body + sec_off;
+                        if (sh.sec_type == XNIFF_V2_SEC_MACH_DESC_META &&
+                            sh.sec_len >= sizeof(xniff_ipc_v2_desc_meta_t)) {
+                            memcpy(&dump_desc, val, sizeof(dump_desc));
+                            have_dump_desc = true;
+                        } else if (have_dump_desc && sh.sec_type == XNIFF_V2_SEC_MACH_DESC_OOL_BYTES) {
+                            char path[600];
+                            snprintf(path, sizeof(path), "%s_ool%u.bin", prefix, dump_desc.index);
+                            FILE *fp = fopen(path, "wb");
+                            if (fp) {
+                                fwrite(val, 1, sh.sec_len, fp);
+                                fclose(fp);
+                            }
+                        } else if (have_dump_desc && sh.sec_type == XNIFF_V2_SEC_MACH_DESC_PORT_ARRAY) {
+                            char path[600];
+                            snprintf(path, sizeof(path), "%s_ool_ports%u.bin", prefix, dump_desc.index);
+                            FILE *fp = fopen(path, "wb");
+                            if (fp) {
+                                fwrite(val, 1, sh.sec_len, fp);
+                                fclose(fp);
+                            }
+                        }
+                        sec_off += sh.sec_len;
+                    }
                 }
 
-                if (g_listener_opts.jsonl) {
-                    char tbuf[64];
-                    double mono_s = 0.0;
-                    format_time(tbuf, sizeof(tbuf), &mono_s);
-                    jsonl_print_event(cur_evt_id, call_id, entry_evt_id, &hdr, pl, msg_bytes, msg_len,
-                                      tbuf, mono_s, msg_path, atts, att_count);
-                } else {
-                    print_event(hdr.kind, pl, msg_bytes, msg_len);
-                }
-
+                print_event(kind, &pl, msg_bytes, msg_len);
                 if (atts) free(atts);
                 evt_idx++;
             }
-            if (buf) free(buf);
+
             memmove(stream, stream + frame_len, stream_len - frame_len);
             stream_len -= frame_len;
         }
@@ -1794,10 +1503,9 @@ static int cmd_listen(pid_t pid) {
     return 0;
 }
 
-static int cmd_hook_xpc(pid_t pid, const char *dylib_path, int mode) {
+static int install_hooks(pid_t pid, const char *dylib_path, int mode) {
     mach_port_t task;
     if (attach_and_get_task(pid, &task) != 0) return -1;
-    (void)mode;
 
     // Resolve absolute path so dlopen() in the remote process finds the library
     char abs_path[PATH_MAX] = {0};
@@ -1808,12 +1516,14 @@ static int cmd_hook_xpc(pid_t pid, const char *dylib_path, int mode) {
     }
 
     char inject_path[PATH_MAX] = {0};
-    if (stage_dylib_for_sandbox(abs_path, inject_path, sizeof(inject_path)) == 0) {
-        XNIFF_DIAGF("hook-xpc: staged hooks dylib at %s (from %s)\n", inject_path, abs_path);
+    bool staged_copy =
+        stage_dylib_for_sandbox(abs_path, inject_path, sizeof(inject_path)) == 0;
+    if (staged_copy) {
+        XNIFF_DIAGF("attach: staged hooks dylib at %s (from %s)\n", inject_path, abs_path);
     } else {
         (void)strncpy(inject_path, abs_path, sizeof(inject_path) - 1);
         inject_path[sizeof(inject_path) - 1] = '\0';
-        XNIFF_DIAGF("hook-xpc: warning: failed to stage hooks dylib; using original path %s\n", abs_path);
+        XNIFF_DIAGF("attach: warning: failed to stage hooks dylib; using original path %s\n", abs_path);
     }
 
     // Inject hooks dylib (uses filtered dlopen/pthread_exit resolution)
@@ -1821,6 +1531,7 @@ static int cmd_hook_xpc(pid_t pid, const char *dylib_path, int mode) {
     if (xniff_inject_dylib_task(task, inject_path, NULL) != 0) {
         fprintf(stderr, "failed to inject hooks dylib into pid %d\n", pid);
         detach_process(pid);
+        if (staged_copy) (void)unlink(inject_path);
         return -1;
     }
     // Wait for dyld to finish loading the injected image; poll for up to ~2s
@@ -1835,160 +1546,106 @@ static int cmd_hook_xpc(pid_t pid, const char *dylib_path, int mode) {
         }
         usleep(50 * 1000);
     }
+    if (configure_remote_capture_mode(task, (uint32_t)mode) != 0) {
+        fprintf(stderr, "attach: failed to configure capture mode in pid %d\n", pid);
+        detach_process(pid);
+        if (staged_copy) (void)unlink(inject_path);
+        return -1;
+    }
     detach_process(pid);
-    XNIFF_DIAGF("hook-xpc: injected %s; xniff-hooks installs interceptors via frida-gum\n", inject_path);
+    XNIFF_DIAGF("attach: injected %s; capture mode=%s\n", inject_path,
+                mode == XNIFF_HOOK_MODE_XPC ? "xpc" : "mach");
+    if (staged_copy) (void)unlink(inject_path);
     return 0;
 }
 
-static int spawn_suspended_target(char *const launch_argv[], pid_t *out_pid) {
-    if (!launch_argv || !launch_argv[0] || !out_pid) {
+static int spawn_suspended_target(char *const launch_argv[], const char *hooks_path,
+                                  int mode, const char *capture_file, pid_t *out_pid) {
+    if (!launch_argv || !launch_argv[0] || !hooks_path || !out_pid) {
         errno = EINVAL;
         return -1;
     }
-#ifdef POSIX_SPAWN_START_SUSPENDED
-    posix_spawnattr_t attr;
-    int src = posix_spawnattr_init(&attr);
-    if (src != 0) {
-        errno = src;
-        return -1;
-    }
-    short flags = POSIX_SPAWN_START_SUSPENDED;
-    src = posix_spawnattr_setflags(&attr, flags);
-    if (src != 0) {
-        errno = src;
-        (void)posix_spawnattr_destroy(&attr);
+    xniff_launch_environment_t launch_environment;
+    if (xniff_launch_environment_create(hooks_path, mode, capture_file,
+                                        &launch_environment) != 0) {
+        errno = ENOMEM;
         return -1;
     }
 
-    pid_t pid = 0;
-    src = posix_spawnp(&pid, launch_argv[0], NULL, &attr, launch_argv, environ);
-    (void)posix_spawnattr_destroy(&attr);
-    if (src != 0) {
-        errno = src;
+    pid_t pid = fork();
+    if (pid == 0) {
+        /*
+         * START_SUSPENDED is too late for platform binaries: dyld can strip
+         * DYLD_INSERT_LIBRARIES before the parent gets control.  TRACE_ME
+         * marks the child debugged before exec and stops it at the exec trap,
+         * so dyld accepts the injected hooks while main is still unreachable.
+         */
+        if (ptrace(PT_TRACE_ME, 0, 0, 0) != 0) _exit(126);
+        environ = launch_environment.values;
+        execvp(launch_argv[0], launch_argv);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+    xniff_launch_environment_destroy(&launch_environment);
+    if (pid < 0) return -1;
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        return -1;
+    }
+    if (!WIFSTOPPED(status)) {
+        errno = WIFEXITED(status) && WEXITSTATUS(status) == 127 ? ENOENT : ENOEXEC;
         return -1;
     }
     *out_pid = pid;
     return 0;
-#else
-    (void)launch_argv;
-    (void)out_pid;
-    errno = ENOTSUP;
-    return -1;
-#endif
 }
 
-static const char *xniff_basename(const char *path) {
-    if (!path) return NULL;
-    const char *slash = strrchr(path, '/');
-    return slash ? (slash + 1) : path;
+static int continue_traced_target(pid_t pid, int signal_number) {
+    return ptrace(PT_CONTINUE, pid, (caddr_t)1, signal_number);
 }
 
-static int find_process_by_name_once(const char *target_name, pid_t *out_pid) {
-    if (!target_name || !*target_name || !out_pid) return -1;
-
-    int bytes = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
-    if (bytes <= 0) return -1;
-    size_t count = (size_t)bytes / sizeof(pid_t);
-    pid_t *pids = (pid_t *)calloc(count ? count : 1, sizeof(pid_t));
-    if (!pids) return -1;
-
-    int got = proc_listpids(PROC_ALL_PIDS, 0, pids, (int)(count * sizeof(pid_t)));
-    if (got <= 0) {
-        free(pids);
-        return -1;
-    }
-    size_t got_count = (size_t)got / sizeof(pid_t);
-
-    pid_t self = getpid();
-    pid_t best_pid = 0;
-    for (size_t i = 0; i < got_count; i++) {
-        pid_t pid = pids[i];
-        if (pid <= 0 || pid == self) continue;
-
-        bool matched = false;
-
-        char name_buf[PROC_PIDPATHINFO_MAXSIZE];
-        int n = proc_name(pid, name_buf, sizeof(name_buf));
-        if (n > 0) {
-            size_t nn = (size_t)n;
-            if (nn >= sizeof(name_buf)) nn = sizeof(name_buf) - 1;
-            name_buf[nn] = '\0';
-            if (strcmp(name_buf, target_name) == 0) matched = true;
-        }
-
-        char path_buf[PROC_PIDPATHINFO_MAXSIZE];
-        if (!matched) {
-            int pn = proc_pidpath(pid, path_buf, sizeof(path_buf));
-            if (pn > 0) {
-                size_t pnn = (size_t)pn;
-                if (pnn >= sizeof(path_buf)) pnn = sizeof(path_buf) - 1;
-                path_buf[pnn] = '\0';
-                if (strcmp(path_buf, target_name) == 0) {
-                    matched = true;
-                } else {
-                    const char *base = xniff_basename(path_buf);
-                    if (base && strcmp(base, target_name) == 0) matched = true;
-                }
-            }
-        }
-
-        if (matched && pid > best_pid) {
-            // Prefer the newest matching pid.
-            best_pid = pid;
-        }
-    }
-
-    free(pids);
-    if (best_pid > 0) {
-        *out_pid = best_pid;
-        return 0;
-    }
-    return 1;
-}
-
-static int wait_for_process_name(const char *target_name, pid_t *out_pid) {
-    if (!target_name || !*target_name || !out_pid) return -1;
-    for (;;) {
-        pid_t pid = 0;
-        int rc = find_process_by_name_once(target_name, &pid);
-        if (rc == 0) {
-            *out_pid = pid;
-            return 0;
-        }
-        usleep(50 * 1000);
-    }
+static int continue_after_trace_stop(pid_t pid, int status) {
+    int signal_number = WSTOPSIG(status);
+    /* Exec traps are debugger notifications, not target-visible signals. */
+    if (signal_number == SIGTRAP) signal_number = 0;
+    return continue_traced_target(pid, signal_number);
 }
 
 // Combined workflow: start listener, then inject hooks.
-static int cmd_sniff_xpc_impl(pid_t pid,
-                              const char *dylib_path,
-                              int mode,
-                              bool resume_target,
-                              bool target_is_child) {
-    const char *flow = resume_target ? "sniff-xpc-launch" : "sniff-xpc";
+static int capture_attached_process(pid_t pid,
+                                    const char *dylib_path,
+                                    int mode,
+                                    bool resume_target,
+                                    bool target_is_child,
+                                    bool hooks_preloaded) {
+    const char *flow = resume_target ? "launch" : "attach";
+    int ready_pipe[2] = {-1, -1};
+    if (pipe(ready_pipe) != 0) {
+        perror("pipe");
+        return -1;
+    }
     pid_t child = fork();
     if (child == 0) {
-        int rc = cmd_listen(pid);
+        close(ready_pipe[0]);
+        int rc = capture_ring(pid, ready_pipe[1]);
         _exit(rc == 0 ? 0 : 1);
     }
     if (child < 0) {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
         perror("fork");
         return -1;
     }
-    if (g_listener_opts.jsonl) {
-        // Keep JSONL on stdout clean: route parent stdout to stderr.
-        (void)dup2(STDERR_FILENO, STDOUT_FILENO);
-    }
+    close(ready_pipe[1]);
 
-    // Wait for listener process startup. If it exits early, do not inject.
-    bool listener_ready = false;
-    for (int i = 0; i < 20; i++) { // ~1s
-        if (kill(child, 0) != 0 && errno == ESRCH) {
-            break;
-        }
-        listener_ready = true;
-        usleep(50 * 1000);
-    }
+    struct pollfd ready_poll = {.fd = ready_pipe[0], .events = POLLIN};
+    int poll_result = poll(&ready_poll, 1, 5000);
+    uint8_t ready_byte = 0;
+    bool listener_ready = poll_result > 0 &&
+                          read(ready_pipe[0], &ready_byte, sizeof(ready_byte)) == sizeof(ready_byte) &&
+                          ready_byte == 1;
+    close(ready_pipe[0]);
     if (!listener_ready) {
         fprintf(stderr, "%s: listener failed to start for pid %d\n", flow, (int)pid);
         (void)kill(child, SIGTERM);
@@ -1996,16 +1653,18 @@ static int cmd_sniff_xpc_impl(pid_t pid,
         return -1;
     }
 
-    int rc = cmd_hook_xpc(pid, dylib_path, mode);
-    if (rc != 0) {
-        fprintf(stderr, "%s: hook-xpc failed; terminating listener (pid %d)\n", flow, (int)child);
-        kill(child, SIGTERM);
-        (void)waitpid(child, NULL, 0);
-        return -1;
+    if (!hooks_preloaded) {
+        int rc = install_hooks(pid, dylib_path, mode);
+        if (rc != 0) {
+            fprintf(stderr, "%s: hook injection failed; terminating listener (pid %d)\n", flow, (int)child);
+            kill(child, SIGTERM);
+            (void)waitpid(child, NULL, 0);
+            return -1;
+        }
     }
 
     if (resume_target) {
-        if (kill(pid, SIGCONT) != 0) {
+        if (continue_traced_target(pid, 0) != 0) {
             fprintf(stderr, "%s: failed to resume target pid %d: %s\n", flow, (int)pid, strerror(errno));
             kill(child, SIGTERM);
             (void)waitpid(child, NULL, 0);
@@ -2029,7 +1688,13 @@ static int cmd_sniff_xpc_impl(pid_t pid,
             break;
         }
         if (target_is_child && w == pid) {
-            if (WIFEXITED(status)) {
+            if (WIFSTOPPED(status)) {
+                if (continue_after_trace_stop(pid, status) != 0) {
+                    fprintf(stderr, "%s: failed to continue target pid %d: %s\n",
+                            flow, (int)pid, strerror(errno));
+                    (void)kill(child, SIGTERM);
+                }
+            } else if (WIFEXITED(status)) {
                 XNIFF_DIAGF("%s: target pid %d exited with code %d\n",
                             flow, (int)pid, WEXITSTATUS(status));
             } else if (WIFSIGNALED(status)) {
@@ -2043,45 +1708,60 @@ static int cmd_sniff_xpc_impl(pid_t pid,
     return -1;
 }
 
-int cmd_sniff_xpc(pid_t pid, const char *dylib_path, int mode) {
-    return cmd_sniff_xpc_impl(pid, dylib_path, mode, false, false);
+static int cmd_attach(pid_t pid, const char *dylib_path, int mode) {
+    return capture_attached_process(pid, dylib_path, mode, false, false, false);
 }
 
-static int cmd_sniff_xpc_launch(const char *dylib_path, int mode, char *const launch_argv[]) {
+static int cmd_launch(const char *dylib_path, int mode, char *const launch_argv[]) {
+    const char *direct_capture = NULL;
+    if (g_listener_opts.out_bin && strcmp(g_listener_opts.out_bin_path, "-") != 0) {
+        direct_capture = g_listener_opts.out_bin_path;
+        (void)unlink(direct_capture);
+    }
     pid_t pid = 0;
-    if (spawn_suspended_target(launch_argv, &pid) != 0) {
-        fprintf(stderr, "sniff-xpc-launch: failed to spawn suspended target '%s': %s\n",
+    if (spawn_suspended_target(launch_argv, dylib_path, mode, direct_capture, &pid) != 0) {
+        fprintf(stderr, "launch: failed to spawn suspended target '%s': %s\n",
                 launch_argv && launch_argv[0] ? launch_argv[0] : "(null)", strerror(errno));
         return -1;
     }
 
-    XNIFF_DIAGF("sniff-xpc-launch: spawned suspended pid %d (%s)\n", (int)pid, launch_argv[0]);
-    int rc = cmd_sniff_xpc_impl(pid, dylib_path, mode, true, true);
+    XNIFF_DIAGF("launch: spawned suspended pid %d (%s)\n", (int)pid, launch_argv[0]);
+    if (direct_capture) {
+        if (continue_traced_target(pid, 0) != 0) {
+            fprintf(stderr, "launch: failed to resume target: %s\n", strerror(errno));
+            (void)kill(pid, SIGKILL);
+            (void)waitpid(pid, NULL, 0);
+            return -1;
+        }
+        int status = 0;
+        for (;;) {
+            pid_t wait_result = waitpid(pid, &status, 0);
+            if (wait_result < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            if (!WIFSTOPPED(status)) break;
+            if (continue_after_trace_stop(pid, status) != 0) {
+                fprintf(stderr, "launch: failed to continue target: %s\n", strerror(errno));
+                (void)kill(pid, SIGKILL);
+                (void)waitpid(pid, NULL, 0);
+                return -1;
+            }
+        }
+        struct stat capture_stat;
+        if (stat(direct_capture, &capture_stat) != 0 ||
+            capture_stat.st_size < (off_t)sizeof(xniff_bin_file_hdr_t)) {
+            fprintf(stderr,
+                    "launch: hooks did not initialize; DYLD insertion may have been blocked\n");
+            return -1;
+        }
+        XNIFF_DIAGF("launch: wrote capture to %s\n", direct_capture);
+        return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+    }
+    int rc = capture_attached_process(pid, dylib_path, mode, true, true, true);
     if (rc != 0) {
         (void)kill(pid, SIGKILL);
         (void)waitpid(pid, NULL, 0);
-    }
-    return rc;
-}
-
-static int cmd_sniff_xpc_wait(const char *process_name, const char *dylib_path, int mode) {
-    pid_t pid = 0;
-    XNIFF_DIAGF("sniff-xpc-wait: waiting for process '%s'\n", process_name);
-    if (wait_for_process_name(process_name, &pid) != 0) {
-        fprintf(stderr, "sniff-xpc-wait: failed waiting for process '%s'\n", process_name);
-        return -1;
-    }
-
-    XNIFF_DIAGF("sniff-xpc-wait: found pid %d for '%s'; stopping target\n", (int)pid, process_name);
-    if (kill(pid, SIGSTOP) != 0) {
-        fprintf(stderr, "sniff-xpc-wait: failed to stop pid %d: %s\n", (int)pid, strerror(errno));
-        return -1;
-    }
-
-    int rc = cmd_sniff_xpc_impl(pid, dylib_path, mode, true, false);
-    if (rc != 0) {
-        // Avoid leaving a process suspended on failure paths.
-        (void)kill(pid, SIGCONT);
     }
     return rc;
 }

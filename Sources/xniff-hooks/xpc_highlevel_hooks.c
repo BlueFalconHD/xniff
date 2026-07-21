@@ -10,21 +10,25 @@
 #include <pthread.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <execinfo.h>
 
 #include <xpc/xpc.h>
+#include <mach/mach_vm.h>
 
 #include "../shared/xniff_ipc.h"
+#include "../shared/xniff_ipc_v2.h"
 #include "xniff_hooks_emit.h"
-#include "xniff_hooks_ipc.h"
 
 enum {
     XNIFF_XPC_STR_MAX = 16384u,
-    XNIFF_XPC_SERIAL_DEFAULT_MAX = 16384u,
+    XNIFF_XPC_SERIAL_DEFAULT_MAX = 256u * 1024u,
     XNIFF_XPC_SERIAL_ABS_MAX = 512u * 1024u,
     XNIFF_XPC_SERIAL_FLAG_TRUNCATED = 1u,
 };
 
 typedef void *(*xniff_xpc_make_serialization_fn)(xpc_object_t obj, size_t *len_out);
+typedef const char *(*xniff_xpc_conn_get_name_fn)(xpc_connection_t conn);
+typedef uint32_t (*xniff_xpc_conn_get_u32_fn)(xpc_connection_t conn);
 
 typedef struct {
     uint8_t slot;
@@ -35,10 +39,23 @@ typedef struct {
     uint8_t *bytes;
 } xniff_xpc_serial_blob_t;
 
+typedef struct {
+    xniff_xpc_conn_meta_t md;
+    const char *name_public;
+    const char *name_private;
+} xniff_xpc_conn_meta_capture_t;
+
 static pthread_once_t g_serial_once = PTHREAD_ONCE_INIT;
 static xniff_xpc_make_serialization_fn g_xpc_make_serialization = NULL;
 static bool g_xpc_serial_enabled = true;
 static uint32_t g_xpc_serial_max = XNIFF_XPC_SERIAL_DEFAULT_MAX;
+
+static xniff_xpc_conn_get_u32_fn g_xpc_connection_get_pid = NULL;
+static xniff_xpc_conn_get_u32_fn g_xpc_connection_get_pid_private = NULL;
+static xniff_xpc_conn_get_name_fn g_xpc_connection_get_name = NULL;
+static xniff_xpc_conn_get_u32_fn g_xpc_connection_get_euid = NULL;
+static xniff_xpc_conn_get_u32_fn g_xpc_connection_get_egid = NULL;
+static xniff_xpc_conn_get_u32_fn g_xpc_connection_get_asid = NULL;
 
 static bool xniff_env_enabled_default_true(const char *name) {
     if (!name || !*name) return true;
@@ -62,6 +79,32 @@ static uint32_t xniff_env_u32(const char *name, uint32_t defv, uint32_t maxv) {
     return (uint32_t)v;
 }
 
+static void *xniff_dlsym_with_alias(const char *name) {
+    if (!name || !*name) return NULL;
+    void *p = dlsym(RTLD_DEFAULT, name);
+    if (p) return p;
+    if (name[0] == '_') {
+        p = dlsym(RTLD_DEFAULT, name + 1);
+    } else {
+        char alt[256];
+        int n = snprintf(alt, sizeof(alt), "_%s", name);
+        if (n > 0 && (size_t)n < sizeof(alt)) {
+            p = dlsym(RTLD_DEFAULT, alt);
+        }
+    }
+    return p;
+}
+
+static void *xniff_require_libxpc_symbol(void *sym) {
+    if (!sym) return NULL;
+    Dl_info info;
+    memset(&info, 0, sizeof(info));
+    if (dladdr(sym, &info) == 0) return NULL;
+    if (!info.dli_fname) return NULL;
+    if (strstr(info.dli_fname, "libxpc") == NULL) return NULL;
+    return sym;
+}
+
 static void xniff_xpc_serial_init_once(void) {
     g_xpc_serial_enabled = xniff_env_enabled_default_true("XNIFF_XPC_SERIALIZE");
     g_xpc_serial_max = xniff_env_u32("XNIFF_XPC_SERIAL_MAX",
@@ -69,7 +112,35 @@ static void xniff_xpc_serial_init_once(void) {
                                      XNIFF_XPC_SERIAL_ABS_MAX);
     if (g_xpc_serial_max == 0) g_xpc_serial_enabled = false;
     g_xpc_make_serialization =
-        (xniff_xpc_make_serialization_fn)dlsym(RTLD_DEFAULT, "xpc_make_serialization");
+        (xniff_xpc_make_serialization_fn)xniff_dlsym_with_alias("xpc_make_serialization");
+
+    g_xpc_connection_get_pid =
+        (xniff_xpc_conn_get_u32_fn)xniff_dlsym_with_alias("xpc_connection_get_pid");
+    g_xpc_connection_get_pid_private =
+        (xniff_xpc_conn_get_u32_fn)xniff_require_libxpc_symbol(
+            xniff_dlsym_with_alias("_xpc_connection_get_pid"));
+    g_xpc_connection_get_name =
+        (xniff_xpc_conn_get_name_fn)xniff_dlsym_with_alias("xpc_connection_get_name");
+    g_xpc_connection_get_euid =
+        (xniff_xpc_conn_get_u32_fn)xniff_dlsym_with_alias("xpc_connection_get_euid");
+    g_xpc_connection_get_egid =
+        (xniff_xpc_conn_get_u32_fn)xniff_dlsym_with_alias("xpc_connection_get_egid");
+    g_xpc_connection_get_asid =
+        (xniff_xpc_conn_get_u32_fn)xniff_dlsym_with_alias("xpc_connection_get_asid");
+}
+
+static bool xniff_ptr_readable(const void *p) {
+    if (!p) return false;
+    uintptr_t u = (uintptr_t)p;
+    if (u < 0x1000u) return false;
+    uint64_t tmp = 0;
+    mach_vm_size_t out = 0;
+    kern_return_t kr = mach_vm_read_overwrite(mach_task_self(),
+                                              (mach_vm_address_t)u,
+                                              (mach_vm_size_t)sizeof(tmp),
+                                              (mach_vm_address_t)(uintptr_t)&tmp,
+                                              &out);
+    return (kr == KERN_SUCCESS && out == (mach_vm_size_t)sizeof(tmp));
 }
 
 static inline uint32_t xniff_strnlen_u32(const char *s, uint32_t maxlen) {
@@ -78,28 +149,84 @@ static inline uint32_t xniff_strnlen_u32(const char *s, uint32_t maxlen) {
     return (uint32_t)n;
 }
 
-static char *xniff_xpc_desc(xpc_object_t obj, uint32_t *len_out) {
-    if (len_out) *len_out = 0;
-    if (!obj) return NULL;
-    char *s = xpc_copy_description(obj);
-    if (!s) return NULL;
-    uint32_t n = xniff_strnlen_u32(s, XNIFF_XPC_STR_MAX);
-    if (len_out) *len_out = n;
-    return s; // free() by caller
-}
+static void xniff_add_backtrace_section(xniff_ipc_v2_builder_t *b) {
+    if (!b || !xniff_hooks_backtrace_is_enabled()) return;
+    xniff_ipc_v2_backtrace_t bt;
+    xniff_ipc_v2_backtrace_symbols_hdr_t sh;
+    xniff_ipc_v2_backtrace_symbol_t syms[XNIFF_V2_BACKTRACE_MAX_FRAMES];
+    const char *names[XNIFF_V2_BACKTRACE_MAX_FRAMES] = {0};
+    const char *images[XNIFF_V2_BACKTRACE_MAX_FRAMES] = {0};
+    void *captured[XNIFF_V2_BACKTRACE_MAX_FRAMES] = {0};
+    uint32_t captured_count = 0;
 
-static char *xniff_ptr_desc(uint64_t ptr, uint32_t *len_out) {
-    if (len_out) *len_out = 0;
-    char buf[32];
-    int n = snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)ptr);
-    if (n <= 0) return NULL;
-    size_t m = (size_t)n;
-    char *s = (char *)malloc(m + 1);
-    if (!s) return NULL;
-    memcpy(s, buf, m);
-    s[m] = '\0';
-    if (len_out) *len_out = (uint32_t)m;
-    return s;
+    memset(&bt, 0, sizeof(bt));
+    memset(&sh, 0, sizeof(sh));
+    memset(syms, 0, sizeof(syms));
+
+    void *frames[XNIFF_V2_BACKTRACE_MAX_FRAMES + 8u] = {0};
+    int n = backtrace(frames, (int)(sizeof(frames) / sizeof(frames[0])));
+    if (n <= 0) return;
+
+    int skip = 2; // xniff_add_backtrace_section + immediate sender
+    for (int i = skip; i < n && bt.count < XNIFF_V2_BACKTRACE_MAX_FRAMES; i++) {
+        void *pc = frames[i];
+        captured[bt.count] = pc;
+        bt.pcs[bt.count++] = (uint64_t)(uintptr_t)pc;
+    }
+    captured_count = bt.count;
+    if (captured_count == 0) return;
+
+    (void)xniff_ipc_v2_add_section(b, XNIFF_V2_SEC_BACKTRACE, 0, &bt, sizeof(bt));
+
+    bool have_symbol_data = false;
+    sh.count = captured_count;
+    for (uint32_t i = 0; i < captured_count; i++) {
+        Dl_info info;
+        memset(&info, 0, sizeof(info));
+
+        syms[i].pc = (uint64_t)(uintptr_t)captured[i];
+        if (dladdr(captured[i], &info) == 0) continue;
+
+        if (info.dli_saddr) {
+            syms[i].sym_addr = (uint64_t)(uintptr_t)info.dli_saddr;
+            have_symbol_data = true;
+        }
+        if (info.dli_sname) {
+            syms[i].name_len = (uint32_t)strnlen(info.dli_sname, 255u);
+            names[i] = info.dli_sname;
+            if (syms[i].name_len != 0) have_symbol_data = true;
+        }
+        if (info.dli_fname) {
+            syms[i].image_len = (uint32_t)strnlen(info.dli_fname, 255u);
+            images[i] = info.dli_fname;
+            if (syms[i].image_len != 0) have_symbol_data = true;
+        }
+        sh.strings_len += syms[i].name_len + syms[i].image_len;
+    }
+
+    if (!have_symbol_data) return;
+
+    size_t sec_len = sizeof(sh) +
+                     ((size_t)captured_count * sizeof(syms[0])) +
+                     (size_t)sh.strings_len;
+    uint8_t *sec = (uint8_t *)malloc(sec_len);
+    if (!sec) return;
+
+    memcpy(sec, &sh, sizeof(sh));
+    memcpy(sec + sizeof(sh), syms, (size_t)captured_count * sizeof(syms[0]));
+    size_t off = sizeof(sh) + ((size_t)captured_count * sizeof(syms[0]));
+    for (uint32_t i = 0; i < captured_count; i++) {
+        if (syms[i].name_len != 0 && names[i]) {
+            memcpy(sec + off, names[i], syms[i].name_len);
+            off += syms[i].name_len;
+        }
+        if (syms[i].image_len != 0 && images[i]) {
+            memcpy(sec + off, images[i], syms[i].image_len);
+            off += syms[i].image_len;
+        }
+    }
+    (void)xniff_ipc_v2_add_section(b, XNIFF_V2_SEC_BACKTRACE_SYMBOLS, 0, sec, off);
+    free(sec);
 }
 
 static void xniff_xpc_serial_blob_free(xniff_xpc_serial_blob_t *b) {
@@ -148,6 +275,44 @@ static bool xniff_capture_xpc_serialized(xpc_object_t obj, uint8_t slot, xniff_x
     return true;
 }
 
+static bool xniff_capture_xpc_conn_meta(xpc_connection_t conn, xniff_xpc_conn_meta_capture_t *out) {
+    if (!conn || !out) return false;
+    (void)pthread_once(&g_serial_once, xniff_xpc_serial_init_once);
+    if (!xniff_ptr_readable((const void *)conn)) return false;
+
+    memset(out, 0, sizeof(*out));
+    out->md.version = XNIFF_XPC_CONN_META_VERSION;
+
+    if (g_xpc_connection_get_name) {
+        out->name_public = g_xpc_connection_get_name(conn);
+        out->md.name_public_len = xniff_strnlen_u32(out->name_public, XNIFF_XPC_STR_MAX);
+        if (out->md.name_public_len != 0) out->md.flags |= XNIFF_XPC_CONN_META_HAS_NAME_PUBLIC;
+    }
+
+    if (g_xpc_connection_get_pid) {
+        out->md.pid_public = g_xpc_connection_get_pid(conn);
+        out->md.flags |= XNIFF_XPC_CONN_META_HAS_PID_PUBLIC;
+    }
+    if (g_xpc_connection_get_pid_private) {
+        out->md.pid_private = g_xpc_connection_get_pid_private(conn);
+        out->md.flags |= XNIFF_XPC_CONN_META_HAS_PID_PRIVATE;
+    }
+    if (g_xpc_connection_get_euid) {
+        out->md.euid_public = g_xpc_connection_get_euid(conn);
+        out->md.flags |= XNIFF_XPC_CONN_META_HAS_EUID_PUBLIC;
+    }
+    if (g_xpc_connection_get_egid) {
+        out->md.egid_public = g_xpc_connection_get_egid(conn);
+        out->md.flags |= XNIFF_XPC_CONN_META_HAS_EGID_PUBLIC;
+    }
+    if (g_xpc_connection_get_asid) {
+        out->md.asid_public = g_xpc_connection_get_asid(conn);
+        out->md.flags |= XNIFF_XPC_CONN_META_HAS_ASID_PUBLIC;
+    }
+
+    return out->md.flags != 0;
+}
+
 static void ipc_send_xpc_event_ex(
     uint16_t kind,
     const xniff_ipc_xpc_payload_t *pl_in,
@@ -156,66 +321,94 @@ static void ipc_send_xpc_event_ex(
     const char *s2, uint32_t l2,
     const char *s3, uint32_t l3,
     const xniff_xpc_serial_blob_t *serial_blobs,
-    size_t serial_blob_count)
+    size_t serial_blob_count,
+    const xniff_xpc_conn_meta_capture_t *conn_meta)
 {
+    if (!xniff_hooks_capture_mode_enabled(XNIFF_CAPTURE_MODE_XPC)) return;
     if (!pl_in) return;
+    (void)kind;
 
-    uint64_t payload_len = (uint64_t)sizeof(*pl_in) + l0 + l1 + l2 + l3;
-    for (size_t i = 0; i < serial_blob_count; i++) {
-        const xniff_xpc_serial_blob_t *b = &serial_blobs[i];
-        if (!b->bytes || b->stored_len == 0) continue;
-        uint64_t ext_len = (uint64_t)sizeof(xniff_ipc_tlv_t) +
-                           (uint64_t)sizeof(xniff_xpc_serialized_t) +
-                           (uint64_t)b->stored_len;
-        payload_len += ext_len;
+    xniff_ipc_v2_builder_t b;
+    xniff_ipc_v2_builder_init(&b);
+
+    if (xniff_ipc_v2_begin(&b,
+                           XNIFF_V2_ENTRY_XPC,
+                           (uint32_t)getpid(),
+                           (uint32_t)(uintptr_t)pthread_self(),
+                           0,
+                           (uint16_t)pl_in->direction,
+                           XNIFF_API_XPC_HL,
+                           pl_in->func) != 0) {
+        xniff_ipc_v2_builder_free(&b);
+        return;
     }
-    if (payload_len > UINT32_MAX) return;
-
-    xniff_hooks_ipc_lock();
-
-    xniff_ipc_hdr_t hdr = {0};
-    hdr.magic = XNIFF_IPC_MAGIC;
-    hdr.version = XNIFF_IPC_VERSION;
-    hdr.kind = kind;
-    hdr.pid = (uint32_t)getpid();
-    hdr.tid_low = (uint32_t)(uintptr_t)pthread_self();
-    hdr.payload_len = (uint32_t)payload_len;
 
     xniff_ipc_xpc_payload_t pl = *pl_in;
     pl.str0_len = l0;
     pl.str1_len = l1;
     pl.str2_len = l2;
     pl.str3_len = l3;
-
-    if (xniff_hooks_ipc_write_locked(&hdr, sizeof(hdr)) != 0) { xniff_hooks_ipc_unlock(); return; }
-    if (xniff_hooks_ipc_write_locked(&pl, sizeof(pl)) != 0)   { xniff_hooks_ipc_unlock(); return; }
-
-    if (l0 && s0) if (xniff_hooks_ipc_write_locked(s0, l0) != 0) { xniff_hooks_ipc_unlock(); return; }
-    if (l1 && s1) if (xniff_hooks_ipc_write_locked(s1, l1) != 0) { xniff_hooks_ipc_unlock(); return; }
-    if (l2 && s2) if (xniff_hooks_ipc_write_locked(s2, l2) != 0) { xniff_hooks_ipc_unlock(); return; }
-    if (l3 && s3) if (xniff_hooks_ipc_write_locked(s3, l3) != 0) { xniff_hooks_ipc_unlock(); return; }
+    size_t call_len = sizeof(pl) + (size_t)l0 + (size_t)l1 + (size_t)l2 + (size_t)l3;
+    uint8_t *call_sec = (uint8_t *)malloc(call_len);
+    if (!call_sec) {
+        xniff_ipc_v2_builder_free(&b);
+        return;
+    }
+    memcpy(call_sec, &pl, sizeof(pl));
+    size_t off = sizeof(pl);
+    if (l0 && s0) { memcpy(call_sec + off, s0, l0); off += l0; }
+    if (l1 && s1) { memcpy(call_sec + off, s1, l1); off += l1; }
+    if (l2 && s2) { memcpy(call_sec + off, s2, l2); off += l2; }
+    if (l3 && s3) { memcpy(call_sec + off, s3, l3); off += l3; }
+    (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_XPC_CALL_META, 0, call_sec, off);
+    free(call_sec);
+    uint64_t call_id = xniff_hooks_current_call_id();
+    if (call_id != 0) {
+        (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_CALL_ID, 0, &call_id, sizeof(call_id));
+    }
+    xniff_add_backtrace_section(&b);
 
     for (size_t i = 0; i < serial_blob_count; i++) {
-        const xniff_xpc_serial_blob_t *b = &serial_blobs[i];
-        if (!b->bytes || b->stored_len == 0) continue;
-        if ((uint64_t)sizeof(xniff_xpc_serialized_t) + (uint64_t)b->stored_len > UINT32_MAX) continue;
-
-        xniff_ipc_tlv_t tlv = {0};
-        tlv.type = XNIFF_TLV_XPC_SERIALIZED;
-        tlv.length = (uint32_t)(sizeof(xniff_xpc_serialized_t) + b->stored_len);
-        if (xniff_hooks_ipc_write_locked(&tlv, sizeof(tlv)) != 0) { xniff_hooks_ipc_unlock(); return; }
-
+        const xniff_xpc_serial_blob_t *sb = &serial_blobs[i];
+        if (!sb->bytes || sb->stored_len == 0) continue;
+        size_t sec_len = sizeof(xniff_xpc_serialized_t) + (size_t)sb->stored_len;
+        uint8_t *sec = (uint8_t *)malloc(sec_len);
+        if (!sec) continue;
         xniff_xpc_serialized_t md = {0};
-        md.slot = b->slot;
-        md.format = b->format;
-        md.flags = b->flags;
-        md.original_len = b->original_len;
-        md.stored_len = b->stored_len;
-        if (xniff_hooks_ipc_write_locked(&md, sizeof(md)) != 0) { xniff_hooks_ipc_unlock(); return; }
-        if (xniff_hooks_ipc_write_locked(b->bytes, b->stored_len) != 0) { xniff_hooks_ipc_unlock(); return; }
+        md.slot = sb->slot;
+        md.format = sb->format;
+        md.flags = sb->flags;
+        md.original_len = sb->original_len;
+        md.stored_len = sb->stored_len;
+        memcpy(sec, &md, sizeof(md));
+        memcpy(sec + sizeof(md), sb->bytes, sb->stored_len);
+        (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_XPC_SERIALIZED, 0, sec, sec_len);
+        free(sec);
     }
 
-    xniff_hooks_ipc_unlock();
+    if (conn_meta && conn_meta->md.flags != 0) {
+        size_t sec_len = sizeof(conn_meta->md) +
+                         (size_t)conn_meta->md.name_public_len +
+                         (size_t)conn_meta->md.name_private_len;
+        uint8_t *sec = (uint8_t *)malloc(sec_len);
+        if (sec) {
+            memcpy(sec, &conn_meta->md, sizeof(conn_meta->md));
+            size_t so = sizeof(conn_meta->md);
+            if (conn_meta->md.name_public_len != 0 && conn_meta->name_public) {
+                memcpy(sec + so, conn_meta->name_public, conn_meta->md.name_public_len);
+                so += conn_meta->md.name_public_len;
+            }
+            if (conn_meta->md.name_private_len != 0 && conn_meta->name_private) {
+                memcpy(sec + so, conn_meta->name_private, conn_meta->md.name_private_len);
+                so += conn_meta->md.name_private_len;
+            }
+            (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_XPC_CONN_META, 0, sec, so);
+            free(sec);
+        }
+    }
+
+    (void)xniff_ipc_v2_write(&b);
+    xniff_ipc_v2_builder_free(&b);
 }
 
 static void ipc_send_xpc_event(
@@ -226,7 +419,7 @@ static void ipc_send_xpc_event(
     const char *s2, uint32_t l2,
     const char *s3, uint32_t l3)
 {
-    ipc_send_xpc_event_ex(kind, pl_in, s0, l0, s1, l1, s2, l2, s3, l3, NULL, 0);
+    ipc_send_xpc_event_ex(kind, pl_in, s0, l0, s1, l1, s2, l2, s3, l3, NULL, 0, NULL);
 }
 
 static inline void pl_init_from_args(xniff_ipc_xpc_payload_t *pl, uint32_t func, uint32_t direction, uint64_t ret, const uint64_t args[8]) {
@@ -251,75 +444,71 @@ void xniff_emit_xpc_connection_create_entry(const uint64_t args[8]) {
 
 void xniff_emit_xpc_connection_create_exit(uint64_t ret, const uint64_t args[8]) {
     xpc_connection_t conn = (xpc_connection_t)(uintptr_t)ret;
-    const char *cname = conn ? xpc_connection_get_name(conn) : NULL;
+    xniff_xpc_conn_meta_capture_t conn_meta;
+    bool has_conn_meta = xniff_capture_xpc_conn_meta(conn, &conn_meta);
+    const char *cname = (has_conn_meta && conn_meta.name_public) ? conn_meta.name_public : NULL;
     uint32_t l0 = xniff_strnlen_u32(cname, XNIFF_XPC_STR_MAX);
-    uint32_t l1 = 0;
-    char *cdesc = xniff_xpc_desc(conn, &l1);
 
     xniff_ipc_xpc_payload_t pl;
     pl_init_from_args(&pl, XNIFF_XPC_FUNC_CONNECTION_CREATE, XNIFF_DIR_EXIT, ret, args);
-    if (conn) pl.conn_pid = (uint32_t)xpc_connection_get_pid(conn);
-    ipc_send_xpc_event(XNIFF_EVT_XPC_EXIT, &pl, cname, l0, cdesc, l1, NULL, 0, NULL, 0);
-    if (cdesc) free(cdesc);
+    if (has_conn_meta && (conn_meta.md.flags & XNIFF_XPC_CONN_META_HAS_PID_PUBLIC)) {
+        pl.conn_pid = conn_meta.md.pid_public;
+    }
+    ipc_send_xpc_event_ex(XNIFF_EVT_XPC_EXIT, &pl, cname, l0, NULL, 0, NULL, 0, NULL, 0,
+                          NULL, 0, has_conn_meta ? &conn_meta : NULL);
 }
 
 void xniff_emit_xpc_pipe_routine_entry(const uint64_t args[8]) {
-    uint64_t pipe_ptr = (args ? args[0] : 0);
     xpc_object_t in_obj = (xpc_object_t)(uintptr_t)(args ? args[1] : 0);
-
-    uint32_t l0 = 0, l1 = 0;
-    char *pdesc = xniff_ptr_desc(pipe_ptr, &l0);
-    char *idesc = xniff_xpc_desc(in_obj, &l1);
 
     xniff_ipc_xpc_payload_t pl;
     pl_init_from_args(&pl, XNIFF_XPC_FUNC_PIPE_ROUTINE, XNIFF_DIR_ENTRY, 0, args);
     xniff_xpc_serial_blob_t blob;
     bool has_blob = xniff_capture_xpc_serialized(in_obj, XNIFF_XPC_SERIAL_SLOT_MESSAGE, &blob);
-    ipc_send_xpc_event_ex(XNIFF_EVT_XPC_ENTRY, &pl, pdesc, l0, idesc, l1, NULL, 0, NULL, 0,
-                          has_blob ? &blob : NULL, has_blob ? 1u : 0u);
+    ipc_send_xpc_event_ex(XNIFF_EVT_XPC_ENTRY, &pl, NULL, 0, NULL, 0, NULL, 0, NULL, 0,
+                          has_blob ? &blob : NULL, has_blob ? 1u : 0u, NULL);
     if (has_blob) xniff_xpc_serial_blob_free(&blob);
-    if (pdesc) free(pdesc);
-    if (idesc) free(idesc);
 }
 
 void xniff_emit_xpc_pipe_routine_exit(uint64_t ret, const uint64_t args[8]) {
-    uint64_t pipe_ptr = (args ? args[0] : 0);
-    xpc_object_t in_obj = (xpc_object_t)(uintptr_t)(args ? args[1] : 0);
-    uint64_t out_ptr = (args ? args[2] : 0);
-
-    uint32_t l0 = 0, l1 = 0, l2 = 0;
-    char *pdesc = xniff_ptr_desc(pipe_ptr, &l0);
-    char *idesc = xniff_xpc_desc(in_obj, &l1);
-    char *odesc = xniff_ptr_desc(out_ptr, &l2);
+    xpc_object_t reply = NULL;
+    const void *reply_out = (const void *)(uintptr_t)(args ? args[2] : 0);
+    if (reply_out) {
+        mach_vm_size_t copied = 0;
+        (void)mach_vm_read_overwrite(mach_task_self(),
+                                     (mach_vm_address_t)(uintptr_t)reply_out,
+                                     (mach_vm_size_t)sizeof(reply),
+                                     (mach_vm_address_t)(uintptr_t)&reply,
+                                     &copied);
+        if (copied != (mach_vm_size_t)sizeof(reply)) reply = NULL;
+    }
 
     xniff_ipc_xpc_payload_t pl;
     pl_init_from_args(&pl, XNIFF_XPC_FUNC_PIPE_ROUTINE, XNIFF_DIR_EXIT, ret, args);
     xniff_xpc_serial_blob_t blob;
-    bool has_blob = xniff_capture_xpc_serialized(in_obj, XNIFF_XPC_SERIAL_SLOT_MESSAGE, &blob);
-    ipc_send_xpc_event_ex(XNIFF_EVT_XPC_EXIT, &pl, pdesc, l0, idesc, l1, odesc, l2, NULL, 0,
-                          has_blob ? &blob : NULL, has_blob ? 1u : 0u);
+    bool has_blob = xniff_capture_xpc_serialized(reply, XNIFF_XPC_SERIAL_SLOT_REPLY, &blob);
+    ipc_send_xpc_event_ex(XNIFF_EVT_XPC_EXIT, &pl, NULL, 0, NULL, 0, NULL, 0, NULL, 0,
+                          has_blob ? &blob : NULL, has_blob ? 1u : 0u, NULL);
     if (has_blob) xniff_xpc_serial_blob_free(&blob);
-    if (pdesc) free(pdesc);
-    if (idesc) free(idesc);
-    if (odesc) free(odesc);
 }
 
-static void send_connection_message_event_args(uint16_t kind, uint32_t direction, uint32_t func, uint64_t ret, const uint64_t args[8], bool include_reply_desc) {
+static void send_message_event_args(uint16_t kind, uint32_t direction, uint32_t func,
+                                    uint64_t ret, const uint64_t args[8],
+                                    bool include_reply_desc, bool connection_metadata) {
     xpc_connection_t conn = (xpc_connection_t)(uintptr_t)(args ? args[0] : 0);
     xpc_object_t msg = (xpc_object_t)(uintptr_t)(args ? args[1] : 0);
     xpc_object_t reply = include_reply_desc ? (xpc_object_t)(uintptr_t)ret : NULL;
 
-    const char *cname = conn ? xpc_connection_get_name(conn) : NULL;
+    xniff_xpc_conn_meta_capture_t conn_meta;
+    bool has_conn_meta = connection_metadata && xniff_capture_xpc_conn_meta(conn, &conn_meta);
+    const char *cname = (has_conn_meta && conn_meta.name_public) ? conn_meta.name_public : NULL;
     uint32_t l0 = xniff_strnlen_u32(cname, XNIFF_XPC_STR_MAX);
-
-    uint32_t l1 = 0, l2 = 0, l3 = 0;
-    char *mdesc = xniff_xpc_desc(msg, &l1);
-    char *cdesc = xniff_xpc_desc((xpc_object_t)conn, &l2);
-    char *rdesc = xniff_xpc_desc(reply, &l3);
 
     xniff_ipc_xpc_payload_t pl;
     pl_init_from_args(&pl, func, direction, ret, args);
-    if (conn) pl.conn_pid = (uint32_t)xpc_connection_get_pid(conn);
+    if (has_conn_meta && (conn_meta.md.flags & XNIFF_XPC_CONN_META_HAS_PID_PUBLIC)) {
+        pl.conn_pid = conn_meta.md.pid_public;
+    }
 
     xniff_xpc_serial_blob_t blobs[2];
     size_t blob_count = 0;
@@ -331,51 +520,154 @@ static void send_connection_message_event_args(uint16_t kind, uint32_t direction
         blob_count++;
     }
 
-    ipc_send_xpc_event_ex(kind, &pl, cname, l0, mdesc, l1, cdesc, l2, rdesc, l3, blobs, blob_count);
+    ipc_send_xpc_event_ex(kind, &pl, cname, l0, NULL, 0, NULL, 0, NULL, 0, blobs, blob_count,
+                          has_conn_meta ? &conn_meta : NULL);
 
     for (size_t i = 0; i < blob_count; i++) xniff_xpc_serial_blob_free(&blobs[i]);
-
-    if (mdesc) free(mdesc);
-    if (cdesc) free(cdesc);
-    if (rdesc) free(rdesc);
 }
 
 void xniff_emit_xpc_connection_send_message_entry(const uint64_t args[8]) {
-    send_connection_message_event_args(XNIFF_EVT_XPC_ENTRY, XNIFF_DIR_ENTRY, XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE, 0, args, false);
+    send_message_event_args(XNIFF_EVT_XPC_ENTRY, XNIFF_DIR_ENTRY, XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE, 0, args, false, true);
 }
 
 void xniff_emit_xpc_connection_send_message_with_reply_entry(const uint64_t args[8]) {
-    send_connection_message_event_args(XNIFF_EVT_XPC_ENTRY, XNIFF_DIR_ENTRY, XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY, 0, args, false);
+    send_message_event_args(XNIFF_EVT_XPC_ENTRY, XNIFF_DIR_ENTRY, XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY, 0, args, false, true);
+}
+
+void xniff_emit_xpc_connection_send_message_with_reply_async_response(uint64_t reply,
+                                                                       const uint64_t args[8]) {
+    send_message_event_args(XNIFF_EVT_XPC_EXIT, XNIFF_DIR_EXIT,
+                            XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY,
+                            reply, args, true, true);
 }
 
 void xniff_emit_xpc_connection_send_message_with_reply_sync_entry(const uint64_t args[8]) {
-    send_connection_message_event_args(XNIFF_EVT_XPC_ENTRY, XNIFF_DIR_ENTRY, XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC, 0, args, false);
+    send_message_event_args(XNIFF_EVT_XPC_ENTRY, XNIFF_DIR_ENTRY, XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC, 0, args, false, true);
 }
 
 void xniff_emit_xpc_connection_send_message_with_reply_sync_exit(uint64_t ret, const uint64_t args[8]) {
-    send_connection_message_event_args(XNIFF_EVT_XPC_EXIT, XNIFF_DIR_EXIT, XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC, ret, args, true);
+    send_message_event_args(XNIFF_EVT_XPC_EXIT, XNIFF_DIR_EXIT, XNIFF_XPC_FUNC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC, ret, args, true, true);
+}
+
+void xniff_emit_xpc_dictionary_send_reply_entry(const uint64_t args[8]) {
+    xpc_object_t reply = (xpc_object_t)(uintptr_t)(args ? args[0] : 0);
+    xniff_ipc_xpc_payload_t pl;
+    pl_init_from_args(&pl, XNIFF_XPC_FUNC_DICTIONARY_SEND_REPLY, XNIFF_DIR_ENTRY, 0, args);
+    xniff_xpc_serial_blob_t blob;
+    bool has_blob = xniff_capture_xpc_serialized(reply, XNIFF_XPC_SERIAL_SLOT_REPLY, &blob);
+    ipc_send_xpc_event_ex(XNIFF_EVT_XPC_ENTRY, &pl, NULL, 0, NULL, 0, NULL, 0, NULL, 0,
+                          has_blob ? &blob : NULL, has_blob ? 1u : 0u, NULL);
+    if (has_blob) xniff_xpc_serial_blob_free(&blob);
+}
+
+void xniff_emit_xpc_session_send_message_entry(const uint64_t args[8]) {
+    send_message_event_args(XNIFF_EVT_XPC_ENTRY, XNIFF_DIR_ENTRY,
+                            XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE, 0, args, false, false);
+}
+
+void xniff_emit_xpc_session_send_message_with_reply_async_entry(const uint64_t args[8]) {
+    send_message_event_args(XNIFF_EVT_XPC_ENTRY, XNIFF_DIR_ENTRY,
+                            XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC,
+                            0, args, false, false);
+}
+
+void xniff_emit_xpc_session_send_message_with_reply_async_response(uint64_t reply, uint64_t error,
+                                                                    const uint64_t args[8]) {
+    uint64_t callback_args[8] = {0};
+    if (args) memcpy(callback_args, args, sizeof(callback_args));
+    callback_args[3] = error;
+    uint64_t response = reply != 0 ? reply : error;
+    send_message_event_args(XNIFF_EVT_XPC_EXIT, XNIFF_DIR_EXIT,
+                            XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC,
+                            response, callback_args, true, false);
+}
+
+void xniff_emit_xpc_session_send_message_with_reply_sync_entry(const uint64_t args[8]) {
+    send_message_event_args(XNIFF_EVT_XPC_ENTRY, XNIFF_DIR_ENTRY,
+                            XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC,
+                            0, args, false, false);
+}
+
+void xniff_emit_xpc_session_send_message_with_reply_sync_exit(uint64_t ret, const uint64_t args[8]) {
+    uint64_t response = ret;
+    if (response == 0 && args && args[2] != 0) {
+        xpc_object_t error = NULL;
+        mach_vm_size_t copied = 0;
+        (void)mach_vm_read_overwrite(mach_task_self(),
+                                     (mach_vm_address_t)args[2],
+                                     (mach_vm_size_t)sizeof(error),
+                                     (mach_vm_address_t)(uintptr_t)&error,
+                                     &copied);
+        if (copied == (mach_vm_size_t)sizeof(error)) {
+            response = (uint64_t)(uintptr_t)error;
+        }
+    }
+    send_message_event_args(XNIFF_EVT_XPC_EXIT, XNIFF_DIR_EXIT,
+                            XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC,
+                            response, args, true, false);
 }
 
 void xniff_emit_xpc_connection_call_event_handler_entry(const uint64_t args[8]) {
     xniff_ipc_xpc_payload_t pl;
     pl_init_from_args(&pl, XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER, XNIFF_DIR_ENTRY, 0, args);
-    // This is a private libxpc internal. Avoid dereferencing conn/msg pointers here to keep
-    // hook-side behavior conservative across OS updates.
+    // This is a private libxpc internal. Avoid walking event internals directly; only
+    // capture serialized bytes and best-effort connection metadata via getters.
+    xpc_connection_t conn = (xpc_connection_t)(uintptr_t)(args ? args[0] : 0);
     xpc_object_t event = (xpc_object_t)(uintptr_t)(args ? args[1] : 0);
+    xniff_xpc_conn_meta_capture_t conn_meta;
+    bool has_conn_meta = xniff_capture_xpc_conn_meta(conn, &conn_meta);
+    if (has_conn_meta && (conn_meta.md.flags & XNIFF_XPC_CONN_META_HAS_PID_PUBLIC)) {
+        pl.conn_pid = conn_meta.md.pid_public;
+    }
     xniff_xpc_serial_blob_t blob;
     bool has_blob = xniff_capture_xpc_serialized(event, XNIFF_XPC_SERIAL_SLOT_EVENT, &blob);
     ipc_send_xpc_event_ex(XNIFF_EVT_XPC_ENTRY, &pl, NULL, 0, NULL, 0, NULL, 0, NULL, 0,
-                          has_blob ? &blob : NULL, has_blob ? 1u : 0u);
+                          has_blob ? &blob : NULL, has_blob ? 1u : 0u,
+                          has_conn_meta ? &conn_meta : NULL);
     if (has_blob) xniff_xpc_serial_blob_free(&blob);
 }
 
 void xniff_emit_xpc_connection_call_event_handler_exit(uint64_t ret, const uint64_t args[8]) {
     xniff_ipc_xpc_payload_t pl;
     pl_init_from_args(&pl, XNIFF_XPC_FUNC_CONNECTION_CALL_EVENT_HANDLER, XNIFF_DIR_EXIT, ret, args);
+    xpc_connection_t conn = (xpc_connection_t)(uintptr_t)(args ? args[0] : 0);
     xpc_object_t event = (xpc_object_t)(uintptr_t)(args ? args[1] : 0);
+    xniff_xpc_conn_meta_capture_t conn_meta;
+    bool has_conn_meta = xniff_capture_xpc_conn_meta(conn, &conn_meta);
+    if (has_conn_meta && (conn_meta.md.flags & XNIFF_XPC_CONN_META_HAS_PID_PUBLIC)) {
+        pl.conn_pid = conn_meta.md.pid_public;
+    }
     xniff_xpc_serial_blob_t blob;
     bool has_blob = xniff_capture_xpc_serialized(event, XNIFF_XPC_SERIAL_SLOT_EVENT, &blob);
     ipc_send_xpc_event_ex(XNIFF_EVT_XPC_EXIT, &pl, NULL, 0, NULL, 0, NULL, 0, NULL, 0,
-                          has_blob ? &blob : NULL, has_blob ? 1u : 0u);
+                          has_blob ? &blob : NULL, has_blob ? 1u : 0u,
+                          has_conn_meta ? &conn_meta : NULL);
     if (has_blob) xniff_xpc_serial_blob_free(&blob);
+}
+
+static void send_connection_meta_event_args(uint16_t kind, uint32_t direction, uint32_t func, uint64_t ret, const uint64_t args[8]) {
+    xpc_connection_t conn = (xpc_connection_t)(uintptr_t)(args ? args[0] : 0);
+    xniff_xpc_conn_meta_capture_t conn_meta;
+    bool has_conn_meta = xniff_capture_xpc_conn_meta(conn, &conn_meta);
+    const char *cname = (has_conn_meta && conn_meta.name_public) ? conn_meta.name_public : NULL;
+    uint32_t l0 = xniff_strnlen_u32(cname, XNIFF_XPC_STR_MAX);
+
+    xniff_ipc_xpc_payload_t pl;
+    pl_init_from_args(&pl, func, direction, ret, args);
+    if (has_conn_meta && (conn_meta.md.flags & XNIFF_XPC_CONN_META_HAS_PID_PUBLIC)) {
+        pl.conn_pid = conn_meta.md.pid_public;
+    }
+
+    ipc_send_xpc_event_ex(kind, &pl, cname, l0, NULL, 0, NULL, 0, NULL, 0,
+                          NULL, 0, has_conn_meta ? &conn_meta : NULL);
+}
+
+void xniff_emit_xpc_connection_check_in_entry(const uint64_t args[8]) {
+    send_connection_meta_event_args(XNIFF_EVT_XPC_ENTRY, XNIFF_DIR_ENTRY,
+                                    XNIFF_XPC_FUNC_CONNECTION_CHECK_IN, 0, args);
+}
+
+void xniff_emit_xpc_connection_check_in_exit(uint64_t ret, const uint64_t args[8]) {
+    send_connection_meta_event_args(XNIFF_EVT_XPC_EXIT, XNIFF_DIR_EXIT,
+                                    XNIFF_XPC_FUNC_CONNECTION_CHECK_IN, ret, args);
 }

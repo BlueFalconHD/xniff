@@ -2,16 +2,21 @@
 
 #include <pthread.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <mach/mach.h>
+#include <Block.h>
+#include <xpc/xpc.h>
 
 #include "xniff_hooks_emit.h"
 #include "xniff_hooks_ipc.h"
 #include "../shared/xniff_ipc.h"
+#include "../shared/xniff_ipc_v2.h"
+#include "../shared/xniff_capture_file.h"
 
 typedef struct _XniffListener XniffListener;
 typedef enum _XniffHookId XniffHookId;
@@ -33,6 +38,11 @@ enum _XniffHookId {
   XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE_WITH_REPLY,
   XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC,
   XNIFF_HOOK_XPC_CONNECTION_CALL_EVENT_HANDLER,
+  XNIFF_HOOK_XPC_CONNECTION_CHECK_IN,
+  XNIFF_HOOK_XPC_DICTIONARY_SEND_REPLY,
+  XNIFF_HOOK_XPC_SESSION_SEND_MESSAGE,
+  XNIFF_HOOK_XPC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC,
+  XNIFF_HOOK_XPC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC,
 };
 
 static void xniff_listener_iface_init(gpointer g_iface, gpointer iface_data);
@@ -52,6 +62,7 @@ static pthread_mutex_t g_attach_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_enter_count = 0;
 static uint64_t g_leave_count = 0;
 static gboolean g_event_handler_hook_attached = FALSE;
+static uint64_t g_next_call_id = 0;
 
 typedef struct {
   thread_t *threads;
@@ -61,6 +72,7 @@ typedef struct {
 static XniffSuspendedThreadSet g_suspended_threads = {0};
 
 typedef struct {
+  const char *module_query;
   const char *name;
   XniffHookId hook_id;
   gboolean attached;
@@ -68,26 +80,36 @@ typedef struct {
 
 static gboolean xniff_hook_event_handler_enabled(void);
 static gboolean xniff_attach_event_handler_hook_locked(void);
+static void xniff_attach_optional_check_in_hook_once(void);
 
 static XniffExportHookSpec g_export_hooks[] = {
-  { "mach_msg", XNIFF_HOOK_MACH_MSG, FALSE },
-  { "mach_msg_trap", XNIFF_HOOK_MACH_MSG_TRAP, FALSE },
-  { "mach_msg_overwrite", XNIFF_HOOK_MACH_MSG_OVERWRITE, FALSE },
-  { "mach_msg_overwrite_trap", XNIFF_HOOK_MACH_MSG_OVERWRITE_TRAP, FALSE },
-  { "mach_msg2_internal", XNIFF_HOOK_MACH_MSG2_INTERNAL, FALSE },
-  { "mach_msg2_trap", XNIFF_HOOK_MACH_MSG2_TRAP, FALSE },
-  { "xpc_connection_create", XNIFF_HOOK_XPC_CONNECTION_CREATE, FALSE },
-  { "xpc_pipe_routine", XNIFF_HOOK_XPC_PIPE_ROUTINE, FALSE },
-  { "xpc_connection_send_message", XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE, FALSE },
-  { "xpc_connection_send_message_with_reply", XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE_WITH_REPLY, FALSE },
-  { "xpc_connection_send_message_with_reply_sync", XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC, FALSE },
+  { NULL, "mach_msg", XNIFF_HOOK_MACH_MSG, FALSE },
+  { NULL, "mach_msg_trap", XNIFF_HOOK_MACH_MSG_TRAP, FALSE },
+  { NULL, "mach_msg_overwrite", XNIFF_HOOK_MACH_MSG_OVERWRITE, FALSE },
+  { NULL, "mach_msg_overwrite_trap", XNIFF_HOOK_MACH_MSG_OVERWRITE_TRAP, FALSE },
+  { NULL, "mach_msg2_internal", XNIFF_HOOK_MACH_MSG2_INTERNAL, FALSE },
+  { NULL, "mach_msg2_trap", XNIFF_HOOK_MACH_MSG2_TRAP, FALSE },
+  { "libxpc", "xpc_connection_create", XNIFF_HOOK_XPC_CONNECTION_CREATE, FALSE },
+  { "libxpc", "xpc_pipe_routine", XNIFF_HOOK_XPC_PIPE_ROUTINE, FALSE },
+  { "libxpc", "xpc_connection_send_message", XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE, FALSE },
+  { "libxpc", "xpc_connection_send_message_with_reply", XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE_WITH_REPLY, FALSE },
+  { "libxpc", "xpc_connection_send_message_with_reply_sync", XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC, FALSE },
+  { "libxpc", "xpc_dictionary_send_reply", XNIFF_HOOK_XPC_DICTIONARY_SEND_REPLY, FALSE },
+  { "libxpc", "xpc_session_send_message", XNIFF_HOOK_XPC_SESSION_SEND_MESSAGE, FALSE },
+  { "libxpc", "xpc_session_send_message_with_reply_async", XNIFF_HOOK_XPC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC, FALSE },
+  { "libxpc", "xpc_session_send_message_with_reply_sync", XNIFF_HOOK_XPC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC, FALSE },
 };
 
 typedef struct {
   uint64_t args[8];
+  uint64_t call_id;
+  uint64_t parent_call_id;
+  void *replacement_block;
+  uint8_t emit_enabled;
 } XniffInvocationData;
 
 static void xniff_hooks_debug_log(const char *fmt, ...) {
+  if (!xniff_hooks_debug_is_enabled() || !xniff_hooks_streaming_is_enabled()) return;
   char line[1024];
   va_list ap;
   va_start(ap, fmt);
@@ -98,26 +120,30 @@ static void xniff_hooks_debug_log(const char *fmt, ...) {
   size_t msg_len = (size_t)n;
   if (msg_len >= sizeof(line)) msg_len = sizeof(line) - 1;
 
-  xniff_ipc_hdr_t hdr = {0};
-  hdr.magic = XNIFF_IPC_MAGIC;
-  hdr.version = XNIFF_IPC_VERSION;
-  hdr.kind = XNIFF_EVT_DEBUG_LOG;
-  hdr.pid = (uint32_t)getpid();
-  hdr.tid_low = (uint32_t)(uintptr_t)pthread_self();
-  hdr.payload_len = (uint32_t)(sizeof(xniff_ipc_debug_payload_t) + msg_len);
-
-  xniff_ipc_debug_payload_t pl = {0};
-  pl.api = XNIFF_API_DEBUG;
-  pl.level = 0;
-  pl.msg_len = (uint32_t)msg_len;
-
-  xniff_hooks_ipc_lock();
-  int ok = 0;
-  ok |= xniff_hooks_ipc_write_locked(&hdr, sizeof(hdr));
-  ok |= xniff_hooks_ipc_write_locked(&pl, sizeof(pl));
-  if (msg_len != 0) ok |= xniff_hooks_ipc_write_locked(line, msg_len);
-  xniff_hooks_ipc_unlock();
-  (void)ok;
+  xniff_ipc_v2_builder_t b;
+  xniff_ipc_v2_builder_init(&b);
+  if (xniff_ipc_v2_begin(&b,
+                         XNIFF_V2_ENTRY_DIAG,
+                         (uint32_t)getpid(),
+                         (uint32_t)(uintptr_t)pthread_self(),
+                         0,
+                         0,
+                         XNIFF_API_DEBUG,
+                         0) == 0) {
+    xniff_ipc_v2_diag_t d = {0};
+    d.msg_len = (uint32_t)msg_len;
+    d.level = 0;
+    size_t sec_len = sizeof(d) + msg_len;
+    uint8_t *sec = (uint8_t *)malloc(sec_len);
+    if (sec) {
+      memcpy(sec, &d, sizeof(d));
+      if (msg_len != 0) memcpy(sec + sizeof(d), line, msg_len);
+      (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_HOOK_DIAG, 0, sec, sec_len);
+      free(sec);
+      (void)xniff_ipc_v2_write(&b);
+    }
+  }
+  xniff_ipc_v2_builder_free(&b);
 }
 
 static void xniff_suspend_all_other_threads(void) {
@@ -183,21 +209,107 @@ static inline void xniff_read_args_u64(GumInvocationContext *ic, uint64_t out[8]
   }
 }
 
+static bool xniff_hook_is_mach(XniffHookId hook_id) {
+  return hook_id <= XNIFF_HOOK_MACH_MSG2_TRAP;
+}
+
+static bool xniff_hook_capture_enabled(XniffHookId hook_id) {
+  uint32_t mode = xniff_hook_is_mach(hook_id) ? XNIFF_CAPTURE_MODE_MACH : XNIFF_CAPTURE_MODE_XPC;
+  return xniff_hooks_capture_mode_enabled(mode);
+}
+
+static void xniff_ignore_current_thread(void) {
+  if (g_interceptor != NULL) gum_interceptor_ignore_current_thread(g_interceptor);
+}
+
+static void xniff_unignore_current_thread(void) {
+  if (g_interceptor != NULL) gum_interceptor_unignore_current_thread(g_interceptor);
+}
+
+typedef void (^XniffConnectionReplyHandler)(xpc_object_t reply);
+typedef void (^XniffSessionReplyHandler)(xpc_object_t reply, xpc_object_t error);
+
+static void xniff_install_connection_reply_wrapper(GumInvocationContext *ic,
+                                                    XniffInvocationData *inv) {
+  if (ic == NULL || inv == NULL || inv->args[3] == 0) return;
+  XniffConnectionReplyHandler original = (XniffConnectionReplyHandler)(uintptr_t)inv->args[3];
+  uint64_t call_id = inv->call_id;
+  uint64_t connection = inv->args[0];
+  uint64_t message = inv->args[1];
+  XniffConnectionReplyHandler wrapper = Block_copy(^(xpc_object_t reply) {
+    uint64_t args[8] = { connection, message, 0, 0, 0, 0, 0, 0 };
+    uint64_t previous_call_id = xniff_hooks_current_call_id();
+    xniff_hooks_set_current_call_id(call_id);
+    xniff_ignore_current_thread();
+    xniff_emit_xpc_connection_send_message_with_reply_async_response(
+        (uint64_t)(uintptr_t)reply, args);
+    xniff_unignore_current_thread();
+    xniff_hooks_set_current_call_id(previous_call_id);
+    original(reply);
+  });
+  if (wrapper == NULL) return;
+  inv->replacement_block = wrapper;
+  gum_invocation_context_replace_nth_argument(ic, 3, (gpointer)wrapper);
+}
+
+static void xniff_install_session_reply_wrapper(GumInvocationContext *ic,
+                                                 XniffInvocationData *inv) {
+  if (ic == NULL || inv == NULL || inv->args[2] == 0) return;
+  XniffSessionReplyHandler original = (XniffSessionReplyHandler)(uintptr_t)inv->args[2];
+  uint64_t call_id = inv->call_id;
+  uint64_t session = inv->args[0];
+  uint64_t message = inv->args[1];
+  XniffSessionReplyHandler wrapper = Block_copy(^(xpc_object_t reply, xpc_object_t error) {
+    uint64_t args[8] = { session, message, 0, 0, 0, 0, 0, 0 };
+    uint64_t previous_call_id = xniff_hooks_current_call_id();
+    xniff_hooks_set_current_call_id(call_id);
+    xniff_ignore_current_thread();
+    xniff_emit_xpc_session_send_message_with_reply_async_response(
+        (uint64_t)(uintptr_t)reply, (uint64_t)(uintptr_t)error, args);
+    xniff_unignore_current_thread();
+    xniff_hooks_set_current_call_id(previous_call_id);
+    original(reply, error);
+  });
+  if (wrapper == NULL) return;
+  inv->replacement_block = wrapper;
+  gum_invocation_context_replace_nth_argument(ic, 2, (gpointer)wrapper);
+}
+
+static void xniff_release_reply_wrapper(XniffInvocationData *inv) {
+  if (inv == NULL || inv->replacement_block == NULL) return;
+  Block_release(inv->replacement_block);
+  inv->replacement_block = NULL;
+}
+
 static void xniff_listener_on_enter(GumInvocationListener *listener, GumInvocationContext *ic) {
   (void)listener;
   XniffHookId hook_id = (XniffHookId)GPOINTER_TO_SIZE(gum_invocation_context_get_listener_function_data(ic));
   XniffInvocationData *inv = GUM_IC_GET_INVOCATION_DATA(ic, XniffInvocationData);
+  bool enabled = xniff_hook_capture_enabled(hook_id);
+  if (inv != NULL) {
+    inv->parent_call_id = xniff_hooks_current_call_id();
+    inv->emit_enabled = enabled ? 1u : 0u;
+    if (enabled && hook_id == XNIFF_HOOK_XPC_DICTIONARY_SEND_REPLY &&
+        inv->parent_call_id != 0) {
+      inv->call_id = inv->parent_call_id;
+    } else {
+      inv->call_id = enabled ? __atomic_add_fetch(&g_next_call_id, 1, __ATOMIC_RELAXED) : 0;
+    }
+    inv->replacement_block = NULL;
+  }
+  if (!enabled) return;
   if (inv != NULL) {
     xniff_read_args_u64(ic, inv->args);
   }
   const uint64_t *args = (inv != NULL) ? inv->args : NULL;
 
   uint64_t n = __atomic_add_fetch(&g_enter_count, 1, __ATOMIC_RELAXED);
-  if (n <= 16 || (n & 0xFFFu) == 1u) {
+  if (xniff_hooks_debug_is_enabled() && (n <= 16 || (n & 0xFFFu) == 1u)) {
     xniff_hooks_debug_log("enter #%llu hook_id=%d", (unsigned long long)n, (int)hook_id);
   }
 
-  if (g_interceptor != NULL) gum_interceptor_ignore_current_thread(g_interceptor);
+  xniff_hooks_set_current_call_id(inv != NULL ? inv->call_id : 0);
+  xniff_ignore_current_thread();
   switch (hook_id) {
     case XNIFF_HOOK_MACH_MSG:
     case XNIFF_HOOK_MACH_MSG_TRAP:
@@ -219,6 +331,7 @@ static void xniff_listener_on_enter(GumInvocationListener *listener, GumInvocati
       xniff_emit_xpc_connection_send_message_entry(args);
       break;
     case XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE_WITH_REPLY:
+      xniff_install_connection_reply_wrapper(ic, inv);
       xniff_emit_xpc_connection_send_message_with_reply_entry(args);
       break;
     case XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC:
@@ -227,21 +340,49 @@ static void xniff_listener_on_enter(GumInvocationListener *listener, GumInvocati
     case XNIFF_HOOK_XPC_CONNECTION_CALL_EVENT_HANDLER:
       xniff_emit_xpc_connection_call_event_handler_entry(args);
       break;
+    case XNIFF_HOOK_XPC_CONNECTION_CHECK_IN:
+      xniff_emit_xpc_connection_check_in_entry(args);
+      break;
+    case XNIFF_HOOK_XPC_DICTIONARY_SEND_REPLY:
+      xniff_emit_xpc_dictionary_send_reply_entry(args);
+      break;
+    case XNIFF_HOOK_XPC_SESSION_SEND_MESSAGE:
+      xniff_emit_xpc_session_send_message_entry(args);
+      break;
+    case XNIFF_HOOK_XPC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC:
+      xniff_install_session_reply_wrapper(ic, inv);
+      xniff_emit_xpc_session_send_message_with_reply_async_entry(args);
+      break;
+    case XNIFF_HOOK_XPC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC:
+      xniff_emit_xpc_session_send_message_with_reply_sync_entry(args);
+      break;
   }
+  xniff_unignore_current_thread();
+  // Keep the call active while the intercepted implementation runs. Nested
+  // xpc_dictionary_send_reply calls can then inherit an incoming request ID.
+  xniff_hooks_set_current_call_id(inv != NULL ? inv->call_id : 0);
 }
 
 static void xniff_listener_on_leave(GumInvocationListener *listener, GumInvocationContext *ic) {
   (void)listener;
   XniffHookId hook_id = (XniffHookId)GPOINTER_TO_SIZE(gum_invocation_context_get_listener_function_data(ic));
   XniffInvocationData *inv = GUM_IC_GET_INVOCATION_DATA(ic, XniffInvocationData);
+  if (inv != NULL && inv->emit_enabled == 0) return;
+  if (!xniff_hook_capture_enabled(hook_id)) {
+    xniff_release_reply_wrapper(inv);
+    xniff_hooks_set_current_call_id(inv != NULL ? inv->parent_call_id : 0);
+    return;
+  }
   const uint64_t *args = (inv != NULL) ? inv->args : NULL;
   uint64_t ret = (uint64_t)GPOINTER_TO_SIZE(gum_invocation_context_get_return_value(ic));
 
   uint64_t n = __atomic_add_fetch(&g_leave_count, 1, __ATOMIC_RELAXED);
-  if (n <= 16 || (n & 0xFFFu) == 1u) {
+  if (xniff_hooks_debug_is_enabled() && (n <= 16 || (n & 0xFFFu) == 1u)) {
     xniff_hooks_debug_log("leave #%llu hook_id=%d ret=0x%llx", (unsigned long long)n, (int)hook_id, (unsigned long long)ret);
   }
 
+  xniff_hooks_set_current_call_id(inv != NULL ? inv->call_id : 0);
+  xniff_ignore_current_thread();
   switch (hook_id) {
     case XNIFF_HOOK_MACH_MSG:
     case XNIFF_HOOK_MACH_MSG_TRAP:
@@ -269,10 +410,21 @@ static void xniff_listener_on_leave(GumInvocationListener *listener, GumInvocati
       xniff_emit_xpc_connection_send_message_with_reply_sync_exit(ret, args);
       break;
     case XNIFF_HOOK_XPC_CONNECTION_CALL_EVENT_HANDLER:
-      xniff_emit_xpc_connection_call_event_handler_exit(ret, args);
+      break;
+    case XNIFF_HOOK_XPC_CONNECTION_CHECK_IN:
+      xniff_emit_xpc_connection_check_in_exit(ret, args);
+      break;
+    case XNIFF_HOOK_XPC_DICTIONARY_SEND_REPLY:
+    case XNIFF_HOOK_XPC_SESSION_SEND_MESSAGE:
+    case XNIFF_HOOK_XPC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC:
+      break;
+    case XNIFF_HOOK_XPC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC:
+      xniff_emit_xpc_session_send_message_with_reply_sync_exit(ret, args);
       break;
   }
-  if (g_interceptor != NULL) gum_interceptor_unignore_current_thread(g_interceptor);
+  xniff_unignore_current_thread();
+  xniff_hooks_set_current_call_id(inv != NULL ? inv->parent_call_id : 0);
+  xniff_release_reply_wrapper(inv);
 }
 
 static void xniff_listener_class_init(XniffListenerClass *klass) {
@@ -418,14 +570,27 @@ static GumAddress xniff_find_symbol_in_modules(const char *module_query, const c
   return ctx.addr;
 }
 
-static gboolean xniff_attach_export_if_present(const char *name, XniffHookId hook_id) {
-  gpointer target = GSIZE_TO_POINTER(gum_module_find_export_by_name(NULL, name));
+static gboolean xniff_attach_export_if_present(const char *module_query, const char *name, XniffHookId hook_id) {
+  char matched_module[512] = {0};
+  gpointer target = NULL;
+  if (module_query != NULL && module_query[0] != '\0') {
+    target = GSIZE_TO_POINTER(xniff_find_symbol_in_modules(module_query, name,
+                                                           matched_module, sizeof(matched_module)));
+  } else {
+    target = GSIZE_TO_POINTER(gum_module_find_export_by_name(NULL, name));
+  }
   if (target == NULL) {
-    xniff_hooks_debug_log("attach export: %s not found", name ? name : "<null>");
+    xniff_hooks_debug_log("attach export: module_query=%s symbol=%s not found",
+                          module_query ? module_query : "<any>",
+                          name ? name : "<null>");
     return FALSE;
   }
   GumAttachReturn ar = gum_interceptor_attach(g_interceptor, target, g_listener, GSIZE_TO_POINTER(hook_id));
-  xniff_hooks_debug_log("attach export: %s => %p (%d)", name ? name : "<null>", target, (int)ar);
+  xniff_hooks_debug_log("attach export: module_query=%s resolved_module=%s symbol=%s => %p (%d)",
+                        module_query ? module_query : "<any>",
+                        matched_module[0] ? matched_module : "<unknown>",
+                        name ? name : "<null>",
+                        target, (int)ar);
   return ar == GUM_ATTACH_OK || ar == GUM_ATTACH_ALREADY_ATTACHED;
 }
 
@@ -433,7 +598,7 @@ static gboolean xniff_attach_export_hook_locked(XniffExportHookSpec *spec) {
   if (spec == NULL) return FALSE;
   if (spec->attached) return TRUE;
   if (g_interceptor == NULL || g_listener == NULL) return FALSE;
-  if (xniff_attach_export_if_present(spec->name, spec->hook_id)) {
+  if (xniff_attach_export_if_present(spec->module_query, spec->name, spec->hook_id)) {
     spec->attached = TRUE;
     return TRUE;
   }
@@ -479,8 +644,6 @@ static gboolean xniff_attach_private_function_if_present(const char *module_name
 }
 
 static gboolean xniff_hook_event_handler_enabled(void) {
-  const char *e = getenv("XNIFF_HOOK_XPC_EVENT_HANDLER");
-  if (e && *e && strcmp(e, "0") == 0) return FALSE;
   return TRUE;
 }
 
@@ -497,8 +660,9 @@ static gboolean xniff_attach_event_handler_hook_locked(void) {
   return FALSE;
 }
 
-static void xniff_attach_all_hooks_blocking(void) {
-  for (int i = 0;; i++) {
+static void xniff_attach_available_hooks(void) {
+  const int max_attempts = 10;
+  for (int i = 0; i < max_attempts; i++) {
     pthread_mutex_lock(&g_attach_mutex);
     gum_interceptor_begin_transaction(g_interceptor);
     gboolean ok = xniff_attach_all_core_hooks_locked();
@@ -511,11 +675,24 @@ static void xniff_attach_all_hooks_blocking(void) {
       }
       return;
     }
-    if (i < 10 || (i % 20) == 19) {
+    if (xniff_hooks_debug_is_enabled()) {
       xniff_hooks_debug_log("hook install: waiting for hooks (pending=%u, retries=%d)", pending, i + 1);
     }
-    usleep(50 * 1000);
+    usleep(25 * 1000);
   }
+  xniff_hooks_debug_log("hook install: continuing with unavailable optional hooks");
+}
+
+static void xniff_attach_optional_check_in_hook_once(void) {
+  if (g_interceptor == NULL || g_listener == NULL) return;
+  pthread_mutex_lock(&g_attach_mutex);
+  gum_interceptor_begin_transaction(g_interceptor);
+  gboolean ok = xniff_attach_private_function_if_present("libxpc",
+                                                         "_xpc_connection_check_in",
+                                                         XNIFF_HOOK_XPC_CONNECTION_CHECK_IN);
+  gum_interceptor_end_transaction(g_interceptor);
+  pthread_mutex_unlock(&g_attach_mutex);
+  xniff_hooks_debug_log("check-in hook: %s", ok ? "attached" : "unavailable");
 }
 
 static void xniff_install_hooks_once(void) {
@@ -524,15 +701,20 @@ static void xniff_install_hooks_once(void) {
 
   g_interceptor = gum_interceptor_obtain();
   g_listener = g_object_new(XNIFF_TYPE_LISTENER, NULL);
-  xniff_attach_all_hooks_blocking();
+  xniff_attach_available_hooks();
+  xniff_attach_optional_check_in_hook_once();
   xniff_hooks_debug_log("xniff_install_hooks_once: done");
 }
 
 __attribute__((constructor)) static void xniff_frida_gum_ctor(void) {
-  xniff_hooks_debug_log("ctor: entered");
+  xniff_hooks_configure_capture_mode_from_environment();
+  /* Materialize direct captures even when the target makes no matching calls. */
+  (void)xniff_capture_file_is_configured();
+  xniff_hooks_set_streaming_enabled(false);
   xniff_suspend_all_other_threads();
   (void)pthread_once(&g_once, xniff_install_hooks_once);
   xniff_resume_suspended_threads();
+  xniff_hooks_set_streaming_enabled(true);
   xniff_hooks_debug_log("ctor: all hooks attached; resumed halted threads");
 }
 

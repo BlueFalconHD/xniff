@@ -16,12 +16,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+from print_xpc import iter_events
+
 
 @dataclass
 class SnifferProc:
     pid: int
     proc: subprocess.Popen
-    jsonl_path: Path
+    capture_path: Path
     err_path: Path
 
 
@@ -136,7 +138,7 @@ def wait_for_sniffers_ready(sniffers: List[SnifferProc], timeout_s: float = 12.0
             if "hooks installed; streaming events" in text:
                 ready[s.pid] = True
                 continue
-            if any(tok in text for tok in ("hook-xpc failed", "failed to inject", "task_for_pid failed", "listen: failed")):
+            if any(tok in text for tok in ("hook injection failed", "failed to inject", "task_for_pid failed", "capture: failed")):
                 ready[s.pid] = True
                 failed += 1
                 continue
@@ -176,19 +178,11 @@ def summarize_events(sniffers: List[SnifferProc]) -> Dict[str, object]:
 
     for s in sniffers:
         cnt = 0
-        if s.jsonl_path.exists():
-            with s.jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
+        if s.capture_path.exists():
+            try:
+                for evt in iter_events(str(s.capture_path)):
                     cnt += 1
                     total_events += 1
-                    try:
-                        evt = json.loads(line)
-                    except json.JSONDecodeError:
-                        parse_errors += 1
-                        continue
                     kind = evt.get("kind")
                     if isinstance(kind, str):
                         kinds[kind] += 1
@@ -199,7 +193,7 @@ def summarize_events(sniffers: List[SnifferProc]) -> Dict[str, object]:
                         per_pid_kinds[evt_pid][kind] += 1
                     call_id = evt.get("call_id")
                     if isinstance(call_id, int) and call_id > 0:
-                        unique_calls.add(call_id)
+                        unique_calls.add((s.pid, call_id))
                     xpc = evt.get("xpc")
                     if isinstance(xpc, dict):
                         fn = xpc.get("func_name")
@@ -209,6 +203,8 @@ def summarize_events(sniffers: List[SnifferProc]) -> Dict[str, object]:
                                 if evt_pid not in per_pid_xpc_entry_funcs:
                                     per_pid_xpc_entry_funcs[evt_pid] = Counter()
                                 per_pid_xpc_entry_funcs[evt_pid][fn] += 1
+            except (OSError, ValueError):
+                parse_errors += 1
         per_pid[s.pid] = cnt
 
     attach_failures = 0
@@ -216,7 +212,7 @@ def summarize_events(sniffers: List[SnifferProc]) -> Dict[str, object]:
         txt = ""
         if s.err_path.exists():
             txt = s.err_path.read_text(encoding="utf-8", errors="replace")
-        if any(tok in txt for tok in ("hook-xpc failed", "failed to inject", "task_for_pid failed", "listen: failed")):
+        if any(tok in txt for tok in ("hook injection failed", "failed to inject", "task_for_pid failed", "capture: failed")):
             attach_failures += 1
 
     return {
@@ -275,8 +271,6 @@ def main() -> int:
     parser.add_argument("--sniff", type=int, default=0, help="Sniff first N workers (default: all).")
     parser.add_argument("--sniff-all", action="store_true", help="Sniff all workers.")
     parser.add_argument("--mode", choices=("mach", "xpc"), default="xpc")
-    parser.add_argument("--dump", action="store_true", help="Enable /tmp/xniff/<pid> dumps.")
-    parser.add_argument("--xpc", action="store_true", help="Enable XPC decoding in listener.")
     parser.add_argument("--full-capture", action="store_true")
     parser.add_argument("--hooks-debug", action="store_true")
     parser.add_argument("--late-attach", action="store_true", help="Do not gate workers before send.")
@@ -294,7 +288,6 @@ def main() -> int:
     build_dir = root / "build"
     stress_bin = build_dir / "xniff-xpc-stress"
     xniff_cli = build_dir / "xniff-cli"
-    hooks_dylib = build_dir / "libxniff-hooks.dylib"
 
     out_dir = Path(args.out) if args.out else Path(f"/tmp/xniff-xpc-harness-{time.strftime('%Y%m%d-%H%M%S')}")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -307,15 +300,9 @@ def main() -> int:
         eprint("warn: not running as root; attach/inject may fail. Recommended: run with sudo.")
 
     build_if_requested(build_dir, args.build_jobs, not args.no_build)
-    for p in (stress_bin, xniff_cli, hooks_dylib):
+    for p in (stress_bin, xniff_cli):
         if not p.exists():
             raise FileNotFoundError(f"missing required artifact: {p}")
-
-    listener_flags = ["--jsonl", "--no-dump", "--no-xpc"]
-    if args.dump and "--no-dump" in listener_flags:
-        listener_flags.remove("--no-dump")
-    if args.xpc and "--no-xpc" in listener_flags:
-        listener_flags.remove("--no-xpc")
 
     worker_env = os.environ.copy()
     if args.hooks_debug:
@@ -418,22 +405,23 @@ def main() -> int:
         eprint(f"sniff targets: {sniff_n}/{len(worker_pids)} -> {out_dir}")
 
         for pid in target_pids:
-            jsonl_path = out_dir / f"xniff-{pid}.jsonl"
+            capture_path = out_dir / f"xniff-{pid}.xniffbin"
+            stdout_path = out_dir / f"xniff-{pid}.out"
             err_path = out_dir / f"xniff-{pid}.err"
-            out_f = jsonl_path.open("w", encoding="utf-8")
+            out_f = stdout_path.open("w", encoding="utf-8")
             err_f = err_path.open("w", encoding="utf-8")
             cmd = [
                 str(xniff_cli),
-                "sniff-xpc",
+                "attach",
                 str(pid),
-                str(hooks_dylib),
                 f"--{args.mode}",
-                *listener_flags,
+                "--out",
+                str(capture_path),
             ]
             proc = subprocess.Popen(cmd, stdout=out_f, stderr=err_f, env=os.environ.copy())
             out_f.close()
             err_f.close()
-            sniffers.append(SnifferProc(pid=pid, proc=proc, jsonl_path=jsonl_path, err_path=err_path))
+            sniffers.append(SnifferProc(pid=pid, proc=proc, capture_path=capture_path, err_path=err_path))
 
         ready_count, ready_fail = wait_for_sniffers_ready(sniffers)
         eprint(f"sniffers ready={ready_count}/{len(sniffers)} failures={ready_fail}")
@@ -492,7 +480,7 @@ def main() -> int:
         print("per-target:")
         per_pid: Dict[int, int] = summary["per_pid"]  # type: ignore[assignment]
         for pid in sorted(per_pid):
-            print(f"  pid={pid} events={per_pid[pid]} file={out_dir / f'xniff-{pid}.jsonl'}")
+            print(f"  pid={pid} events={per_pid[pid]} file={out_dir / f'xniff-{pid}.xniffbin'}")
 
         per_pid_xpc_entry_funcs: Dict[int, Counter[str]] = summary["per_pid_xpc_entry_funcs"]  # type: ignore[assignment]
         if worker_stats:
