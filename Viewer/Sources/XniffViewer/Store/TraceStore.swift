@@ -6,6 +6,7 @@ import XniffViewerCore
 enum TraceFilter: String, CaseIterable, Identifiable, Sendable {
     case all
     case requests
+    case unmatchedResponses
     case incoming
     case oneWay
     case mach
@@ -16,6 +17,7 @@ enum TraceFilter: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .all: "All Traffic"
         case .requests: "Requests"
+        case .unmatchedResponses: "Unmatched Responses"
         case .incoming: "Incoming"
         case .oneWay: "One-way"
         case .mach: "Mach"
@@ -27,6 +29,7 @@ enum TraceFilter: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .all: true
         case .requests: call.role == .request
+        case .unmatchedResponses: call.role == .response
         case .incoming: call.role == .incoming
         case .oneWay: call.role == .oneWay
         case .mach: call.role == .mach

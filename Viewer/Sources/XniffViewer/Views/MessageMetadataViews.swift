@@ -62,10 +62,10 @@ struct BacktraceView: View {
 
     var body: some View {
         if frames.isEmpty {
-            ContentUnavailableView(
-                "No Backtrace",
+            InspectorPlaceholderView(
+                title: "No Backtrace",
                 systemImage: "point.3.connected.trianglepath.dotted",
-                description: Text("Set XNIFF_BACKTRACE=1 while capturing to include backtraces.")
+                description: "Set XNIFF_BACKTRACE=1 while capturing to include backtraces."
             )
         } else {
             Table(frames) {

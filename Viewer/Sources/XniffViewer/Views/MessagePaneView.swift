@@ -125,10 +125,10 @@ struct MessagePaneView: View {
                 bodyContent
             }
         } else {
-            ContentUnavailableView(
-                "No \(title)",
+            InspectorPlaceholderView(
+                title: "No \(title)",
                 systemImage: side == .request ? "arrow.up.right" : "arrow.down.left",
-                description: Text("This call does not contain a captured \(side.rawValue).")
+                description: "This call does not contain a captured \(side.rawValue)."
             )
         }
     }
@@ -142,10 +142,10 @@ struct MessagePaneView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .loaded(let decoded):
             if decoded.isEmpty {
-                ContentUnavailableView(
-                    "No Body",
+                InspectorPlaceholderView(
+                    title: "No Body",
                     systemImage: "doc.plaintext",
-                    description: Text("No serialized XPC body was captured for this side.")
+                    description: "No serialized XPC body was captured for this side."
                 )
             } else if let payload = selectedPayload(from: decoded) {
                 VStack(spacing: 0) {

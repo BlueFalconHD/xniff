@@ -68,6 +68,24 @@ private let diagnosticSerialization = Data(hex: """
     #expect(decoded.stringValue(at: "kind") == "xniff-diagnostic")
 }
 
+@Test func pairsInternalAsyncReplyDeliveryWithoutDuplicatingTheRequestBody() throws {
+    let callID: UInt64 = 78
+    var file = Data()
+    file.appendLE(UInt32(0x584e4246))
+    file.appendLE(UInt16(2))
+    file.appendLE(UInt16(0))
+    file.append(makeRecord(direction: 0, sequence: 1, callID: callID, reply: false, function: 4))
+    file.append(makeRecord(direction: 1, sequence: 2, callID: callID, reply: true, function: 4))
+
+    let document = try XniffTraceParser.parse(data: file)
+    let call = try #require(document.calls.first)
+
+    #expect(document.calls.count == 1)
+    #expect(call.functionName == "xpc_connection_send_message_with_reply")
+    #expect(call.request?.payloads.map(\.kind) == [.message])
+    #expect(call.response?.payloads.map(\.kind) == [.reply])
+}
+
 @Test func acceptsAnEmptyCapture() throws {
     var file = Data()
     file.appendLE(UInt32(0x584e4246))
@@ -235,19 +253,25 @@ private let diagnosticSerialization = Data(hex: """
     #expect(!coreDataMessages.isEmpty)
 }
 
-private func makeRecord(direction: UInt16, sequence: UInt64, callID: UInt64, reply: Bool) -> Data {
+private func makeRecord(
+    direction: UInt16,
+    sequence: UInt64,
+    callID: UInt64,
+    reply: Bool,
+    function: UInt32 = 5
+) -> Data {
     var fixed = Data()
     fixed.appendLE(UInt32(99))
     fixed.appendLE(UInt32(7))
     fixed.appendLE(sequence)
     fixed.appendLE(direction)
     fixed.appendLE(UInt16(3))
-    fixed.appendLE(UInt32(5))
+    fixed.appendLE(function)
 
     var call = Data()
     call.appendLE(UInt32(3))
     call.appendLE(UInt32(direction))
-    call.appendLE(UInt32(5))
+    call.appendLE(function)
     call.appendLE(UInt32(0))
     call.appendLE(UInt64(reply ? 1 : 0))
     for _ in 0..<8 { call.appendLE(UInt64(0)) }

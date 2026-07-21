@@ -3,6 +3,7 @@ import Testing
 
 private let eventHandlerFunction: UInt32 = 6
 private let dictionaryReplyFunction: UInt32 = 8
+private let asyncReplyFunction: UInt32 = 4
 
 @Test func doesNotTreatEventHandlerExitAsResponse() {
     let incoming = makeXPCEvent(id: 1, function: eventHandlerFunction, direction: .entry)
@@ -28,6 +29,19 @@ private let dictionaryReplyFunction: UInt32 = 8
     #expect(call.request?.role == .incoming)
     #expect(call.response?.role == .response)
     #expect(call.isComplete)
+}
+
+@Test func representsAnUnmatchedInternalAsyncReplyAsResponseOnly() {
+    let response = makeXPCEvent(id: 3, function: asyncReplyFunction, direction: .exit)
+    let call = TraceCall(
+        id: TraceCallID(processID: response.processID, callID: 131),
+        events: [response]
+    )
+
+    #expect(call.request == nil)
+    #expect(call.response?.role == .response)
+    #expect(call.primaryEvent.id == response.id)
+    #expect(call.role == .response)
 }
 
 private func makeXPCEvent(

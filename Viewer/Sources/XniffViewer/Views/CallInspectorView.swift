@@ -47,10 +47,10 @@ struct CallInspectorView: View {
                     bodyDetailsLayout.reset()
                 }
             } else {
-                ContentUnavailableView(
-                    "No Call Selected",
+                InspectorPlaceholderView(
+                    title: "No Call Selected",
                     systemImage: "rectangle.bottomhalf.inset.filled",
-                    description: Text("Select a row to inspect both sides of the call.")
+                    description: "Select a row to inspect both sides of the call."
                 )
             }
         }
