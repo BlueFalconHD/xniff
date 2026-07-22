@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../shared/xniff_ipc.h"
+#include "../shared/xniff_transport.h"
 
 extern char **environ;
 
@@ -21,9 +21,9 @@ static const char *environment_value(const char *name) {
 
 static bool is_replaced_variable(const char *value) {
     return strncmp(value, "DYLD_INSERT_LIBRARIES=", 22) == 0 ||
-           strncmp(value, XNIFF_IPC_CAPTURE_MODE_ENV "=", sizeof(XNIFF_IPC_CAPTURE_MODE_ENV)) == 0 ||
-           strncmp(value, XNIFF_IPC_RING_FD_ENV "=", sizeof(XNIFF_IPC_RING_FD_ENV)) == 0 ||
-           strncmp(value, XNIFF_IPC_WAKE_FD_ENV "=", sizeof(XNIFF_IPC_WAKE_FD_ENV)) == 0;
+           strncmp(value, XNIFF_CAPTURE_MODE_ENV "=", sizeof(XNIFF_CAPTURE_MODE_ENV)) == 0 ||
+           strncmp(value, XNIFF_RING_FD_ENV "=", sizeof(XNIFF_RING_FD_ENV)) == 0 ||
+           strncmp(value, XNIFF_WAKE_FD_ENV "=", sizeof(XNIFF_WAKE_FD_ENV)) == 0;
 }
 
 int xniff_launch_environment_create(const char *hooks_path, int mode,
@@ -54,8 +54,8 @@ int xniff_launch_environment_create(const char *hooks_path, int mode,
         xniff_launch_environment_destroy(environment);
         return -1;
     }
-    if (asprintf(&environment->ring_fd, "%s=%d", XNIFF_IPC_RING_FD_ENV, ring_fd) < 0 ||
-        asprintf(&environment->wake_fd, "%s=%d", XNIFF_IPC_WAKE_FD_ENV, wake_fd) < 0) {
+    if (asprintf(&environment->ring_fd, "%s=%d", XNIFF_RING_FD_ENV, ring_fd) < 0 ||
+        asprintf(&environment->wake_fd, "%s=%d", XNIFF_WAKE_FD_ENV, wake_fd) < 0) {
         xniff_launch_environment_destroy(environment);
         return -1;
     }

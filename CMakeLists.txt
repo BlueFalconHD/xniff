@@ -48,12 +48,15 @@ set_target_properties(frida-gum PROPERTIES
     IMPORTED_LOCATION "${frida_gum_devkit_SOURCE_DIR}/libfrida-gum.a"
     INTERFACE_INCLUDE_DIRECTORIES "${frida_gum_devkit_SOURCE_DIR}")
 
-add_library(xniff-protocol STATIC
-    Sources/shared/xniff_ipc.c
-    Sources/shared/xniff_ipc_v2.c)
-target_include_directories(xniff-protocol PUBLIC Sources/shared)
-set_target_properties(xniff-protocol PROPERTIES POSITION_INDEPENDENT_CODE ON)
-xniff_enable_arm64e(xniff-protocol)
+add_library(xniff-record STATIC Sources/shared/xniff_record.c)
+target_include_directories(xniff-record PUBLIC Sources/shared)
+set_target_properties(xniff-record PROPERTIES POSITION_INDEPENDENT_CODE ON)
+xniff_enable_arm64e(xniff-record)
+
+add_library(xniff-transport STATIC Sources/shared/xniff_transport.c)
+target_include_directories(xniff-transport PUBLIC Sources/shared)
+set_target_properties(xniff-transport PROPERTIES POSITION_INDEPENDENT_CODE ON)
+xniff_enable_arm64e(xniff-transport)
 
 add_library(xniff-injector STATIC
     Sources/xniff-injector/src/dylib_inject_stub.S
@@ -74,7 +77,6 @@ add_library(xniff-hooks SHARED
     Sources/xniff-hooks/frida_gum_interceptor.c
     Sources/xniff-hooks/xniff_hooks_api.c
     Sources/xniff-hooks/xniff_hooks_backtrace.c
-    Sources/xniff-hooks/xniff_hooks_ipc.c
     Sources/xniff-hooks/xniff_hooks_runtime.c
     Sources/xniff-hooks/xpc_highlevel_hooks.c
     Sources/xniff-hooks/xpc_hooks.c)
@@ -84,7 +86,8 @@ target_link_options(xniff-hooks PRIVATE "-Wl,-undefined,dynamic_lookup")
 target_link_libraries(xniff-hooks PRIVATE
     frida-gum
     xniff-hook-state
-    xniff-protocol
+    xniff-record
+    xniff-transport
     resolv
     m)
 set_target_properties(xniff-hooks PROPERTIES OUTPUT_NAME xniff-hooks)
@@ -96,7 +99,7 @@ add_library(xniff-cli-support STATIC
     Sources/xniff-cli/shared_transport.c
     Sources/xniff-cli/target_identity.c)
 target_include_directories(xniff-cli-support PUBLIC Sources/xniff-cli)
-target_link_libraries(xniff-cli-support PUBLIC xniff-injector xniff-protocol)
+target_link_libraries(xniff-cli-support PUBLIC xniff-injector xniff-transport)
 xniff_enable_arm64e(xniff-cli-support)
 
 add_executable(xniff-cli
@@ -108,7 +111,7 @@ add_executable(xniff-cli
     Sources/xniff-cli/record_renderer.c
     Sources/xniff-cli/record_render_support.c
     Sources/xniff-cli/xpc_record_renderer.c)
-target_link_libraries(xniff-cli PRIVATE xniff-cli-support)
+target_link_libraries(xniff-cli PRIVATE xniff-cli-support xniff-record)
 xniff_enable_arm64e(xniff-cli)
 add_dependencies(xniff-cli xniff-hooks)
 set_property(TARGET xniff-cli APPEND PROPERTY LINK_DEPENDS "$<TARGET_FILE:xniff-hooks>")
@@ -123,12 +126,12 @@ add_executable(xniff-test
 target_link_libraries(xniff-test PRIVATE
     xniff-cli-support
     xniff-hook-state
-    xniff-protocol)
+    xniff-record)
 xniff_enable_arm64e(xniff-test)
 
-add_test(NAME xniff-ipc-ring COMMAND xniff-test --ipc-ring)
-add_test(NAME xniff-ipc-drop COMMAND xniff-test --ipc-drop)
-add_test(NAME xniff-v2-call-id COMMAND xniff-test --v2-call-id)
+add_test(NAME xniff-transport-ring COMMAND xniff-test --transport-ring)
+add_test(NAME xniff-transport-drop COMMAND xniff-test --transport-drop)
+add_test(NAME xniff-record-call-id COMMAND xniff-test --record-call-id)
 add_test(NAME xniff-shared-transport-tail COMMAND xniff-test --shared-transport-tail)
 add_test(NAME xniff-xpc-reply-tracker COMMAND xniff-test --xpc-reply-tracker)
 add_test(NAME xniff-xpc-session-coalescer COMMAND xniff-test --xpc-session-coalescer)

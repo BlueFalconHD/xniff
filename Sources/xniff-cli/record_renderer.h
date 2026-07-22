@@ -7,7 +7,6 @@
 
 int xniff_render_record(const uint8_t *record,
                         size_t record_length,
-                        uint64_t event_index,
                         bool include_hook_debug);
 
 #endif

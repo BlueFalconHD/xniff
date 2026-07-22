@@ -17,19 +17,15 @@ public enum XniffTraceParser {
             throw TraceParseError.invalidFile("The file is too short to be an xniff dump")
         }
 
-        let first = try reader.readUInt32()
-        if first == fileMagic {
-            let version = try reader.readUInt16()
-            guard version == fileVersion else {
-                throw TraceParseError.unsupported("Unsupported xniff file version \(version)")
-            }
-            try reader.skip(2)
-        } else {
-            guard data.count >= 16 else {
-                throw TraceParseError.invalidFile("The file is too short to contain an xniff record")
-            }
-            reader.offset = 0
+        let magic = try reader.readUInt32()
+        guard magic == fileMagic else {
+            throw TraceParseError.invalidFile("The file does not have an xniff capture header")
         }
+        let version = try reader.readUInt16()
+        guard version == fileVersion else {
+            throw TraceParseError.unsupported("Unsupported xniff file version \(version)")
+        }
+        try reader.skip(2)
 
         var pending: [PendingEvent] = []
         var fallbackCalls: [FallbackCallKey: [UInt64]] = [:]
@@ -39,7 +35,7 @@ public enum XniffTraceParser {
             try Task.checkCancellation()
             let recordStart = reader.offset
             let recordLength = Int(try reader.readUInt32())
-            _ = try reader.readUInt16() // entry type
+            let recordType = try reader.readUInt16()
             let version = try reader.readUInt16()
             let sequence = try reader.readUInt64()
 
@@ -60,6 +56,16 @@ public enum XniffTraceParser {
             }
             guard let api = TraceAPI(rawValue: try reader.readUInt16()) else {
                 throw TraceParseError.invalidFile("Invalid API at byte \(recordStart)")
+            }
+            let expectedRecordType: UInt16 = switch api {
+            case .machMessage, .machMessage2: 1
+            case .xpc: 2
+            case .diagnostic: 3
+            }
+            guard recordType == expectedRecordType else {
+                throw TraceParseError.invalidFile(
+                    "Record type \(recordType) does not match API \(api.rawValue) at byte \(recordStart)"
+                )
             }
             var function = try reader.readUInt32()
             var returnValue: UInt64 = 0

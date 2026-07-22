@@ -9,17 +9,17 @@
 
 #include "xniff_hooks_runtime.h"
 
-void xniff_hooks_add_backtrace(xniff_ipc_v2_builder_t *builder) {
+void xniff_hooks_add_backtrace(xniff_record_builder_t *builder) {
     if (!builder || !xniff_hooks_backtrace_is_enabled()) return;
 
-    void *frames[XNIFF_V2_BACKTRACE_MAX_FRAMES + 8u] = {0};
+    void *frames[XNIFF_BACKTRACE_MAX_FRAMES + 8u] = {0};
     int frame_count = backtrace(frames, (int)(sizeof(frames) / sizeof(frames[0])));
     if (frame_count <= 2) return;
 
-    xniff_ipc_v2_backtrace_t backtrace_section = {0};
-    void *captured[XNIFF_V2_BACKTRACE_MAX_FRAMES] = {0};
+    xniff_backtrace_section_t backtrace_section = {0};
+    void *captured[XNIFF_BACKTRACE_MAX_FRAMES] = {0};
     for (int index = 2;
-         index < frame_count && backtrace_section.count < XNIFF_V2_BACKTRACE_MAX_FRAMES;
+         index < frame_count && backtrace_section.count < XNIFF_BACKTRACE_MAX_FRAMES;
          index++) {
         void *pc = frames[index];
         captured[backtrace_section.count] = pc;
@@ -27,15 +27,15 @@ void xniff_hooks_add_backtrace(xniff_ipc_v2_builder_t *builder) {
     }
     if (backtrace_section.count == 0) return;
 
-    (void)xniff_ipc_v2_add_section(builder, XNIFF_V2_SEC_BACKTRACE, 0,
+    (void)xniff_record_add_section(builder, XNIFF_SECTION_BACKTRACE, 0,
                                    &backtrace_section, sizeof(backtrace_section));
 
-    xniff_ipc_v2_backtrace_symbols_hdr_t header = {
+    xniff_backtrace_symbols_header_t header = {
         .count = backtrace_section.count,
     };
-    xniff_ipc_v2_backtrace_symbol_t symbols[XNIFF_V2_BACKTRACE_MAX_FRAMES] = {0};
-    const char *names[XNIFF_V2_BACKTRACE_MAX_FRAMES] = {0};
-    const char *images[XNIFF_V2_BACKTRACE_MAX_FRAMES] = {0};
+    xniff_backtrace_symbol_t symbols[XNIFF_BACKTRACE_MAX_FRAMES] = {0};
+    const char *names[XNIFF_BACKTRACE_MAX_FRAMES] = {0};
+    const char *images[XNIFF_BACKTRACE_MAX_FRAMES] = {0};
     bool has_symbols = false;
 
     for (uint32_t index = 0; index < header.count; index++) {
@@ -78,7 +78,7 @@ void xniff_hooks_add_backtrace(xniff_ipc_v2_builder_t *builder) {
             offset += symbols[index].image_len;
         }
     }
-    (void)xniff_ipc_v2_add_section(builder, XNIFF_V2_SEC_BACKTRACE_SYMBOLS, 0,
+    (void)xniff_record_add_section(builder, XNIFF_SECTION_BACKTRACE_SYMBOLS, 0,
                                    section, offset);
     free(section);
 }

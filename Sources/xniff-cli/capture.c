@@ -8,13 +8,13 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "../shared/xniff_ipc.h"
-#include "../shared/xniff_ipc_v2.h"
+#include "../shared/xniff_record.h"
+#include "../shared/xniff_transport.h"
 #include "record_renderer.h"
 
 static bool entry_length_is_valid(uint32_t length) {
-    size_t minimum = sizeof(xniff_ipc_v2_entry_hdr_t) +
-                     sizeof(xniff_ipc_v2_fixed_hdr_t);
+    size_t minimum = sizeof(xniff_record_header_t) +
+                     sizeof(xniff_record_fixed_header_t);
     return length >= minimum && length <= 64u * 1024u * 1024u;
 }
 
@@ -24,9 +24,9 @@ static bool environment_flag_is_enabled(const char *name) {
 }
 
 static int write_capture_header(FILE *output) {
-    xniff_bin_file_hdr_t header = {
-        .magic = XNIFF_BIN_FILE_MAGIC,
-        .version = XNIFF_BIN_FILE_VERSION,
+    xniff_capture_file_header_t header = {
+        .magic = XNIFF_CAPTURE_FILE_MAGIC,
+        .version = XNIFF_CAPTURE_FILE_VERSION,
     };
     return fwrite(&header, sizeof(header), 1, output) == 1 ? 0 : -1;
 }
@@ -72,21 +72,18 @@ int xniff_capture_ring(pid_t pid,
             (int)pid, (void *)transport->ring);
 
     uint64_t local_read_index =
-        __atomic_load_n(&transport->ring->hdr.read_idx, __ATOMIC_ACQUIRE);
+        __atomic_load_n(&transport->ring->header.read_idx, __ATOMIC_ACQUIRE);
     uint8_t *stream = NULL;
     size_t stream_length = 0;
     size_t stream_capacity = 0;
     uint64_t last_dropped_events = 0;
     uint64_t last_dropped_bytes = 0;
-    uint64_t event_index = 0;
     bool producer_closed = false;
     bool include_hook_debug = environment_flag_is_enabled("XNIFF_HOOKS_DEBUG");
 
     for (;;) {
-        xniff_ipc_ring_hdr_t *header = &transport->ring->hdr;
-        if (header->magic != XNIFF_IPC_RING_MAGIC ||
-            header->version != XNIFF_IPC_RING_VERSION ||
-            header->capacity != XNIFF_IPC_RING_CAPACITY) {
+        xniff_ring_header_t *header = &transport->ring->header;
+        if (!xniff_ring_is_valid(transport->ring)) {
             fprintf(stderr, "capture: invalid shared ring header\n");
             break;
         }
@@ -113,29 +110,27 @@ int xniff_capture_ring(pid_t pid,
         }
 
         size_t consumed = 0;
-        while (stream_length - consumed >= sizeof(xniff_ipc_v2_entry_hdr_t)) {
+        while (stream_length - consumed >= sizeof(xniff_record_header_t)) {
             const uint8_t *record = stream + consumed;
-            xniff_ipc_v2_entry_hdr_t record_header = {0};
+            xniff_record_header_t record_header = {0};
             memcpy(&record_header, record, sizeof(record_header));
-            if (record_header.version != XNIFF_IPC_V2_VERSION ||
-                !entry_length_is_valid(record_header.entry_len)) {
+            if (record_header.version != XNIFF_RECORD_VERSION ||
+                !entry_length_is_valid(record_header.length)) {
                 consumed++;
                 continue;
             }
 
-            size_t record_length = record_header.entry_len;
+            size_t record_length = record_header.length;
             if (stream_length - consumed < record_length) break;
             int result = output
                 ? write_record(output, record, record_length)
-                : xniff_render_record(record, record_length, event_index,
-                                      include_hook_debug);
+                : xniff_render_record(record, record_length, include_hook_debug);
             if (result != 0) {
                 fprintf(stderr, "capture: failed processing record\n");
                 close_output(output);
                 free(stream);
                 return -1;
             }
-            event_index++;
             consumed += record_length;
         }
         if (consumed != 0) {

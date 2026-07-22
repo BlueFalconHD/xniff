@@ -38,7 +38,7 @@ static int create_ring_backing(void) {
     int fd = mkstemp(path);
     if (fd < 0) return -1;
     (void)unlink(path);
-    if (ftruncate(fd, (off_t)sizeof(xniff_ipc_ring_t)) != 0) {
+    if (ftruncate(fd, (off_t)sizeof(xniff_ring_t)) != 0) {
         close(fd);
         return -1;
     }
@@ -54,7 +54,7 @@ int xniff_shared_transport_create(xniff_shared_transport_t *transport) {
     transport->ring_fd = -1;
     transport->wake_read_fd = -1;
     transport->wake_write_fd = -1;
-    transport->ring_size = sizeof(xniff_ipc_ring_t);
+    transport->ring_size = sizeof(xniff_ring_t);
 
     transport->ring_fd = create_ring_backing();
     if (transport->ring_fd < 0) goto fail;
@@ -64,7 +64,7 @@ int xniff_shared_transport_create(xniff_shared_transport_t *transport) {
         transport->ring = NULL;
         goto fail;
     }
-    xniff_ipc_ring_initialize(transport->ring);
+    xniff_ring_initialize(transport->ring);
 
     int sockets[2] = {-1, -1};
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) goto fail;
@@ -158,10 +158,10 @@ int xniff_shared_transport_configure_target(xniff_shared_transport_t *transport,
 
     mach_vm_address_t config_address = 0;
     if (xniff_find_symbol_in_image_path_contains(task, "xniff-hooks",
-                                                  "_xniff_ipc_transport_config",
+                                                  "_xniff_transport_configuration",
                                                   &config_address) != 0 &&
         xniff_find_symbol_in_image_path_contains(task, "xniff-hooks",
-                                                  "xniff_ipc_transport_config",
+                                                  "xniff_transport_configuration",
                                                   &config_address) != 0) {
         return -1;
     }
@@ -186,9 +186,9 @@ int xniff_shared_transport_configure_target(xniff_shared_transport_t *transport,
     mach_port_name_t remote_fileport = MACH_PORT_NULL;
     int result = insert_send_right(task, fileport, &remote_fileport);
     if (result == 0) {
-        xniff_ipc_transport_config_t config = {0};
-        config.magic = XNIFF_IPC_TRANSPORT_MAGIC;
-        config.version = XNIFF_IPC_TRANSPORT_VERSION;
+        xniff_transport_config_t config = {0};
+        config.magic = XNIFF_TRANSPORT_MAGIC;
+        config.version = XNIFF_TRANSPORT_VERSION;
         config.struct_size = (uint16_t)sizeof(config);
         config.ring_address = remote_ring;
         config.wake_fd = -1;
@@ -199,7 +199,7 @@ int xniff_shared_transport_configure_target(xniff_shared_transport_t *transport,
         if (result == 0) {
             const uint64_t ready = 1;
             result = write_remote(task,
-                                  config_address + offsetof(xniff_ipc_transport_config_t, ready),
+                                  config_address + offsetof(xniff_transport_config_t, ready),
                                   &ready, sizeof(ready));
         }
     }
@@ -225,9 +225,9 @@ int xniff_shared_transport_pull(xniff_shared_transport_t *transport,
         errno = EINVAL;
         return -1;
     }
-    xniff_ipc_ring_t *ring = transport->ring;
-    uint64_t write_index = __atomic_load_n(&ring->hdr.write_idx, __ATOMIC_ACQUIRE);
-    uint64_t capacity = ring->hdr.capacity;
+    xniff_ring_t *ring = transport->ring;
+    uint64_t write_index = __atomic_load_n(&ring->header.write_idx, __ATOMIC_ACQUIRE);
+    uint64_t capacity = ring->header.capacity;
     if (write_index < *read_index || write_index - *read_index > capacity) {
         errno = EOVERFLOW;
         return -1;
@@ -265,7 +265,7 @@ int xniff_shared_transport_pull(xniff_shared_transport_t *transport,
     }
     *stream_length += (size_t)available;
     *read_index = write_index;
-    __atomic_store_n(&ring->hdr.read_idx, write_index, __ATOMIC_RELEASE);
+    __atomic_store_n(&ring->header.read_idx, write_index, __ATOMIC_RELEASE);
     return 1;
 }
 
@@ -302,5 +302,5 @@ int xniff_shared_transport_wait(xniff_shared_transport_t *transport,
 bool xniff_shared_transport_is_drained(const xniff_shared_transport_t *transport,
                                        uint64_t read_index) {
     if (!transport || !transport->ring) return true;
-    return __atomic_load_n(&transport->ring->hdr.write_idx, __ATOMIC_ACQUIRE) == read_index;
+    return __atomic_load_n(&transport->ring->header.write_idx, __ATOMIC_ACQUIRE) == read_index;
 }

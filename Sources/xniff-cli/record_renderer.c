@@ -5,30 +5,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../shared/xniff_ipc.h"
-#include "../shared/xniff_ipc_v2.h"
+#include "../shared/xniff_payload.h"
+#include "../shared/xniff_record.h"
 #include "mach_record_renderer.h"
 #include "record_render_support.h"
 #include "xpc_record_renderer.h"
-
-static uint16_t event_kind(const xniff_ipc_v2_fixed_hdr_t *fixed) {
-    if (fixed->api == XNIFF_API_XPC_HL) {
-        return fixed->direction == XNIFF_DIR_EXIT
-            ? XNIFF_EVT_XPC_EXIT
-            : XNIFF_EVT_XPC_ENTRY;
-    }
-    if (fixed->api == XNIFF_API_MACH_MSG) {
-        return fixed->direction == XNIFF_DIR_EXIT
-            ? XNIFF_EVT_MACH_EXIT
-            : XNIFF_EVT_MACH_ENTRY;
-    }
-    if (fixed->api == XNIFF_API_MACH_MSG2) {
-        return fixed->direction == XNIFF_DIR_EXIT
-            ? XNIFF_EVT_MACH2_EXIT
-            : XNIFF_EVT_MACH2_ENTRY;
-    }
-    return fixed->api == XNIFF_API_DEBUG ? XNIFF_EVT_DEBUG_LOG : 0;
-}
 
 static void append_hook_debug_log(uint32_t pid,
                                   uint32_t thread_id,
@@ -47,19 +28,19 @@ static void append_hook_debug_log(uint32_t pid,
 
 static int render_hook_debug(const uint8_t *body,
                              size_t body_length,
-                             const xniff_ipc_v2_fixed_hdr_t *fixed) {
-    size_t section_offset = sizeof(*fixed);
-    while (section_offset + sizeof(xniff_ipc_v2_section_hdr_t) <= body_length) {
-        xniff_ipc_v2_section_hdr_t section = {0};
-        memcpy(&section, body + section_offset, sizeof(section));
-        section_offset += sizeof(section);
-        if (section_offset + section.sec_len > body_length) break;
-        const uint8_t *value = body + section_offset;
-        if (section.sec_type == XNIFF_V2_SEC_HOOK_DIAG &&
-            section.sec_len >= sizeof(xniff_ipc_v2_diag_t)) {
-            xniff_ipc_v2_diag_t diagnostic = {0};
+                             const xniff_record_fixed_header_t *fixed) {
+    xniff_record_section_iterator_t iterator;
+    xniff_record_section_iterator_init(&iterator, body + sizeof(*fixed),
+                                       body_length - sizeof(*fixed));
+    xniff_record_section_t section;
+    int section_result;
+    while ((section_result = xniff_record_section_next(&iterator, &section)) > 0) {
+        const uint8_t *value = section.data;
+        if (section.type == XNIFF_SECTION_HOOK_DIAG &&
+            section.length >= sizeof(xniff_diagnostic_section_t)) {
+            xniff_diagnostic_section_t diagnostic = {0};
             memcpy(&diagnostic, value, sizeof(diagnostic));
-            size_t available = section.sec_len - sizeof(diagnostic);
+            size_t available = section.length - sizeof(diagnostic);
             size_t message_length = diagnostic.msg_len;
             if (message_length > available) message_length = available;
             char *line = malloc(message_length + 1);
@@ -79,36 +60,40 @@ static int render_hook_debug(const uint8_t *body,
             }
             free(line);
         }
-        section_offset += section.sec_len;
     }
-    return 0;
+    return section_result;
 }
 
 int xniff_render_record(const uint8_t *record,
                         size_t record_length,
-                        uint64_t event_index,
                         bool include_hook_debug) {
-    size_t header_length = sizeof(xniff_ipc_v2_entry_hdr_t);
+    size_t header_length = sizeof(xniff_record_header_t);
     if (!record || record_length < header_length +
-                                    sizeof(xniff_ipc_v2_fixed_hdr_t)) {
+                                    sizeof(xniff_record_fixed_header_t)) {
+        return -1;
+    }
+
+    xniff_record_header_t header = {0};
+    memcpy(&header, record, sizeof(header));
+    if (header.version != XNIFF_RECORD_VERSION ||
+        header.length != record_length) {
         return -1;
     }
 
     const uint8_t *body = record + header_length;
     size_t body_length = record_length - header_length;
-    xniff_ipc_v2_fixed_hdr_t fixed = {0};
+    xniff_record_fixed_header_t fixed = {0};
     memcpy(&fixed, body, sizeof(fixed));
-    uint16_t kind = event_kind(&fixed);
+    if (!xniff_record_type_matches_api(header.type, fixed.api)) return -1;
 
-    if (include_hook_debug && kind == XNIFF_EVT_DEBUG_LOG) {
+    if (include_hook_debug && fixed.api == XNIFF_API_DEBUG) {
         return render_hook_debug(body, body_length, &fixed);
     }
-    if (fixed.api == XNIFF_API_XPC_HL) {
-        return xniff_render_xpc_record(body, body_length, &fixed, kind,
-                                       event_index);
+    if (fixed.api == XNIFF_API_XPC) {
+        return xniff_render_xpc_record(body, body_length, &fixed);
     }
     if (fixed.api == XNIFF_API_MACH_MSG || fixed.api == XNIFF_API_MACH_MSG2) {
-        return xniff_render_mach_record(body, body_length, &fixed, kind);
+        return xniff_render_mach_record(body, body_length, &fixed);
     }
     return 0;
 }

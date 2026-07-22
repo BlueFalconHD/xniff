@@ -8,7 +8,7 @@
 #include <string.h>
 
 #include "../shared/mach_private.h"
-#include "../shared/xniff_ipc.h"
+#include "../shared/xniff_payload.h"
 #include "record_render_support.h"
 
 static bool extract_sender_pid(const uint8_t *message,
@@ -40,18 +40,16 @@ static bool extract_sender_pid(const uint8_t *message,
     return true;
 }
 
-static void print_mach_event(uint16_t kind,
-                             const xniff_ipc_mach_payload_t *payload,
+static void print_mach_event(const xniff_mach_payload_t *payload,
                              const uint8_t *message,
                              size_t message_length) {
     const mach_msg_header_t *header = (const mach_msg_header_t *)message;
-    const char *kind_name = "?";
-    switch (kind) {
-        case XNIFF_EVT_MACH_ENTRY: kind_name = "mach_msg entry"; break;
-        case XNIFF_EVT_MACH_EXIT: kind_name = "mach_msg exit"; break;
-        case XNIFF_EVT_MACH2_ENTRY: kind_name = "mach_msg2 entry"; break;
-        case XNIFF_EVT_MACH2_EXIT: kind_name = "mach_msg2 exit"; break;
-    }
+    const char *api_name = payload->api == XNIFF_API_MACH_MSG2
+        ? "mach_msg2"
+        : "mach_msg";
+    const char *direction_name = payload->direction == XNIFF_DIRECTION_EXIT
+        ? "exit"
+        : "entry";
 
     char timestamp[64];
     double monotonic_seconds = 0;
@@ -66,7 +64,8 @@ static void print_mach_event(uint16_t kind,
     mach_port_t remote = header ? header->msgh_remote_port : MACH_PORT_NULL;
     mach_port_t local = header ? header->msgh_local_port : MACH_PORT_NULL;
 
-    printf("[%s][+%0.6fs] %s\n", timestamp, monotonic_seconds, kind_name);
+    printf("[%s][+%0.6fs] %s %s\n", timestamp, monotonic_seconds,
+           api_name, direction_name);
     printf("  mach.api: %u\n", payload->api);
     printf("  mach.direction: %u\n", payload->direction);
     printf("  mach.is_send: %s\n", is_send ? "true" : "false");
@@ -86,7 +85,7 @@ static void print_mach_event(uint16_t kind,
     printf("  mach.local_port: 0x%08x\n", local);
 
     uint32_t sender_pid = 0;
-    if (payload->direction == XNIFF_DIR_EXIT && is_receive && payload->ret_value == 0) {
+    if (payload->direction == XNIFF_DIRECTION_EXIT && is_receive && payload->ret_value == 0) {
         uint32_t message_size = payload->msgh_size;
         if (message_size == 0 && header) message_size = header->msgh_size;
         if (message_size != 0) {
@@ -115,32 +114,30 @@ static void print_mach_event(uint16_t kind,
 
 int xniff_render_mach_record(const uint8_t *body,
                              size_t body_length,
-                             const xniff_ipc_v2_fixed_hdr_t *fixed,
-                             uint16_t kind) {
+                             const xniff_record_fixed_header_t *fixed) {
     if (!body || !fixed || body_length < sizeof(*fixed)) return -1;
 
-    xniff_ipc_mach_payload_t payload = {
+    xniff_mach_payload_t payload = {
         .api = fixed->api,
         .direction = fixed->direction,
     };
     const uint8_t *message = NULL;
     size_t message_length = 0;
-    size_t section_offset = sizeof(*fixed);
-    while (section_offset + sizeof(xniff_ipc_v2_section_hdr_t) <= body_length) {
-        xniff_ipc_v2_section_hdr_t section = {0};
-        memcpy(&section, body + section_offset, sizeof(section));
-        section_offset += sizeof(section);
-        if (section_offset + section.sec_len > body_length) break;
-        const uint8_t *value = body + section_offset;
-        if (section.sec_type == XNIFF_V2_SEC_MACH_HEADER_OPTIONS &&
-            section.sec_len >= sizeof(payload)) {
-            memcpy(&payload, value, sizeof(payload));
-        } else if (section.sec_type == XNIFF_V2_SEC_MACH_INLINE_BYTES) {
-            message = value;
-            message_length = section.sec_len;
+    xniff_record_section_iterator_t iterator;
+    xniff_record_section_iterator_init(&iterator, body + sizeof(*fixed),
+                                       body_length - sizeof(*fixed));
+    xniff_record_section_t section;
+    int section_result;
+    while ((section_result = xniff_record_section_next(&iterator, &section)) > 0) {
+        if (section.type == XNIFF_SECTION_MACH_HEADER_OPTIONS &&
+            section.length >= sizeof(payload)) {
+            memcpy(&payload, section.data, sizeof(payload));
+        } else if (section.type == XNIFF_SECTION_MACH_INLINE_BYTES) {
+            message = section.data;
+            message_length = section.length;
         }
-        section_offset += section.sec_len;
     }
-    print_mach_event(kind, &payload, message, message_length);
+    if (section_result < 0) return -1;
+    print_mach_event(&payload, message, message_length);
     return 0;
 }

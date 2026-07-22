@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../shared/xniff_ipc.h"
+#include "../shared/xniff_transport.h"
 
 static int find_double_dash(int argc, char **argv, int start) {
     for (int i = start; i < argc; i++) {

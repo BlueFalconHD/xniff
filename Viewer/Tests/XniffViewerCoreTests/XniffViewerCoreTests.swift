@@ -96,6 +96,13 @@ private let diagnosticSerialization = Data(hex: """
     #expect(document.events.isEmpty)
 }
 
+@Test func rejectsHeaderlessRecordStreams() {
+    let record = makeRecord(direction: 0, sequence: 1, callID: 1, reply: false)
+    #expect(throws: TraceParseError.self) {
+        try XniffTraceParser.parse(data: record)
+    }
+}
+
 @Test func attributesOnlyExactMetadataWithinAnXPCObjectLifetime() throws {
     let object: UInt64 = 0x1234_5678
     var file = Data()

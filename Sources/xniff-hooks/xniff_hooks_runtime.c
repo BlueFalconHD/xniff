@@ -4,7 +4,7 @@
 #include <string.h>
 #include <strings.h>
 
-#include "../shared/xniff_ipc.h"
+#include "../shared/xniff_transport.h"
 
 static uint32_t g_streaming_enabled = 0;
 static _Thread_local uint64_t g_current_call_id = 0;
@@ -26,8 +26,8 @@ void xniff_hooks_set_streaming_enabled(bool enabled) {
 
 bool xniff_hooks_capture_mode_enabled(uint32_t mode) {
     if (!xniff_hooks_streaming_is_enabled()) return false;
-    if (xniff_ipc_transport_is_internal()) return false;
-    uint32_t configured = xniff_ipc_transport_capture_mode();
+    if (xniff_transport_is_internal()) return false;
+    uint32_t configured = xniff_transport_capture_mode();
     return (configured & mode) != 0;
 }
 
@@ -37,6 +37,13 @@ bool xniff_hooks_debug_is_enabled(void) {
 
 bool xniff_hooks_backtrace_is_enabled(void) {
     return xniff_env_enabled("XNIFF_BACKTRACE", false);
+}
+
+int xniff_hooks_write_record(xniff_record_builder_t *builder) {
+    const uint8_t *record = NULL;
+    size_t length = 0;
+    if (xniff_record_finish(builder, &record, &length) != 0) return -1;
+    return xniff_ring_write(record, length);
 }
 
 void xniff_hooks_set_current_call_id(uint64_t call_id) {

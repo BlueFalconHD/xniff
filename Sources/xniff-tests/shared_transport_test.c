@@ -6,7 +6,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "../shared/xniff_ipc.h"
+#include "../shared/xniff_transport.h"
 #include "../xniff-cli/shared_transport.h"
 
 int selftest_shared_transport_tail(void) {
@@ -20,10 +20,10 @@ int selftest_shared_transport_tail(void) {
     pid_t child = fork();
     if (child == 0) {
         xniff_shared_transport_prepare_target_child(&transport);
-        if (xniff_ipc_transport_configure_direct(transport.ring,
+        if (xniff_transport_configure_direct(transport.ring,
                                                  transport.wake_write_fd,
                                                  XNIFF_CAPTURE_MODE_MACH) != 0 ||
-            xniff_ipc_ring_write(expected, sizeof(expected)) != 0) {
+            xniff_ring_write(expected, sizeof(expected)) != 0) {
             _exit(1);
         }
         _exit(0);

@@ -1,6 +1,6 @@
 // xniff-hooks: in-process Frida Gum hooks for Mach message tracing.
 // This library is intended to be injected into a running process. It installs
-// interceptors and streams events back to xniff-cli via the existing IPC protocol.
+// interceptors and streams capture records back to xniff-cli.
 
 #include <stdio.h>
 #include <stdint.h>
@@ -20,8 +20,9 @@
 #include <pthread.h>
 #include <time.h>
 
-#include "../shared/xniff_ipc.h"
-#include "../shared/xniff_ipc_v2.h"
+#include "../shared/xniff_payload.h"
+#include "../shared/xniff_transport.h"
+#include "../shared/xniff_record.h"
 #include "../shared/mach_private.h"
 
 #include <mach/mach.h>
@@ -36,7 +37,7 @@ typedef struct {
     uint32_t max_ool_total;      // max total OOL bytes per event (0 = unlimited)
     uint32_t max_ool_per_desc;   // max OOL bytes per descriptor (0 = unlimited)
     uint32_t max_desc;           // max descriptors walked
-    uint32_t max_payload;        // max total IPC payload (excluding 20-byte header)
+    uint32_t max_payload;        // max captured message bytes
 } xniff_hook_limits_t;
 
 static xniff_hook_limits_t g_limits;
@@ -124,7 +125,7 @@ static mach_msg_size_t safe_descriptor_count(const mach_msg_header_t *msg, uint3
     return dcount;
 }
 
-static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
+static void ipc_send_msg_full(const xniff_mach_payload_t *pl_in,
                               const mach_msg_header_t *msg,
                               uint32_t buf_size_hint) {
     if (!xniff_hooks_capture_mode_enabled(XNIFF_CAPTURE_MODE_MACH)) return;
@@ -191,7 +192,7 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
         if (msg_bound > copy_len) msg_bound = copy_len;
     }
 
-    xniff_ipc_mach_payload_t pl = *pl_in;
+    xniff_mach_payload_t pl = *pl_in;
     pl.msgh_size = header_ok ? raw_msgh_size : 0;
     pl.copy_len = copy_len;
     pl.msg_addr = (uint64_t)(uintptr_t)msg;
@@ -202,34 +203,34 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
         pl.desc_count = (uint32_t)dcount;
     }
 
-    xniff_ipc_v2_builder_t b;
-    xniff_ipc_v2_builder_init(&b);
-    if (xniff_ipc_v2_begin(&b,
-                           XNIFF_V2_ENTRY_MACH,
+    xniff_record_builder_t b;
+    xniff_record_builder_init(&b);
+    if (xniff_record_begin(&b,
+                           XNIFF_RECORD_TYPE_MACH,
                            (uint32_t)getpid(),
                            (uint32_t)(uintptr_t)pthread_self(),
                            0,
                            (uint16_t)pl.direction,
                            (uint16_t)pl.api,
                            0) != 0) {
-        xniff_ipc_v2_builder_free(&b);
+        xniff_record_builder_free(&b);
         goto out;
     }
-    (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_MACH_HEADER_OPTIONS, 0, &pl, sizeof(pl));
+    (void)xniff_record_add_section(&b, XNIFF_SECTION_MACH_HEADER_OPTIONS, 0, &pl, sizeof(pl));
     uint64_t call_id = xniff_hooks_current_call_id();
     if (call_id != 0) {
-        (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_CALL_ID, 0, &call_id, sizeof(call_id));
+        (void)xniff_record_add_section(&b, XNIFF_SECTION_CALL_ID, 0, &call_id, sizeof(call_id));
     }
     xniff_hooks_add_backtrace(&b);
     if (copy_len != 0 && msg_copy) {
-        (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_MACH_INLINE_BYTES, 0, msg_copy, copy_len);
+        (void)xniff_record_add_section(&b, XNIFF_SECTION_MACH_INLINE_BYTES, 0, msg_copy, copy_len);
     }
     if (header_ok && copy_len > raw_msgh_size) {
         size_t trailer_off = (size_t)round_msg(raw_msgh_size);
         if (trailer_off < copy_len) {
             size_t trailer_len = (size_t)copy_len - trailer_off;
-            (void)xniff_ipc_v2_add_section(&b,
-                                           XNIFF_V2_SEC_MACH_TRAILER_BYTES,
+            (void)xniff_record_add_section(&b,
+                                           XNIFF_SECTION_MACH_TRAILER_BYTES,
                                            0,
                                            msg_copy + trailer_off,
                                            trailer_len);
@@ -241,7 +242,7 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
         uint32_t total_left = lim->max_ool_total ? lim->max_ool_total : 0;
         for (mach_msg_size_t i = 0; i < dcount; i++, desc_it++) {
             mach_msg_descriptor_type_t t = desc_it->type.type;
-            xniff_ipc_v2_desc_meta_t md = {0};
+            xniff_mach_descriptor_section_t md = {0};
             md.index = (uint32_t)i;
             md.desc_type = (uint16_t)t;
 
@@ -251,7 +252,7 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
                 md.desc_flags = (ool->deallocate ? 1u : 0u) | (ool->copy ? 2u : 0u);
                 md.address = (uint64_t)(uintptr_t)ool->address;
                 md.size_bytes = n;
-                (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_MACH_DESC_META, 0, &md, sizeof(md));
+                (void)xniff_record_add_section(&b, XNIFF_SECTION_MACH_DESC_META, 0, &md, sizeof(md));
                 if (n != 0) {
                     if ((size_t)n > scratch_cap) {
                         uint8_t *ns = (uint8_t *)realloc(scratch, (size_t)n);
@@ -261,7 +262,7 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
                     }
                     memset(scratch, 0, (size_t)n);
                     if (ool->address) (void)xniff_safe_copy(ool->address, scratch, (size_t)n);
-                    (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_MACH_DESC_OOL_BYTES, 0, scratch, n);
+                    (void)xniff_record_add_section(&b, XNIFF_SECTION_MACH_DESC_OOL_BYTES, 0, scratch, n);
                 }
             } else if (t == MACH_MSG_OOL_PORTS_DESCRIPTOR) {
                 const mach_msg_ool_ports_descriptor_t *op = &desc_it->ool_ports;
@@ -274,7 +275,7 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
                 md.size_bytes = n;
                 md.count = send_count;
                 md.elem_size = (uint32_t)sizeof(mach_port_t);
-                (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_MACH_DESC_META, 0, &md, sizeof(md));
+                (void)xniff_record_add_section(&b, XNIFF_SECTION_MACH_DESC_META, 0, &md, sizeof(md));
                 if (n != 0) {
                     if ((size_t)n > scratch_cap) {
                         uint8_t *ns = (uint8_t *)realloc(scratch, (size_t)n);
@@ -284,21 +285,21 @@ static void ipc_send_msg_full(int kind, const xniff_ipc_mach_payload_t *pl_in,
                     }
                     memset(scratch, 0, (size_t)n);
                     if (op->address) (void)xniff_safe_copy(op->address, scratch, (size_t)n);
-                    (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_MACH_DESC_PORT_ARRAY, 0, scratch, n);
+                    (void)xniff_record_add_section(&b, XNIFF_SECTION_MACH_DESC_PORT_ARRAY, 0, scratch, n);
                 }
             } else if (t == MACH_MSG_PORT_DESCRIPTOR) {
                 const mach_msg_port_descriptor_t *pd = &desc_it->port;
                 md.port_name = pd->name;
                 md.port_disposition = pd->disposition;
-                (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_MACH_DESC_META, 0, &md, sizeof(md));
+                (void)xniff_record_add_section(&b, XNIFF_SECTION_MACH_DESC_META, 0, &md, sizeof(md));
             } else {
-                (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_MACH_DESC_META, 0, &md, sizeof(md));
+                (void)xniff_record_add_section(&b, XNIFF_SECTION_MACH_DESC_META, 0, &md, sizeof(md));
             }
         }
     }
 
-    (void)xniff_ipc_v2_write(&b);
-    xniff_ipc_v2_builder_free(&b);
+    (void)xniff_hooks_write_record(&b);
+    xniff_record_builder_free(&b);
 out:
     if (scratch) free(scratch);
     if (msg_copy) free(msg_copy);
@@ -313,9 +314,9 @@ void xniff_emit_mach_msg_entry(const uint64_t args[8]) {
     uint32_t buf_hint = 0;
     if (option & MACH_SEND_MSG) buf_hint = send_size;
     else if (option & MACH_RCV_MSG) buf_hint = rcv_size;
-    xniff_ipc_mach_payload_t pl = {0};
+    xniff_mach_payload_t pl = {0};
     pl.api = XNIFF_API_MACH_MSG;
-    pl.direction = XNIFF_DIR_ENTRY;
+    pl.direction = XNIFF_DIRECTION_ENTRY;
     pl.option_lo = (uint32_t)option;
     pl.option_hi = 0;
     pl.ret_value = 0;
@@ -323,7 +324,7 @@ void xniff_emit_mach_msg_entry(const uint64_t args[8]) {
     pl.priority = 0;
     pl.timeout = args[5];
     for (int i = 0; i < 8; i++) pl.args[i] = args[i];
-    ipc_send_msg_full(XNIFF_EVT_MACH_ENTRY, &pl, msg, buf_hint);
+    ipc_send_msg_full(&pl, msg, buf_hint);
 }
 
 void xniff_emit_mach_msg_exit(uint64_t ret, const uint64_t args[8], int has_separate_rcv_msg) {
@@ -338,14 +339,14 @@ void xniff_emit_mach_msg_exit(uint64_t ret, const uint64_t args[8], int has_sepa
     if (!msg) return;
     uint32_t buf_hint = have_rcv ? rcv_size : send_size;
 
-    xniff_ipc_mach_payload_t pl = {0};
+    xniff_mach_payload_t pl = {0};
     pl.api = XNIFF_API_MACH_MSG;
-    pl.direction = XNIFF_DIR_EXIT;
+    pl.direction = XNIFF_DIRECTION_EXIT;
     pl.option_lo = (uint32_t)option;
     pl.ret_value = ret;
     for (int i = 0; i < 8; i++) pl.args[i] = args[i];
     pl.timeout = args[5];
-    ipc_send_msg_full(XNIFF_EVT_MACH_EXIT, &pl, msg, buf_hint);
+    ipc_send_msg_full(&pl, msg, buf_hint);
 }
 
 
@@ -458,9 +459,9 @@ void xniff_emit_mach_msg2_entry(const uint64_t args[8]) {
     if (p.option64 & MACH64_SEND_MSG) buf_hint = p.send_size;
     else if (p.option64 & MACH64_RCV_MSG) buf_hint = p.rcv_size;
 
-    xniff_ipc_mach_payload_t pl = {0};
+    xniff_mach_payload_t pl = {0};
     pl.api = XNIFF_API_MACH_MSG2;
-    pl.direction = XNIFF_DIR_ENTRY;
+    pl.direction = XNIFF_DIRECTION_ENTRY;
     pl.option_lo = (uint32_t)(option64 & 0xffffffffu);
     pl.option_hi = (uint32_t)(option64 >> 32);
     pl.timeout = p.timeout;
@@ -468,7 +469,7 @@ void xniff_emit_mach_msg2_entry(const uint64_t args[8]) {
     pl.desc_count = p.desc_count;
     pl.aux_addr = (uint64_t)(uintptr_t)p.aux;
     for (int i = 0; i < 8; i++) pl.args[i] = args[i];
-    ipc_send_msg_full(XNIFF_EVT_MACH2_ENTRY, &pl, p.send_msg, buf_hint);
+    ipc_send_msg_full(&pl, p.send_msg, buf_hint);
 }
 
 void xniff_emit_mach_msg2_exit(uint64_t ret, const uint64_t args[8]) {
@@ -502,9 +503,9 @@ void xniff_emit_mach_msg2_exit(uint64_t ret, const uint64_t args[8]) {
         return;
     }
 
-    xniff_ipc_mach_payload_t pl = {0};
+    xniff_mach_payload_t pl = {0};
     pl.api = XNIFF_API_MACH_MSG2;
-    pl.direction = XNIFF_DIR_EXIT;
+    pl.direction = XNIFF_DIRECTION_EXIT;
     pl.option_lo = (uint32_t)(p.option64 & 0xffffffffu);
     pl.option_hi = (uint32_t)(p.option64 >> 32);
     pl.timeout = p.timeout;
@@ -513,7 +514,7 @@ void xniff_emit_mach_msg2_exit(uint64_t ret, const uint64_t args[8]) {
     pl.aux_addr = (uint64_t)(uintptr_t)p.aux;
     pl.ret_value = ret;
     for (int i = 0; i < 8; i++) pl.args[i] = args[i];
-    ipc_send_msg_full(XNIFF_EVT_MACH2_EXIT, &pl, out_msg, out_hint);
+    ipc_send_msg_full(&pl, out_msg, out_hint);
 }
 
 // Legacy trampoline hook entrypoints removed (Frida Gum handles interception).

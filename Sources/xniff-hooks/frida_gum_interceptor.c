@@ -13,11 +13,11 @@
 #include <xpc/xpc.h>
 
 #include "xniff_hooks_emit.h"
-#include "xniff_hooks_ipc.h"
 #include "xpc_reply_tracker.h"
 #include "xpc_session_coalescer.h"
-#include "../shared/xniff_ipc.h"
-#include "../shared/xniff_ipc_v2.h"
+#include "../shared/xniff_payload.h"
+#include "../shared/xniff_transport.h"
+#include "../shared/xniff_record.h"
 
 typedef struct _XniffListener XniffListener;
 typedef enum _XniffHookId XniffHookId;
@@ -156,17 +156,17 @@ static void xniff_hooks_debug_log(const char *fmt, ...) {
   size_t msg_len = (size_t)n;
   if (msg_len >= sizeof(line)) msg_len = sizeof(line) - 1;
 
-  xniff_ipc_v2_builder_t b;
-  xniff_ipc_v2_builder_init(&b);
-  if (xniff_ipc_v2_begin(&b,
-                         XNIFF_V2_ENTRY_DIAG,
+  xniff_record_builder_t b;
+  xniff_record_builder_init(&b);
+  if (xniff_record_begin(&b,
+                         XNIFF_RECORD_TYPE_DIAG,
                          (uint32_t)getpid(),
                          (uint32_t)(uintptr_t)pthread_self(),
                          0,
                          0,
                          XNIFF_API_DEBUG,
                          0) == 0) {
-    xniff_ipc_v2_diag_t d = {0};
+    xniff_diagnostic_section_t d = {0};
     d.msg_len = (uint32_t)msg_len;
     d.level = 0;
     size_t sec_len = sizeof(d) + msg_len;
@@ -174,12 +174,12 @@ static void xniff_hooks_debug_log(const char *fmt, ...) {
     if (sec) {
       memcpy(sec, &d, sizeof(d));
       if (msg_len != 0) memcpy(sec + sizeof(d), line, msg_len);
-      (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_HOOK_DIAG, 0, sec, sec_len);
+      (void)xniff_record_add_section(&b, XNIFF_SECTION_HOOK_DIAG, 0, sec, sec_len);
       free(sec);
-      (void)xniff_ipc_v2_write(&b);
+      (void)xniff_hooks_write_record(&b);
     }
   }
-  xniff_ipc_v2_builder_free(&b);
+  xniff_record_builder_free(&b);
 }
 
 static void xniff_suspend_all_other_threads(void) {
@@ -425,12 +425,12 @@ static void xniff_listener_on_enter(GumInvocationListener *listener, GumInvocati
       break;
     case XNIFF_HOOK_XPC_CONNECTION_CANCEL:
       xniff_emit_xpc_connection_lifecycle(
-          XNIFF_XPC_FUNC_CONNECTION_CANCEL, XNIFF_DIR_ENTRY, 0, args,
+          XNIFF_XPC_FUNC_CONNECTION_CANCEL, XNIFF_DIRECTION_ENTRY, 0, args,
           XNIFF_XPC_OBJECT_CANCELLED);
       break;
     case XNIFF_HOOK_XPC_SESSION_CANCEL:
       xniff_emit_xpc_session_lifecycle(
-          XNIFF_XPC_FUNC_SESSION_CANCEL, XNIFF_DIR_ENTRY, 0, args,
+          XNIFF_XPC_FUNC_SESSION_CANCEL, XNIFF_DIRECTION_ENTRY, 0, args,
           XNIFF_XPC_OBJECT_CANCELLED);
       break;
     case XNIFF_HOOK_XPC_CONNECTION_CREATE_FROM_ENDPOINT:
@@ -564,17 +564,17 @@ static void xniff_listener_on_leave(GumInvocationListener *listener, GumInvocati
       break;
     case XNIFF_HOOK_XPC_CONNECTION_ACTIVATE:
       xniff_emit_xpc_connection_lifecycle(
-          XNIFF_XPC_FUNC_CONNECTION_ACTIVATE, XNIFF_DIR_EXIT, ret, args,
+          XNIFF_XPC_FUNC_CONNECTION_ACTIVATE, XNIFF_DIRECTION_EXIT, ret, args,
           XNIFF_XPC_OBJECT_OBSERVED);
       break;
     case XNIFF_HOOK_XPC_CONNECTION_RESUME:
       xniff_emit_xpc_connection_lifecycle(
-          XNIFF_XPC_FUNC_CONNECTION_RESUME, XNIFF_DIR_EXIT, ret, args,
+          XNIFF_XPC_FUNC_CONNECTION_RESUME, XNIFF_DIRECTION_EXIT, ret, args,
           XNIFF_XPC_OBJECT_OBSERVED);
       break;
     case XNIFF_HOOK_XPC_SESSION_ACTIVATE:
       xniff_emit_xpc_session_lifecycle(
-          XNIFF_XPC_FUNC_SESSION_ACTIVATE, XNIFF_DIR_EXIT, ret, args,
+          XNIFF_XPC_FUNC_SESSION_ACTIVATE, XNIFF_DIRECTION_EXIT, ret, args,
           XNIFF_XPC_OBJECT_OBSERVED);
       break;
     case XNIFF_HOOK_XPC_CONNECTION_CANCEL:
@@ -928,7 +928,7 @@ static void xniff_install_hooks_once(void) {
 }
 
 __attribute__((constructor)) static void xniff_frida_gum_ctor(void) {
-  (void)xniff_ipc_transport_configure_from_environment();
+  (void)xniff_transport_configure_from_environment();
   xniff_hooks_set_streaming_enabled(false);
   xniff_suspend_all_other_threads();
   (void)pthread_once(&g_once, xniff_install_hooks_once);

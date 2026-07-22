@@ -6,10 +6,10 @@
 
 #include <mach/mach.h>
 
-#include "../shared/xniff_ipc.h"
+#include "../shared/xniff_transport.h"
 
 typedef struct {
-    xniff_ipc_ring_t *ring;
+    xniff_ring_t *ring;
     size_t ring_size;
     int ring_fd;
     int wake_read_fd;
