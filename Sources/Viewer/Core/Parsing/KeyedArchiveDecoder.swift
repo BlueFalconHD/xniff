@@ -261,6 +261,20 @@ public enum EmbeddedPayloadDecoder {
         let offset = sourceOffset ?? 0
 
         if data.starts(with: Data("bplist".utf8)) {
+            if data.starts(with: Data("bplist15".utf8)) {
+                let label = String(format: "Binary property list v15 at 0x%X", offset)
+                do {
+                    let decoded = try BPlist15Decoder.decode(data, sourceOffset: offset)
+                    return .object(type: label, fields: [
+                        TraceField(name: "Decoded value", value: decoded)
+                    ])
+                } catch {
+                    return .object(type: label, fields: [
+                        TraceField(name: "Decode error", value: .error(error.localizedDescription))
+                    ])
+                }
+            }
+
             if data.starts(with: Data("bplist17".utf8)) {
                 let label = String(format: "Binary property list v17 at 0x%X", offset)
                 do {
