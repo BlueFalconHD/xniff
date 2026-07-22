@@ -237,22 +237,28 @@ public struct TraceCall: Sendable, Identifiable, Hashable {
 
     public var request: TraceEvent? {
         if let traffic = events.first(where: { [.request, .incoming, .oneWay].contains($0.role) }) {
-            return traffic
+            return mergingCallMetadata(into: traffic)
         }
         if events.first?.api != .xpc || events.contains(where: { $0.role == .metadata }) {
-            return events.first { $0.direction == .entry } ?? events.first
+            return (events.first { $0.direction == .entry } ?? events.first)
+                .map(mergingCallMetadata)
         }
         return nil
     }
 
     public var response: TraceEvent? {
+        if request.map(isSessionEvent) == true,
+           let sessionResponse = events.first(where: { $0.role == .response && isSessionEvent($0) }) {
+            return mergingCallMetadata(into: sessionResponse)
+        }
         if let response = events.first(where: { $0.role == .response }) {
-            return response
+            return mergingCallMetadata(into: response)
         }
         if let request, [.incoming, .oneWay].contains(request.role) {
             return nil
         }
         return events.last { $0.direction == .exit && $0.id != request?.id }
+            .map(mergingCallMetadata)
     }
 
     public var primaryEvent: TraceEvent { request ?? response ?? events[0] }
@@ -270,6 +276,39 @@ public struct TraceCall: Sendable, Identifiable, Hashable {
     public var isComplete: Bool { response != nil }
     public var searchableText: String {
         events.map(\.searchableText).joined(separator: " ")
+    }
+
+    private func isSessionEvent(_ event: TraceEvent) -> Bool {
+        event.api == .xpc && (9...11).contains(event.function)
+    }
+
+    private func mergingCallMetadata(into event: TraceEvent) -> TraceEvent {
+        let peerProcessID = event.peerProcessID ?? events.lazy.compactMap(\.peerProcessID).first
+        let serviceName = event.serviceName ?? events.lazy.compactMap(\.serviceName).first
+        guard peerProcessID != event.peerProcessID || serviceName != event.serviceName else {
+            return event
+        }
+        return TraceEvent(
+            id: event.id,
+            sequence: event.sequence,
+            processID: event.processID,
+            threadID: event.threadID,
+            timestampNanoseconds: event.timestampNanoseconds,
+            relativeSeconds: event.relativeSeconds,
+            api: event.api,
+            direction: event.direction,
+            function: event.function,
+            functionName: event.functionName,
+            role: event.role,
+            callID: event.callID,
+            peerProcessID: peerProcessID,
+            serviceName: serviceName,
+            returnValue: event.returnValue,
+            arguments: event.arguments,
+            payloads: event.payloads,
+            backtrace: event.backtrace,
+            summary: event.summary
+        )
     }
 }
 

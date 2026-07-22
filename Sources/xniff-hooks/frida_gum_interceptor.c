@@ -15,6 +15,7 @@
 #include "xniff_hooks_emit.h"
 #include "xniff_hooks_ipc.h"
 #include "xpc_reply_tracker.h"
+#include "xpc_session_coalescer.h"
 #include "../shared/xniff_ipc.h"
 #include "../shared/xniff_ipc_v2.h"
 
@@ -116,6 +117,7 @@ typedef struct {
   uint64_t call_id;
   uint64_t parent_call_id;
   void *replacement_block;
+  xniff_xpc_session_scope_t session_scope;
   uint8_t emit_enabled;
   uint8_t tracks_async_reply;
 } XniffInvocationData;
@@ -300,6 +302,18 @@ static void xniff_leave_async_reply_scope(XniffInvocationData *inv) {
   inv->tracks_async_reply = 0;
 }
 
+static bool xniff_hook_is_connection_send(XniffHookId hook_id) {
+  return hook_id == XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE ||
+         hook_id == XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE_WITH_REPLY ||
+         hook_id == XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE_WITH_REPLY_SYNC;
+}
+
+static bool xniff_hook_is_session_send(XniffHookId hook_id) {
+  return hook_id == XNIFF_HOOK_XPC_SESSION_SEND_MESSAGE ||
+         hook_id == XNIFF_HOOK_XPC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC ||
+         hook_id == XNIFF_HOOK_XPC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC;
+}
+
 static void xniff_listener_on_enter(GumInvocationListener *listener, GumInvocationContext *ic) {
   (void)listener;
   XniffHookId hook_id = (XniffHookId)GPOINTER_TO_SIZE(gum_invocation_context_get_listener_function_data(ic));
@@ -310,6 +324,7 @@ static void xniff_listener_on_enter(GumInvocationListener *listener, GumInvocati
     inv->emit_enabled = enabled ? 1u : 0u;
     inv->call_id = 0;
     inv->replacement_block = NULL;
+    inv->session_scope = (xniff_xpc_session_scope_t){0};
     inv->tracks_async_reply = 0;
   }
   if (!enabled) return;
@@ -326,8 +341,17 @@ static void xniff_listener_on_enter(GumInvocationListener *listener, GumInvocati
   }
 
   uint64_t pending_reply_call_id = 0;
+  uint64_t session_call_id = 0;
   if (inv != NULL) {
-    if ((hook_id == XNIFF_HOOK_XPC_DICTIONARY_SEND_REPLY ||
+    if (xniff_hook_is_connection_send(hook_id) &&
+        inv->parent_call_id != 0 &&
+        xniff_xpc_session_scope_match(inv->args[1], &session_call_id) &&
+        session_call_id == inv->parent_call_id) {
+      // XPCSession is implemented in terms of an XPC connection. Give both
+      // layers one call ID so consumers can retain the session backtrace and
+      // the inner connection metadata without presenting duplicate calls.
+      inv->call_id = session_call_id;
+    } else if ((hook_id == XNIFF_HOOK_XPC_DICTIONARY_SEND_REPLY ||
          hook_id == XNIFF_HOOK_XPC_CONNECTION_PACK_MESSAGE) &&
         inv->parent_call_id != 0) {
       inv->call_id = inv->parent_call_id;
@@ -341,6 +365,9 @@ static void xniff_listener_on_enter(GumInvocationListener *listener, GumInvocati
         xniff_internal_reply_hooks_ready()) {
       g_async_connection_send_depth++;
       inv->tracks_async_reply = 1;
+    }
+    if (xniff_hook_is_session_send(hook_id)) {
+      xniff_xpc_session_scope_enter(&inv->session_scope, inv->call_id, inv->args[1]);
     }
   }
 
@@ -427,12 +454,14 @@ static void xniff_listener_on_leave(GumInvocationListener *listener, GumInvocati
   XniffInvocationData *inv = GUM_IC_GET_INVOCATION_DATA(ic, XniffInvocationData);
   if (inv != NULL && inv->emit_enabled == 0) {
     xniff_leave_async_reply_scope(inv);
+    xniff_xpc_session_scope_leave(&inv->session_scope);
     return;
   }
   if (!xniff_hook_capture_enabled(hook_id)) {
     xniff_release_reply_wrapper(inv);
     xniff_leave_async_reply_scope(inv);
     xniff_hooks_set_current_call_id(inv != NULL ? inv->parent_call_id : 0);
+    if (inv != NULL) xniff_xpc_session_scope_leave(&inv->session_scope);
     return;
   }
   const uint64_t *args = (inv != NULL) ? inv->args : NULL;
@@ -498,6 +527,7 @@ static void xniff_listener_on_leave(GumInvocationListener *listener, GumInvocati
   xniff_hooks_set_current_call_id(inv != NULL ? inv->parent_call_id : 0);
   xniff_release_reply_wrapper(inv);
   xniff_leave_async_reply_scope(inv);
+  if (inv != NULL) xniff_xpc_session_scope_leave(&inv->session_scope);
 }
 
 static void xniff_listener_class_init(XniffListenerClass *klass) {
