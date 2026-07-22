@@ -51,3 +51,5 @@ to view in the terminal:
 ```sh
 build/xniff-print /tmp/out.xniff
 ```
+
+![xniff demo](Resources/demo.png)
