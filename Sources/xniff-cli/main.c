@@ -33,6 +33,7 @@
 #include "cli_options.h"
 #include "embedded_hooks.h"
 #include "launch_environment.h"
+#include "target_identity.h"
 // XPC wire parser (shared library)
 #include "../xpcdesert/xpcdesert.h"
 
@@ -190,7 +191,8 @@ static int stage_dylib_for_sandbox(const char *src_abs_path,
 
 static int install_hooks(pid_t pid, const char *dylib_path, int mode);
 static int cmd_attach(pid_t pid, const char *dylib_path, int mode);
-static int cmd_launch(const char *dylib_path, int mode, char *const launch_argv[]);
+static int cmd_launch(const char *dylib_path, int mode, const char *target_user,
+                      char *const launch_argv[]);
 
 int main(int argc, char **argv) {
     xniff_cli_options_t options;
@@ -217,7 +219,7 @@ int main(int argc, char **argv) {
             rc = cmd_attach(options.pid, hooks_path, options.capture_mode);
             break;
         case XNIFF_CLI_LAUNCH:
-            rc = cmd_launch(hooks_path, options.capture_mode,
+            rc = cmd_launch(hooks_path, options.capture_mode, options.target_user,
                             (char *const *)options.launch_argv);
             break;
         default:
@@ -1560,17 +1562,12 @@ static int install_hooks(pid_t pid, const char *dylib_path, int mode) {
 }
 
 static int spawn_suspended_target(char *const launch_argv[], const char *hooks_path,
-                                  int mode, pid_t *out_pid) {
+                                  int mode, const xniff_target_identity_t *identity,
+                                  pid_t *out_pid) {
     if (!launch_argv || !launch_argv[0] || !hooks_path || !out_pid) {
         errno = EINVAL;
         return -1;
     }
-    xniff_launch_environment_t launch_environment;
-    if (xniff_launch_environment_create(hooks_path, mode, &launch_environment) != 0) {
-        errno = ENOMEM;
-        return -1;
-    }
-
     pid_t pid = fork();
     if (pid == 0) {
         /*
@@ -1579,12 +1576,21 @@ static int spawn_suspended_target(char *const launch_argv[], const char *hooks_p
          * marks the child debugged before exec and stops it at the exec trap,
          * so dyld accepts the injected hooks while main is still unreachable.
          */
+        if (identity && xniff_target_identity_apply(identity) != 0) {
+            fprintf(stderr, "launch: failed to become %s (%u:%u): %s\n",
+                    identity->name, (unsigned int)identity->uid,
+                    (unsigned int)identity->gid, strerror(errno));
+            _exit(126);
+        }
+        xniff_launch_environment_t launch_environment;
+        if (xniff_launch_environment_create(hooks_path, mode, &launch_environment) != 0) {
+            _exit(126);
+        }
         if (ptrace(PT_TRACE_ME, 0, 0, 0) != 0) _exit(126);
         environ = launch_environment.values;
         execvp(launch_argv[0], launch_argv);
         _exit(errno == ENOENT ? 127 : 126);
     }
-    xniff_launch_environment_destroy(&launch_environment);
     if (pid < 0) return -1;
 
     int status = 0;
@@ -1711,9 +1717,22 @@ static int cmd_attach(pid_t pid, const char *dylib_path, int mode) {
     return capture_attached_process(pid, dylib_path, mode, false, false, false);
 }
 
-static int cmd_launch(const char *dylib_path, int mode, char *const launch_argv[]) {
+static int cmd_launch(const char *dylib_path, int mode, const char *target_user,
+                      char *const launch_argv[]) {
+    xniff_target_identity_t identity;
+    xniff_target_identity_t *identity_ptr = NULL;
+    if (target_user) {
+        if (xniff_target_identity_resolve(target_user, &identity) != 0) {
+            fprintf(stderr, "launch: failed to resolve target user '%s': %s\n",
+                    target_user, strerror(errno));
+            return -1;
+        }
+        identity_ptr = &identity;
+        XNIFF_DIAGF("launch: target user %s (%u:%u)\n", identity.name,
+                    (unsigned int)identity.uid, (unsigned int)identity.gid);
+    }
     pid_t pid = 0;
-    if (spawn_suspended_target(launch_argv, dylib_path, mode, &pid) != 0) {
+    if (spawn_suspended_target(launch_argv, dylib_path, mode, identity_ptr, &pid) != 0) {
         fprintf(stderr, "launch: failed to spawn suspended target '%s': %s\n",
                 launch_argv && launch_argv[0] ? launch_argv[0] : "(null)", strerror(errno));
         return -1;

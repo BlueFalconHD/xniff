@@ -55,6 +55,12 @@ static int parse_flags(int argc, char **argv, int start, int end,
             options->listener.out_bin = true;
             snprintf(options->listener.out_bin_path,
                      sizeof(options->listener.out_bin_path), "%s", argv[i]);
+        } else if (strcmp(arg, "--target-user") == 0) {
+            if (++i >= end) {
+                fprintf(stderr, "--target-user requires sudo, a user name, or a numeric uid\n");
+                return -1;
+            }
+            options->target_user = argv[i];
         } else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
             return 1;
         } else {
@@ -74,6 +80,7 @@ void xniff_cli_usage(const char *program) {
     fprintf(stderr, "  --xpc              Capture high-level XPC calls\n");
     fprintf(stderr, "  --hooks <path>     Override the hooks embedded in xniff-cli\n");
     fprintf(stderr, "  --out <path>       Write an xniff dump\n");
+    fprintf(stderr, "  --target-user <u>  Launch target as sudo's caller, a user name, or a uid\n");
 }
 
 int xniff_cli_parse(int argc, char **argv, xniff_cli_options_t *options) {
@@ -108,5 +115,10 @@ int xniff_cli_parse(int argc, char **argv, xniff_cli_options_t *options) {
         return -1;
     }
 
-    return parse_flags(argc, argv, flags_start, flags_end, options);
+    int result = parse_flags(argc, argv, flags_start, flags_end, options);
+    if (result == 0 && options->command != XNIFF_CLI_LAUNCH && options->target_user) {
+        fprintf(stderr, "--target-user is only valid with launch\n");
+        return -1;
+    }
+    return result;
 }

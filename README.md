@@ -31,6 +31,16 @@ sudo build/xniff-cli launch --xpc --out /tmp/screentime.xniff -- \
   inspect --verbose
 ```
 
+Keep xniff privileged while running the target as the user who invoked `sudo`:
+
+```sh
+sudo build/xniff-cli launch --target-user sudo --xpc --out /tmp/app.xniff -- \
+  /path/to/program
+```
+
+`--target-user` also accepts a user name or numeric uid. The privileged listener
+still reads the target's ring buffer; only the target drops credentials.
+
 Attach to an existing process and capture Mach messages:
 
 ```sh

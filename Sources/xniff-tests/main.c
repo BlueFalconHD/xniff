@@ -9,6 +9,9 @@
 #include "../shared/xniff_ipc_v2.h"
 #include "xpc_reply_tracker.h"
 
+int selftest_target_user_options(void);
+int selftest_target_identity(void);
+
 static int selftest_ipc_ring(void) {
     const uint8_t payload[] = {0xde, 0xad, 0xbe, 0xef, 0x42};
 
@@ -155,6 +158,8 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--ipc-drop") == 0) return selftest_ipc_drop();
         if (strcmp(argv[i], "--v2-call-id") == 0) return selftest_v2_call_id();
         if (strcmp(argv[i], "--xpc-reply-tracker") == 0) return selftest_xpc_reply_tracker();
+        if (strcmp(argv[i], "--target-user-options") == 0) return selftest_target_user_options();
+        if (strcmp(argv[i], "--target-identity") == 0) return selftest_target_identity();
     }
 
     printf("xniff-test: no tests selected (try --ipc-ring)\n");

@@ -24,6 +24,7 @@ typedef struct {
     xniff_cli_command_t command;
     pid_t pid;
     const char *hooks_path;
+    const char *target_user;
     char *const *launch_argv;
     int capture_mode;
     listener_opts_t listener;
