@@ -94,11 +94,15 @@ understood are labeled as opaque rather than presented as a successful decode.
 Right-click any decoded tree item to copy its value, its complete textual tree,
 or its source bytes as hex. **View in _parent_** steps down one inspector layer
 and highlights the closest source node; following the chain eventually reaches
-the highlighted bytes in Hex. See [Viewer/INSPECTORS.md](Viewer/INSPECTORS.md)
-for the API used to add another layered body inspector or Core Data operation.
+the highlighted bytes in Hex. New layers implement `TraceBodyInspector` and are
+registered in `BodyInspectorRegistry`.
 
 For terminal inspection, use:
 
 ```sh
-python3 scripts/print_xpc.py /tmp/screentime.xniff
+build/xniff-print /tmp/screentime.xniff
 ```
+
+The terminal printer and native viewer share the same parser and layered body
+inspectors, so Foundation NSXPC, Swift XPC Codable, and Core Data output stays
+consistent between them. Run `build/xniff-print --help` for filtering options.

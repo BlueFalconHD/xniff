@@ -10,6 +10,7 @@ SWIFT_MODULECACHE_PATH="$xniff_swift_cache" \
 CLANG_MODULE_CACHE_PATH="$xniff_swift_cache" \
 swift build --disable-sandbox --package-path Viewer -c release
 cp Viewer/.build/release/xniff-viewer build/xniff-viewer
+cp Viewer/.build/release/xniff-print build/xniff-print
 xniff_viewer_app="build/xniff-viewer.app"
 mkdir -p "$xniff_viewer_app/Contents/MacOS"
 cp Viewer/.build/release/xniff-viewer "$xniff_viewer_app/Contents/MacOS/xniff-viewer"

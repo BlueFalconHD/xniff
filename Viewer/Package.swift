@@ -8,11 +8,16 @@ let package = Package(
     products: [
         .library(name: "XniffViewerCore", targets: ["XniffViewerCore"]),
         .executable(name: "xniff-viewer", targets: ["XniffViewer"]),
+        .executable(name: "xniff-print", targets: ["XniffPrint"]),
     ],
     targets: [
         .target(name: "XniffViewerCore"),
         .executableTarget(
             name: "XniffViewer",
+            dependencies: ["XniffViewerCore"]
+        ),
+        .executableTarget(
+            name: "XniffPrint",
             dependencies: ["XniffViewerCore"]
         ),
         .testTarget(
@@ -22,6 +27,10 @@ let package = Package(
         .testTarget(
             name: "XniffViewerTests",
             dependencies: ["XniffViewer"]
+        ),
+        .testTarget(
+            name: "XniffPrintTests",
+            dependencies: ["XniffPrint"]
         ),
     ]
 )
