@@ -87,9 +87,6 @@ int xniff_cli_parse(int argc, char **argv, xniff_cli_options_t *options) {
     if (!options || argc < 2) return -1;
     memset(options, 0, sizeof(*options));
     options->capture_mode = XNIFF_CAPTURE_MODE_MACH;
-    options->listener.dump_files = false;
-    options->listener.parse_xpc = true;
-    options->listener.hex_preview_len = 64;
 
     const char *command = argv[1];
     int flags_start = 0;

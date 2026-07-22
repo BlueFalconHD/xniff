@@ -90,6 +90,8 @@ static void free_image_cache(image_cache_t *ic) {
     if (!ic) return;
     free(ic->strtab); ic->strtab = NULL; ic->strsize = 0;
     free(ic->syms);   ic->syms = NULL;   ic->nsyms = 0;
+    free(ic->exports); ic->exports = NULL; ic->exports_size = 0;
+    ic->exports_off = 0; ic->have_exports = 0;
     ic->initialized = 0;
 }
 
@@ -112,6 +114,18 @@ static task_cache_t* ensure_task_cache(mach_port_t task) {
     memset(tc, 0, sizeof(*tc));
     tc->task = task;
     return tc;
+}
+
+void xniff_release_task_cache(mach_port_t task) {
+    for (size_t index = 0; index < g_tasks_count; index++) {
+        if (g_tasks[index].task != task) continue;
+        free_task_cache(&g_tasks[index]);
+        size_t last = g_tasks_count - 1;
+        if (index != last) g_tasks[index] = g_tasks[last];
+        memset(&g_tasks[last], 0, sizeof(g_tasks[last]));
+        g_tasks_count--;
+        return;
+    }
 }
 
 static image_cache_t* find_image_cache(task_cache_t *tc, mach_vm_address_t header) {

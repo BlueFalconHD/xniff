@@ -185,6 +185,12 @@ static int selftest_xpc_reply_tracker(void) {
                   xniff_xpc_reply_tracker_take(context, &actual) &&
                   actual == 18 &&
                   !xniff_xpc_reply_tracker_take(context, &actual);
+    for (uint64_t index = 1; passed && index <= 9000; index++) {
+        passed = xniff_xpc_reply_tracker_record(index << 12, index);
+    }
+    passed = passed &&
+             xniff_xpc_reply_tracker_take(9000ull << 12, &actual) &&
+             actual == 9000;
     xniff_xpc_reply_tracker_clear();
     if (!passed) {
         fprintf(stderr, "FAIL: XPC reply tracker did not preserve and consume correlation\n");

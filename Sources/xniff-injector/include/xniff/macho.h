@@ -24,6 +24,9 @@ int xniff_find_symbol_in_image_exact_path(mach_port_t task,
                                           const char *symbol,
                                           mach_vm_address_t *out_addr);
 
+/* Release cached image and symbol data before discarding a task right. */
+void xniff_release_task_cache(mach_port_t task);
+
 /* Unconditionally print all dyld images in the target task (index, header, slide, type, path). */
 int xniff_dump_task_images(mach_port_t task);
 

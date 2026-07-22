@@ -18,6 +18,7 @@
 #include "../shared/xniff_ipc.h"
 #include "../shared/xniff_ipc_v2.h"
 #include "xniff_hooks_emit.h"
+#include "xniff_hooks_backtrace.h"
 
 enum {
     XNIFF_XPC_STR_MAX = 16384u,
@@ -157,86 +158,6 @@ static inline uint32_t xniff_strnlen_u32(const char *s, uint32_t maxlen) {
     if (!s) return 0;
     size_t n = strnlen(s, (size_t)maxlen);
     return (uint32_t)n;
-}
-
-static void xniff_add_backtrace_section(xniff_ipc_v2_builder_t *b) {
-    if (!b || !xniff_hooks_backtrace_is_enabled()) return;
-    xniff_ipc_v2_backtrace_t bt;
-    xniff_ipc_v2_backtrace_symbols_hdr_t sh;
-    xniff_ipc_v2_backtrace_symbol_t syms[XNIFF_V2_BACKTRACE_MAX_FRAMES];
-    const char *names[XNIFF_V2_BACKTRACE_MAX_FRAMES] = {0};
-    const char *images[XNIFF_V2_BACKTRACE_MAX_FRAMES] = {0};
-    void *captured[XNIFF_V2_BACKTRACE_MAX_FRAMES] = {0};
-    uint32_t captured_count = 0;
-
-    memset(&bt, 0, sizeof(bt));
-    memset(&sh, 0, sizeof(sh));
-    memset(syms, 0, sizeof(syms));
-
-    void *frames[XNIFF_V2_BACKTRACE_MAX_FRAMES + 8u] = {0};
-    int n = backtrace(frames, (int)(sizeof(frames) / sizeof(frames[0])));
-    if (n <= 0) return;
-
-    int skip = 2; // xniff_add_backtrace_section + immediate sender
-    for (int i = skip; i < n && bt.count < XNIFF_V2_BACKTRACE_MAX_FRAMES; i++) {
-        void *pc = frames[i];
-        captured[bt.count] = pc;
-        bt.pcs[bt.count++] = (uint64_t)(uintptr_t)pc;
-    }
-    captured_count = bt.count;
-    if (captured_count == 0) return;
-
-    (void)xniff_ipc_v2_add_section(b, XNIFF_V2_SEC_BACKTRACE, 0, &bt, sizeof(bt));
-
-    bool have_symbol_data = false;
-    sh.count = captured_count;
-    for (uint32_t i = 0; i < captured_count; i++) {
-        Dl_info info;
-        memset(&info, 0, sizeof(info));
-
-        syms[i].pc = (uint64_t)(uintptr_t)captured[i];
-        if (dladdr(captured[i], &info) == 0) continue;
-
-        if (info.dli_saddr) {
-            syms[i].sym_addr = (uint64_t)(uintptr_t)info.dli_saddr;
-            have_symbol_data = true;
-        }
-        if (info.dli_sname) {
-            syms[i].name_len = (uint32_t)strnlen(info.dli_sname, 255u);
-            names[i] = info.dli_sname;
-            if (syms[i].name_len != 0) have_symbol_data = true;
-        }
-        if (info.dli_fname) {
-            syms[i].image_len = (uint32_t)strnlen(info.dli_fname, 255u);
-            images[i] = info.dli_fname;
-            if (syms[i].image_len != 0) have_symbol_data = true;
-        }
-        sh.strings_len += syms[i].name_len + syms[i].image_len;
-    }
-
-    if (!have_symbol_data) return;
-
-    size_t sec_len = sizeof(sh) +
-                     ((size_t)captured_count * sizeof(syms[0])) +
-                     (size_t)sh.strings_len;
-    uint8_t *sec = (uint8_t *)malloc(sec_len);
-    if (!sec) return;
-
-    memcpy(sec, &sh, sizeof(sh));
-    memcpy(sec + sizeof(sh), syms, (size_t)captured_count * sizeof(syms[0]));
-    size_t off = sizeof(sh) + ((size_t)captured_count * sizeof(syms[0]));
-    for (uint32_t i = 0; i < captured_count; i++) {
-        if (syms[i].name_len != 0 && names[i]) {
-            memcpy(sec + off, names[i], syms[i].name_len);
-            off += syms[i].name_len;
-        }
-        if (syms[i].image_len != 0 && images[i]) {
-            memcpy(sec + off, images[i], syms[i].image_len);
-            off += syms[i].image_len;
-        }
-    }
-    (void)xniff_ipc_v2_add_section(b, XNIFF_V2_SEC_BACKTRACE_SYMBOLS, 0, sec, off);
-    free(sec);
 }
 
 static void xniff_xpc_serial_blob_free(xniff_xpc_serial_blob_t *b) {
@@ -383,7 +304,7 @@ static void ipc_send_xpc_event_ex(
     if (call_id != 0) {
         (void)xniff_ipc_v2_add_section(&b, XNIFF_V2_SEC_CALL_ID, 0, &call_id, sizeof(call_id));
     }
-    xniff_add_backtrace_section(&b);
+    xniff_hooks_add_backtrace(&b);
 
     for (size_t i = 0; i < serial_blob_count; i++) {
         const xniff_xpc_serial_blob_t *sb = &serial_blobs[i];

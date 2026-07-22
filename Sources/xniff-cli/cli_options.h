@@ -6,12 +6,8 @@
 #include <sys/types.h>
 
 typedef struct {
-    bool dump_files;
-    bool parse_xpc;
-    bool xpc_only;
     bool out_bin;
     char out_bin_path[PATH_MAX];
-    size_t hex_preview_len;
 } listener_opts_t;
 
 typedef enum {

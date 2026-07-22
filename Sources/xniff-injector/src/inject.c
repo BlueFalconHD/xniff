@@ -143,11 +143,11 @@ int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path,
   const char *libpth_exact = PATH_LIBSYS_PTHREAD_EXACT;
   const char *libpth_sub = PATH_LIBSYS_PTHREAD_SUB;
 
-  // look for pthread_exit
-  // if not found, we can proceed without it and instead just infinite loop in the stub
-  if (xniff_resolve_symbol_flexible(task, libpth_exact, libpth_sub, "_pthread_exit",
-                                    &pthr_exit_addr) != 0) {
-    pthr_exit_addr = 0;
+  // The injection stub calls pthread_exit unconditionally after dlopen.
+  if (xniff_wait_for_symbol_flexible(task, libpth_exact, libpth_sub,
+                                     "_pthread_exit", &pthr_exit_addr) != 0) {
+    fprintf(stderr, "could not resolve pthread_exit in target\n");
+    return -1;
   }
 
   // allocate a stack for the remote thread
@@ -302,6 +302,8 @@ int xniff_inject_dylib_task(mach_port_t task, const char *dylib_path,
     fprintf(stderr, "thread_create_running: %d (%s)\n", kr, mach_error_string(kr));
     goto fail_code;
   }
+
+  (void)mach_port_deallocate(mach_task_self(), th);
 
 
   if (out_handle)
