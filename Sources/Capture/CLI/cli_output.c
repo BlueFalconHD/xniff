@@ -5,6 +5,14 @@
 #include <strings.h>
 #include <unistd.h>
 
+#ifndef XNIFF_VERSION
+#define XNIFF_VERSION "unknown"
+#endif
+
+enum {
+    XNIFF_OUTPUT_LABEL_WIDTH = 12,
+};
+
 typedef enum {
     XNIFF_OUTPUT_STYLE_INFO,
     XNIFF_OUTPUT_STYLE_SUCCESS,
@@ -66,7 +74,7 @@ static const char *style_sequence(xniff_output_style_t style) {
         case XNIFF_OUTPUT_STYLE_ERROR:
             return "\033[1;31m";
         case XNIFF_OUTPUT_STYLE_DETAIL:
-            return "\033[2m";
+            return "\033[1;35m";
     }
     return "";
 }
@@ -77,10 +85,19 @@ static void output_line(xniff_output_style_t style, const char *label,
     vsnprintf(message, sizeof(message), format, arguments);
     bool color = xniff_output_color_enabled(stderr);
     if (color) {
-        fprintf(stderr, "%s%-9s\033[0m%s\n", style_sequence(style), label,
-                message);
+        fprintf(stderr, "%s%-*s\033[0m%s\n", style_sequence(style),
+                XNIFF_OUTPUT_LABEL_WIDTH, label, message);
     } else {
-        fprintf(stderr, "%-9s%s\n", label, message);
+        fprintf(stderr, "%-*s%s\n", XNIFF_OUTPUT_LABEL_WIDTH, label, message);
+    }
+    fflush(stderr);
+}
+
+void xniff_output_banner(void) {
+    if (xniff_output_color_enabled(stderr)) {
+        fprintf(stderr, "\033[1;36mXn👃ff\033[0m v%s\n\n", XNIFF_VERSION);
+    } else {
+        fprintf(stderr, "Xniff v%s\n\n", XNIFF_VERSION);
     }
     fflush(stderr);
 }

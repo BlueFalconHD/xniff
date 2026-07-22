@@ -24,6 +24,10 @@ static int parse_pid(const char *value, pid_t *pid_out) {
     return 0;
 }
 
+static void print_environment_entry(const char *name, const char *description) {
+    fprintf(stderr, "  %-32s %s\n", name, description);
+}
+
 static int parse_flags(int argc, char **argv, int start, int end,
                        xniff_cli_options_t *options) {
     bool saw_mode = false;
@@ -85,9 +89,15 @@ void xniff_cli_usage(const char *program) {
     fprintf(stderr, "  --target-user <u>  Launch target as sudo's caller, a user name, or a uid\n");
     fputc('\n', stderr);
     xniff_output_section(stderr, "Environment");
-    fprintf(stderr, "  XNIFF_COLOR <when>  Color output: auto, always, or never\n");
-    fprintf(stderr, "  NO_COLOR            Disable color output\n");
-    fprintf(stderr, "  XNIFF_VERBOSE=1     Show internal capture details\n");
+    print_environment_entry("XNIFF_BACKTRACE=1", "Capture backtraces");
+    print_environment_entry("XNIFF_HOOKS_DEBUG=1", "Capture hook diagnostics");
+    print_environment_entry("XNIFF_VERBOSE=1", "Show internal capture details");
+    print_environment_entry("XNIFF_COLOR=<when>",
+                            "Color output: auto, always, or never");
+    print_environment_entry("NO_COLOR", "Disable color output");
+    print_environment_entry("CLICOLOR=0", "Disable color output");
+    print_environment_entry("CLICOLOR_FORCE=1", "Force color output");
+    print_environment_entry("FORCE_COLOR=1", "Force color output");
 }
 
 int xniff_cli_parse(int argc, char **argv, xniff_cli_options_t *options) {

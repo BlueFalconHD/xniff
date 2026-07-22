@@ -117,6 +117,8 @@ add_library(xniff-capture-cli-support STATIC
     Sources/Capture/CLI/shared_transport.c
     Sources/Capture/CLI/target_identity.c)
 target_include_directories(xniff-capture-cli-support PUBLIC Sources/Capture/CLI)
+target_compile_definitions(xniff-capture-cli-support PRIVATE
+    XNIFF_VERSION="${PROJECT_VERSION}")
 target_link_libraries(xniff-capture-cli-support PUBLIC xniff-injector xniff-transport)
 xniff_enable_arm64e(xniff-capture-cli-support)
 

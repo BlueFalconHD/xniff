@@ -10,6 +10,8 @@
 #include "process_control.h"
 
 int main(int argc, char **argv) {
+    xniff_output_banner();
+
     xniff_cli_options_t options;
     int parse_result = xniff_cli_parse(argc, argv, &options);
     if (parse_result != 0) {

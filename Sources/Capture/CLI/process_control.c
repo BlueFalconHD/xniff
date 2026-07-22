@@ -337,8 +337,8 @@ static int capture_attached_process(pid_t pid,
     const char *destination = listener_options->out_bin
         ? listener_options->out_bin_path
         : "standard output";
-    xniff_output_status("capture", "%s events → %s", capture_mode_name(mode),
-                        destination);
+    xniff_output_status("capture", "writing %s events to %s",
+                        capture_mode_name(mode), destination);
     xniff_output_success("ready", "listening to pid %d, press Ctrl-C to stop",
                          (int)pid);
     xniff_output_detail("listener", "pid %d", (int)child);
@@ -443,11 +443,11 @@ int xniff_launch(const char *dylib_path, int mode, const char *target_user,
     }
 
     const char *name = command_name(launch_argv[0]);
-    xniff_output_status("launch", "%s (pid %d)", name, (int)pid);
     if (identity_ptr) {
-        xniff_output_status("user", "%s (%u:%u)", identity.name,
-                            (unsigned int)identity.uid,
-                            (unsigned int)identity.gid);
+        xniff_output_status("starting", "%s (%d) as %s (%u)", name, (int)pid,
+                            identity.name, (unsigned int)identity.uid);
+    } else {
+        xniff_output_status("starting", "%s (%d)", name, (int)pid);
     }
     int rc = capture_attached_process(pid, dylib_path, mode, name, true, true,
                                       true, &transport, listener_options);

@@ -7,6 +7,7 @@
 bool xniff_output_color_enabled(FILE *stream);
 bool xniff_output_verbose_enabled(void);
 
+void xniff_output_banner(void);
 void xniff_output_section(FILE *stream, const char *title);
 void xniff_output_status(const char *label, const char *format, ...)
     __attribute__((format(printf, 2, 3)));
