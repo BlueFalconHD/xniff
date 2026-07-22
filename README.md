@@ -36,6 +36,9 @@ existing processes:
 sudo build/xniff attach 1234 --mach --out /tmp/process.xniff
 ```
 
+note that xniff doesn't remove its hooks so if you'd like to reattach xniff
+to a process you need to restart it
+
 ## reading dumps
 
 xniff has both a graphical and command line interface to interact with captured dumps.
