@@ -1,5 +1,4 @@
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -11,7 +10,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -20,6 +18,7 @@
 
 #include "capture.h"
 #include "cli_output.h"
+#include "dylib_staging.h"
 #include "launch_environment.h"
 #include "process_control.h"
 #include "shared_transport.h"
@@ -81,64 +80,6 @@ static void release_task(pid_t pid, mach_port_t task) {
     (void)mach_port_deallocate(mach_task_self(), task);
 }
 
-static int copy_file(const char *source_path, const char *destination_path) {
-    int source = open(source_path, O_RDONLY);
-    if (source < 0) return -1;
-    int destination = open(destination_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
-    if (destination < 0) {
-        close(source);
-        return -1;
-    }
-
-    uint8_t buffer[64 * 1024];
-    int result = 0;
-    for (;;) {
-        ssize_t count = read(source, buffer, sizeof(buffer));
-        if (count == 0) break;
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            result = -1;
-            break;
-        }
-        size_t offset = 0;
-        while (offset < (size_t)count) {
-            ssize_t written = write(destination, buffer + offset,
-                                    (size_t)count - offset);
-            if (written < 0) {
-                if (errno == EINTR) continue;
-                result = -1;
-                break;
-            }
-            offset += (size_t)written;
-        }
-        if (result != 0) break;
-    }
-    if (result == 0) (void)fsync(destination);
-    close(destination);
-    close(source);
-    if (result != 0) (void)unlink(destination_path);
-    return result;
-}
-
-static int stage_dylib(const char *source_path, char *output_path,
-                       size_t output_path_size) {
-    const char *directories[] = {"/tmp", "/private/tmp", "/private/var/tmp"};
-    for (size_t directory = 0;
-         directory < sizeof(directories) / sizeof(directories[0]);
-         directory++) {
-        for (int attempt = 0; attempt < 16; attempt++) {
-            unsigned int salt = arc4random() & 0xffff;
-            int length = snprintf(output_path, output_path_size,
-                                  "%s/xniff-hooks-%d-%u.dylib",
-                                  directories[directory], (int)getpid(), salt);
-            if (length <= 0 || (size_t)length >= output_path_size) continue;
-            if (copy_file(source_path, output_path) == 0) return 0;
-        }
-    }
-    output_path[0] = '\0';
-    return -1;
-}
-
 static int install_hooks(pid_t pid, const char *dylib_path, int mode,
                          xniff_shared_transport_t *transport) {
     mach_port_t task;
@@ -155,7 +96,8 @@ static int install_hooks(pid_t pid, const char *dylib_path, int mode,
 
     char inject_path[PATH_MAX] = {0};
     bool staged_copy =
-        stage_dylib(abs_path, inject_path, sizeof(inject_path)) == 0;
+        xniff_stage_dylib_for_process(pid, abs_path, inject_path,
+                                      sizeof(inject_path)) == 0;
     if (staged_copy) {
         xniff_output_detail("hooks", "staged %s", inject_path);
     } else {

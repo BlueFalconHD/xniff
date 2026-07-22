@@ -113,6 +113,7 @@ xniff_enable_arm64e(xniff-hooks)
 add_library(xniff-capture-cli-support STATIC
     Sources/Capture/CLI/cli_output.c
     Sources/Capture/CLI/cli_options.c
+    Sources/Capture/CLI/dylib_staging.c
     Sources/Capture/CLI/launch_environment.c
     Sources/Capture/CLI/shared_transport.c
     Sources/Capture/CLI/target_identity.c)
@@ -140,6 +141,7 @@ target_link_options(xniff PRIVATE
 
 add_executable(xniff-test
     Tests/Capture/cli_output_test.c
+    Tests/Capture/dylib_staging_test.c
     Tests/Capture/main.c
     Tests/Capture/shared_transport_test.c
     Tests/Capture/target_user_test.c
@@ -159,6 +161,7 @@ add_test(NAME xniff-xpc-session-coalescer COMMAND xniff-test --xpc-session-coale
 add_test(NAME xniff-target-user-options COMMAND xniff-test --target-user-options)
 add_test(NAME xniff-target-identity COMMAND xniff-test --target-identity)
 add_test(NAME xniff-cli-color COMMAND xniff-test --cli-color)
+add_test(NAME xniff-dylib-staging COMMAND xniff-test --dylib-staging)
 
 set(XNIFF_SWIFT_OUTPUTS
     "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/xniff-viewer"
