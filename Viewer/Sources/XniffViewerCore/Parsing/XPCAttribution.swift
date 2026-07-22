@@ -8,7 +8,7 @@ enum XPCAttribution {
     }
 
     private struct Lifetime {
-        var eventIndexes: [Int] = []
+        var pendingEventIndexes: [Int] = []
         var serviceName: String?
     }
 
@@ -19,7 +19,7 @@ enum XPCAttribution {
         func finish(_ key: ObjectKey) {
             guard let lifetime = lifetimes.removeValue(forKey: key),
                   let serviceName = lifetime.serviceName else { return }
-            for index in lifetime.eventIndexes where result[index].serviceName == nil {
+            for index in lifetime.pendingEventIndexes where result[index].serviceName == nil {
                 result[index] = result[index].replacingExactServiceName(serviceName)
             }
         }
@@ -44,9 +44,19 @@ enum XPCAttribution {
                 finish(key)
                 lifetime = Lifetime()
             }
-            lifetime.eventIndexes.append(index)
-            if lifetime.serviceName == nil {
-                lifetime.serviceName = event.serviceName
+            if let serviceName = lifetime.serviceName ?? event.serviceName {
+                lifetime.serviceName = serviceName
+                for pendingIndex in lifetime.pendingEventIndexes
+                    where result[pendingIndex].serviceName == nil {
+                    result[pendingIndex] = result[pendingIndex]
+                        .replacingExactServiceName(serviceName)
+                }
+                lifetime.pendingEventIndexes.removeAll(keepingCapacity: false)
+                if result[index].serviceName == nil {
+                    result[index] = result[index].replacingExactServiceName(serviceName)
+                }
+            } else {
+                lifetime.pendingEventIndexes.append(index)
             }
             lifetimes[key] = lifetime
 

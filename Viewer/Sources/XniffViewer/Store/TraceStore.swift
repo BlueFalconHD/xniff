@@ -50,6 +50,7 @@ final class TraceStore {
     var filter: TraceFilter = .all { didSet { scheduleFilter() } }
 
     @ObservationIgnored private var callsByID: [TraceCallID: TraceCall] = [:]
+    @ObservationIgnored private var callCounts: [TraceFilter: Int] = [:]
     @ObservationIgnored private var loadTask: Task<Void, Never>?
     @ObservationIgnored private var filterTask: Task<Void, Never>?
 
@@ -62,8 +63,7 @@ final class TraceStore {
     }
 
     func count(for filter: TraceFilter) -> Int {
-        guard let calls = document?.calls else { return 0 }
-        return filter == .all ? calls.count : calls.lazy.filter(filter.includes).count
+        callCounts[filter, default: 0]
     }
 
     func chooseFile() {
@@ -85,15 +85,27 @@ final class TraceStore {
         document = nil
         visibleCalls = []
         callsByID = [:]
+        callCounts = [:]
 
         loadTask = Task {
             do {
-                let parsed = try await Task.detached(priority: .userInitiated) {
+                let worker = Task.detached(priority: .userInitiated) {
                     try XniffTraceParser.parse(url: url)
-                }.value
+                }
+                let parsed = try await withTaskCancellationHandler {
+                    try await worker.value
+                } onCancel: {
+                    worker.cancel()
+                }
                 try Task.checkCancellation()
                 document = parsed
                 callsByID = Dictionary(uniqueKeysWithValues: parsed.calls.map { ($0.id, $0) })
+                callCounts = Dictionary(uniqueKeysWithValues: TraceFilter.allCases.map { filter in
+                    let count = filter == .all
+                        ? parsed.calls.count
+                        : parsed.calls.lazy.filter(filter.includes).count
+                    return (filter, count)
+                })
                 isLoading = false
                 scheduleFilter(delay: .zero)
             } catch is CancellationError {
@@ -114,12 +126,25 @@ final class TraceStore {
         filterTask = Task {
             try? await Task.sleep(for: delay)
             guard !Task.isCancelled else { return }
-            let filtered = await Task.detached(priority: .userInitiated) {
-                calls.filter { call in
-                    selectedFilter.includes(call)
-                        && (normalizedQuery.isEmpty || call.searchableText.contains(normalizedQuery))
+            let worker = Task.detached(priority: .userInitiated) {
+                try Task.checkCancellation()
+                var filtered: [TraceCall] = []
+                filtered.reserveCapacity(calls.count)
+                for (index, call) in calls.enumerated() {
+                    if index.isMultiple(of: 256) { try Task.checkCancellation() }
+                    if selectedFilter.includes(call)
+                        && (normalizedQuery.isEmpty || call.searchableText.contains(normalizedQuery)) {
+                        filtered.append(call)
+                    }
                 }
-            }.value
+                return filtered
+            }
+            let filtered = try? await withTaskCancellationHandler {
+                try await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+            guard let filtered else { return }
             guard !Task.isCancelled else { return }
             visibleCalls = filtered
             if let selectedCallID, !filtered.contains(where: { $0.id == selectedCallID }) {

@@ -36,6 +36,7 @@ public enum XniffTraceParser {
         var nextFallbackCallID: UInt64 = 1
 
         while reader.remaining >= 16 {
+            try Task.checkCancellation()
             let recordStart = reader.offset
             let recordLength = Int(try reader.readUInt32())
             _ = try reader.readUInt16() // entry type

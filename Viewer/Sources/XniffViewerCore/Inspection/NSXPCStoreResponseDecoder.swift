@@ -100,6 +100,12 @@ private enum NSXPCStoreObjectFaultResponseDecoder {
                 value: .object(type: "", fields: propertyFields)
             ))
             fields.append(TraceField(name: "Version", value: version))
+            fields.append(TraceField(
+                name: "Schema requirement",
+                value: .string(
+                    "Property slot names and types require the entity model and are not transmitted"
+                )
+            ))
         } else if status == 2 {
             fields.append(TraceField(
                 name: "Buffered result",
