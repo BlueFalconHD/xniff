@@ -99,7 +99,7 @@ import Testing
     }
 }
 
-@Test func validatesVisuallyConstructedPredicates() {
+@Test func validatesProgrammaticallyConstructedPredicates() {
     let predicate = TracePredicate(root: TracePredicateGroup(items: [
         .comparison(TracePredicateComparison(
             field: .service,

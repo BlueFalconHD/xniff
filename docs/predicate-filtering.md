@@ -1,8 +1,7 @@
 # Predicate filtering
 
-The viewer and `xniff-print` share one typed predicate language. The viewer edits
-the predicate visually by default. Its **Text** button exposes the canonical form
-for copying, pasting, or using at the command line. Right-clicking a call table
+The viewer and `xniff-print` share one typed predicate language. Enter or paste
+the text form directly in the viewer's search field. Right-clicking a call table
 row can append predicates for that call, service, function, role, process, peer,
 or completion state.
 

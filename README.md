@@ -72,10 +72,10 @@ inspector-tree predicate needs them. Each row is
 one logical call; its request and response share a bottom inspector with
 Metadata, Backtrace, and Body tabs.
 
-Filtering uses a visual nested rule builder with typed fields, comparisons,
-regular expressions, AND/OR/NOT groups, and a copyable text representation.
-Right-click a call row to add its metadata to the current predicate. Predicates
-can also query every constructed inspector tree. See
+Enter predicate expressions directly in the search field. The syntax supports
+typed fields, comparisons, regular expressions, and AND/OR/NOT groups.
+Right-click a call row to append its metadata to the current predicate text.
+Predicates can also query every constructed inspector tree. See
 [Predicate filtering](docs/predicate-filtering.md) for the language and fields.
 
 Body is the default view. It recursively expands libxpc v5 values, binary/XML

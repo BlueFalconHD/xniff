@@ -11,8 +11,11 @@ final class TraceStore {
     private(set) var isLoading = false
     private(set) var isFiltering = false
     private(set) var errorMessage: String?
+    private(set) var predicateError: String?
     var selectedCallID: TraceCallID?
-    var predicate = TracePredicate.all { didSet { scheduleFilter() } }
+    var predicateText = "" { didSet { updatePredicate() } }
+
+    private(set) var predicate = TracePredicate.all { didSet { scheduleFilter() } }
 
     @ObservationIgnored private var callsByID: [TraceCallID: TraceCall] = [:]
     @ObservationIgnored private var bodyIndexCache = TracePredicateBodyIndexCache()
@@ -29,15 +32,18 @@ final class TraceStore {
     }
 
     func conjoin(_ item: TracePredicateItem) {
-        predicate.conjoin(item)
+        var updated = predicate
+        updated.conjoin(item)
+        predicateText = updated.text
     }
 
     func replacePredicate(with text: String) throws {
-        predicate = try TracePredicateParser.parse(text)
+        _ = try TracePredicateParser.parse(text)
+        predicateText = text
     }
 
     func clearPredicate() {
-        predicate = .all
+        predicateText = ""
     }
 
     func chooseFile() {
@@ -142,6 +148,18 @@ final class TraceStore {
             } else if selectedCallID == nil {
                 selectedCallID = filtered.first?.id
             }
+        }
+    }
+
+    private func updatePredicate() {
+        do {
+            predicate = try TracePredicateParser.parse(predicateText)
+            predicateError = nil
+        } catch {
+            predicateError = error.localizedDescription
+            filterTask?.cancel()
+            filterRevision &+= 1
+            isFiltering = false
         }
     }
 }

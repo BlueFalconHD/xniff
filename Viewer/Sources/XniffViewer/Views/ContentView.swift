@@ -4,26 +4,24 @@ struct ContentView: View {
     @Bindable var store: TraceStore
 
     var body: some View {
-        VStack(spacing: 0) {
-            PredicateEditorView(
-                predicate: $store.predicate,
-                resultCount: store.visibleCalls.count,
-                isFiltering: store.isFiltering
+        VSplitView {
+            CallTableView(store: store)
+                .frame(minHeight: 120, idealHeight: 390)
+
+            CallInspectorView(
+                document: store.document,
+                call: store.selectedCall
             )
-            Divider()
-
-            VSplitView {
-                CallTableView(store: store)
-                    .frame(minHeight: 120, idealHeight: 390)
-
-                CallInspectorView(
-                    document: store.document,
-                    call: store.selectedCall
-                )
-                .frame(minHeight: 140, idealHeight: 420)
-            }
+            .frame(minHeight: 140, idealHeight: 420)
         }
         .navigationTitle(store.title)
+        .searchable(text: $store.predicateText, prompt: "Predicate")
+        .searchSuggestions {
+            if let predicateError = store.predicateError {
+                Label(predicateError, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+            }
+        }
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 Button("Open", systemImage: "folder") { store.chooseFile() }

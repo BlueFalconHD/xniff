@@ -20,7 +20,7 @@ struct CallTableView: View {
                     description: Text(
                         store.predicate.isEmpty
                             ? "The capture does not contain any logical calls."
-                            : store.predicate.text
+                            : store.predicateText
                     )
                 )
             }
