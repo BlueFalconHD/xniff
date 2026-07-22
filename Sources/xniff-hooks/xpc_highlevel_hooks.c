@@ -575,6 +575,10 @@ void xniff_emit_xpc_session_send_message_with_reply_async_response(uint64_t repl
                                                                     const uint64_t args[8]) {
     uint64_t callback_args[8] = {0};
     if (args) memcpy(callback_args, args, sizeof(callback_args));
+    // The request belongs to the caller and may no longer be live when an
+    // asynchronous response arrives. The response remains correlated by the
+    // hook call ID, so never attempt to serialize the stale request pointer.
+    callback_args[1] = 0;
     callback_args[3] = error;
     uint64_t response = reply != 0 ? reply : error;
     send_message_event_args(XNIFF_EVT_XPC_EXIT, XNIFF_DIR_EXIT,

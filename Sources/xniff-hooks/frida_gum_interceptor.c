@@ -270,9 +270,10 @@ static void xniff_install_session_reply_wrapper(GumInvocationContext *ic,
   XniffSessionReplyHandler original = (XniffSessionReplyHandler)(uintptr_t)inv->args[2];
   uint64_t call_id = inv->call_id;
   uint64_t session = inv->args[0];
-  uint64_t message = inv->args[1];
   XniffSessionReplyHandler wrapper = Block_copy(^(xpc_object_t reply, xpc_object_t error) {
-    uint64_t args[8] = { session, message, 0, 0, 0, 0, 0, 0 };
+    // The request may have been released before this asynchronous callback.
+    // Preserve its call ID, but only serialize the live reply or error object.
+    uint64_t args[8] = { session, 0, 0, 0, 0, 0, 0, 0 };
     uint64_t previous_call_id = xniff_hooks_current_call_id();
     xniff_hooks_set_current_call_id(call_id);
     xniff_ignore_current_thread();
