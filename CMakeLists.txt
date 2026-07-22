@@ -27,12 +27,7 @@ else()
     set(XNIFF_SWIFT_CONFIGURATION release)
 endif()
 set(XNIFF_SWIFT_BUILD_DIR "${CMAKE_BINARY_DIR}/swiftpm")
-set(XNIFF_SWIFT_MODULE_CACHE "${XNIFF_SWIFT_BUILD_DIR}/module-cache")
-set(XNIFF_SWIFT_ENV
-    "SWIFT_MODULECACHE_PATH=${XNIFF_SWIFT_MODULE_CACHE}"
-    "CLANG_MODULE_CACHE_PATH=${XNIFF_SWIFT_MODULE_CACHE}")
 set(XNIFF_SWIFT_COMMON_ARGUMENTS
-    --disable-sandbox
     --package-path "${PROJECT_SOURCE_DIR}"
     --scratch-path "${XNIFF_SWIFT_BUILD_DIR}"
     --configuration "${XNIFF_SWIFT_CONFIGURATION}")
@@ -165,9 +160,7 @@ set(XNIFF_SWIFT_OUTPUTS
     "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/xniff-print")
 add_custom_command(
     OUTPUT ${XNIFF_SWIFT_OUTPUTS}
-    COMMAND "${CMAKE_COMMAND}" -E make_directory "${XNIFF_SWIFT_MODULE_CACHE}"
-    COMMAND "${CMAKE_COMMAND}" -E env ${XNIFF_SWIFT_ENV}
-            "${XNIFF_SWIFT_EXECUTABLE}" build ${XNIFF_SWIFT_COMMON_ARGUMENTS}
+    COMMAND "${XNIFF_SWIFT_EXECUTABLE}" build ${XNIFF_SWIFT_COMMON_ARGUMENTS}
     COMMAND "${CMAKE_COMMAND}" -E copy
             "${XNIFF_SWIFT_BUILD_DIR}/${XNIFF_SWIFT_CONFIGURATION}/xniff-viewer"
             "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/xniff-viewer"
@@ -182,8 +175,7 @@ add_custom_command(
 add_custom_target(xniff-viewer-tools ALL DEPENDS ${XNIFF_SWIFT_OUTPUTS})
 
 add_test(NAME xniff-viewer-tests
-    COMMAND "${CMAKE_COMMAND}" -E env ${XNIFF_SWIFT_ENV}
-            "${XNIFF_SWIFT_EXECUTABLE}" test ${XNIFF_SWIFT_COMMON_ARGUMENTS})
+    COMMAND "${XNIFF_SWIFT_EXECUTABLE}" test ${XNIFF_SWIFT_COMMON_ARGUMENTS})
 
 set(XNIFF_ENTITLEMENTS "${PROJECT_SOURCE_DIR}/Resources/xniff.entitlements")
 function(xniff_codesign target_name)
