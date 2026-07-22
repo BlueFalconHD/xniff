@@ -8,7 +8,8 @@ public struct RawXPCBodyInspector: TraceBodyInspector {
     public init() {}
 
     public func inspect(_ context: BodyInspectorContext) -> BodyInspection? {
-        BodyInspection(
+        guard context.payloadKind?.isMach != true else { return nil }
+        return BodyInspection(
             id: identifier,
             name: "Raw XPC",
             priority: priority,

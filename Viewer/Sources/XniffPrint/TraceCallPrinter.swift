@@ -77,7 +77,8 @@ enum TraceCallPrinter {
             let inspections = BodyInspectorRegistry.standard.inspections(
                 for: value,
                 data: data,
-                counterpartBody: counterpartBody
+                counterpartBody: counterpartBody,
+                payloadKind: payload.kind
             )
             let inspection = options.rawXPC
                 ? inspections.first { $0.id == StandardBodyInspectorID.rawXPC }

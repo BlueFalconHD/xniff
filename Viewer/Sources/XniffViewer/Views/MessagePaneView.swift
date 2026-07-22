@@ -6,6 +6,9 @@ enum MessageSide: String, Sendable, Hashable {
     case response
 
     func payloads(in event: TraceEvent) -> [TracePayloadSlice] {
+        if event.api == .machMessage || event.api == .machMessage2 {
+            return event.payloads
+        }
         switch self {
         case .request:
             let preferred: TracePayloadKind = event.role == .incoming ? .event : .message

@@ -74,8 +74,8 @@ public enum XniffTraceParser {
             var payloads: [TracePayloadSlice] = []
             var backtracePCs: [UInt64] = []
             var backtraceSymbols: [UInt64: BacktraceSymbol] = [:]
-            var machMessageID: Int32?
             var diagnostic: String?
+            var machSections = MachSectionAccumulator()
 
             while reader.offset + 8 <= recordEnd {
                 let sectionType = try reader.readUInt16()
@@ -88,34 +88,13 @@ public enum XniffTraceParser {
                 }
 
                 switch sectionType {
-                case 1 where api == .machMessage || api == .machMessage2:
-                    if sectionLength >= 128 {
-                        var section = BinaryReader(data: data, offset: sectionStart, end: sectionEnd)
-                        _ = try section.readUInt32()
-                        _ = try section.readUInt32()
-                        _ = try section.readUInt32()
-                        _ = try section.readUInt32()
-                        _ = try section.readUInt32()
-                        _ = try section.readUInt32()
-                        _ = try section.readUInt64()
-                        _ = try section.readUInt64()
-                        returnValue = try section.readUInt64()
-                        try section.skip(16)
-                        arguments = try (0..<8).map { _ in try section.readUInt64() }
-                    }
-                case 2 where api == .machMessage || api == .machMessage2:
-                    if sectionLength >= 24 {
-                        var section = BinaryReader(data: data, offset: sectionStart, end: sectionEnd)
-                        try section.skip(20)
-                        machMessageID = Int32(bitPattern: try section.readUInt32())
-                    }
-                    payloads.append(.init(
-                        kind: .message,
-                        format: 0,
-                        originalLength: sectionLength,
-                        isTruncated: false,
-                        range: sectionStart..<sectionEnd
-                    ))
+                case 1...6 where api == .machMessage || api == .machMessage2:
+                    _ = try machSections.consume(
+                        sectionType: sectionType,
+                        data: data,
+                        start: sectionStart,
+                        end: sectionEnd
+                    )
                 case 7 where api == .xpc:
                     if sectionLength >= 12 {
                         var section = BinaryReader(data: data, offset: sectionStart, end: sectionEnd)
@@ -239,6 +218,19 @@ public enum XniffTraceParser {
             }
             reader.offset = recordEnd
 
+            let machMessage = machSections.details
+            if let machReturnValue = machSections.returnValue {
+                returnValue = machReturnValue
+            }
+            if let machArguments = machSections.arguments {
+                arguments = machArguments
+            }
+            payloads.append(contentsOf: machSections.payloads)
+            if let trailer = machMessage?.trailer {
+                peerProcessID = peerProcessID ?? trailer.senderProcessID
+                peerAuditToken = peerAuditToken ?? trailer.auditToken
+            }
+
             if callID == nil {
                 let key = FallbackCallKey(pid: processID, tid: threadID, api: api.rawValue, function: function)
                 if direction == .entry {
@@ -264,7 +256,7 @@ public enum XniffTraceParser {
             let role = TraceModel.role(function: function, direction: direction, api: api)
             let summary = diagnostic
                 ?? serviceName
-                ?? machMessageID.map { "message id \($0)" }
+                ?? machMessage?.header.map { "message id \($0.messageID)" }
                 ?? payloads.map(\.name).joined(separator: ", ")
 
             pending.append(.init(
@@ -283,6 +275,7 @@ public enum XniffTraceParser {
                 returnValue: returnValue,
                 arguments: arguments,
                 payloads: payloads,
+                machMessage: machMessage,
                 backtrace: backtracePCs.enumerated().map { index, pc in
                     let symbol = backtraceSymbols[pc]
                     return TraceFrame(
@@ -323,6 +316,7 @@ public enum XniffTraceParser {
                 payloads: item.payloads,
                 backtrace: item.backtrace,
                 summary: item.summary,
+                machMessage: item.machMessage,
                 peerAuditToken: item.peerAuditToken,
                 xpcObjectID: item.xpcObjectID,
                 xpcObjectKind: item.xpcObjectKind,
@@ -420,6 +414,7 @@ private struct PendingEvent {
     let returnValue: UInt64
     let arguments: [UInt64]
     let payloads: [TracePayloadSlice]
+    let machMessage: MachMessageDetails?
     let backtrace: [TraceFrame]
     let summary: String
     let peerAuditToken: [UInt32]?

@@ -46,6 +46,10 @@ public enum TracePayloadKind: UInt8, Sendable, Hashable {
     case message = 1
     case reply = 2
     case event = 3
+    case machMessage = 128
+    case machTrailer = 129
+    case machOutOfLineData = 130
+    case machPortArray = 131
 
     public var label: String {
         switch self {
@@ -53,8 +57,14 @@ public enum TracePayloadKind: UInt8, Sendable, Hashable {
         case .message: "Message"
         case .reply: "Reply"
         case .event: "Event"
+        case .machMessage: "Mach message"
+        case .machTrailer: "Mach trailer"
+        case .machOutOfLineData: "OOL data"
+        case .machPortArray: "OOL ports"
         }
     }
+
+    public var isMach: Bool { rawValue >= Self.machMessage.rawValue }
 }
 
 public struct TracePayloadSlice: Sendable, Hashable, Identifiable {
@@ -64,8 +74,11 @@ public struct TracePayloadSlice: Sendable, Hashable, Identifiable {
     public let originalLength: Int
     public let isTruncated: Bool
     public let range: Range<Int>
+    public let descriptorIndex: UInt32?
 
-    public var name: String { kind.label }
+    public var name: String {
+        descriptorIndex.map { "\(kind.label) #\($0)" } ?? kind.label
+    }
 
     public init(
         kind: TracePayloadKind,
@@ -73,6 +86,7 @@ public struct TracePayloadSlice: Sendable, Hashable, Identifiable {
         originalLength: Int,
         isTruncated: Bool,
         range: Range<Int>,
+        descriptorIndex: UInt32? = nil,
         id: UUID = UUID()
     ) {
         self.id = id
@@ -81,6 +95,7 @@ public struct TracePayloadSlice: Sendable, Hashable, Identifiable {
         self.originalLength = originalLength
         self.isTruncated = isTruncated
         self.range = range
+        self.descriptorIndex = descriptorIndex
     }
 }
 
@@ -130,6 +145,7 @@ public struct TraceEvent: Sendable, Identifiable, Hashable {
     public let returnValue: UInt64
     public let arguments: [UInt64]
     public let payloads: [TracePayloadSlice]
+    public let machMessage: MachMessageDetails?
     public let backtrace: [TraceFrame]
     public let summary: String
     public let searchableText: String
@@ -154,6 +170,7 @@ public struct TraceEvent: Sendable, Identifiable, Hashable {
         payloads: [TracePayloadSlice],
         backtrace: [TraceFrame],
         summary: String,
+        machMessage: MachMessageDetails? = nil,
         peerAuditToken: [UInt32]? = nil,
         xpcObjectID: UInt64? = nil,
         xpcObjectKind: XPCObjectKind? = nil,
@@ -180,6 +197,7 @@ public struct TraceEvent: Sendable, Identifiable, Hashable {
         self.returnValue = returnValue
         self.arguments = arguments
         self.payloads = payloads
+        self.machMessage = machMessage
         self.backtrace = backtrace
         self.summary = summary
         self.searchableText = [

@@ -94,6 +94,7 @@ private extension TraceEvent {
             payloads: payloads,
             backtrace: backtrace,
             summary: summary,
+            machMessage: machMessage,
             peerAuditToken: peerAuditToken,
             xpcObjectID: xpcObjectID,
             xpcObjectKind: xpcObjectKind,

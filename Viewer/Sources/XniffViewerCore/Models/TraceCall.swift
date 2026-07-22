@@ -95,6 +95,7 @@ public struct TraceCall: Sendable, Identifiable, Hashable {
             payloads: event.payloads,
             backtrace: event.backtrace,
             summary: event.summary,
+            machMessage: event.machMessage,
             peerAuditToken: event.peerAuditToken,
             xpcObjectID: event.xpcObjectID,
             xpcObjectKind: event.xpcObjectKind,

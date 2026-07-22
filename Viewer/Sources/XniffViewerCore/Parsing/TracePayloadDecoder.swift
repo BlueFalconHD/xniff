@@ -30,7 +30,8 @@ public struct DecodedTracePayload: Sendable, Identifiable {
         self.inspections = BodyInspectorRegistry.standard.inspections(
             for: value,
             data: data,
-            counterpartBody: counterpartBody
+            counterpartBody: counterpartBody,
+            payloadKind: slice.kind
         )
     }
 

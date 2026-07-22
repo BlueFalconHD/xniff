@@ -50,17 +50,20 @@ public struct BodyInspection: Sendable, Identifiable {
 public struct BodyInspectorContext: Sendable {
     public let originalBody: TraceValue
     public let originalData: Data
+    public let payloadKind: TracePayloadKind?
     public let inspections: [String: BodyInspection]
     public let counterpartBody: TraceValue?
 
     public init(
         originalBody: TraceValue,
         originalData: Data,
+        payloadKind: TracePayloadKind? = nil,
         inspections: [String: BodyInspection],
         counterpartBody: TraceValue? = nil
     ) {
         self.originalBody = originalBody
         self.originalData = originalData
+        self.payloadKind = payloadKind
         self.inspections = inspections
         self.counterpartBody = counterpartBody
     }
@@ -80,6 +83,7 @@ public protocol TraceBodyInspector: Sendable {
 
 public enum StandardBodyInspectorID {
     public static let hex = "xniff.hex"
+    public static let mach = "xniff.mach"
     public static let rawXPC = "xniff.raw-xpc"
     public static let foundationNSXPC = "xniff.foundation-nsxpc"
     public static let swiftXPCCodable = "xniff.swift-xpc-codable"

@@ -3,6 +3,7 @@ import Foundation
 public struct BodyInspectorRegistry: Sendable {
     public static let standard = BodyInspectorRegistry(inspectors: [
         HexBodyInspector(),
+        MachPayloadBodyInspector(),
         RawXPCBodyInspector(),
         FoundationNSXPCBodyInspector(),
         SwiftXPCCodableBodyInspector(),
@@ -18,7 +19,8 @@ public struct BodyInspectorRegistry: Sendable {
     public func inspections(
         for body: TraceValue,
         data: Data,
-        counterpartBody: TraceValue? = nil
+        counterpartBody: TraceValue? = nil,
+        payloadKind: TracePayloadKind? = nil
     ) -> [BodyInspection] {
         var available: [String: BodyInspection] = [:]
         var pending = inspectors.sorted { lhs, rhs in
@@ -39,6 +41,7 @@ public struct BodyInspectorRegistry: Sendable {
                 let context = BodyInspectorContext(
                     originalBody: body,
                     originalData: data,
+                    payloadKind: payloadKind,
                     inspections: available,
                     counterpartBody: counterpartBody
                 )
