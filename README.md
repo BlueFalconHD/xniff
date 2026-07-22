@@ -66,10 +66,17 @@ build/xniff-viewer /tmp/screentime.xniff
 The build also produces `build/xniff-viewer.app` for Finder or Launchpad-style
 use. Dumps with `.xniff` and `.xniffbin` extensions can be opened with the app.
 
-The native SwiftUI/AppKit viewer memory-maps and indexes the dump, filters large
-traces off the main thread, and decodes payloads only when selected. Each row is
+The native SwiftUI/AppKit viewer memory-maps and indexes the dump, evaluates
+typed predicates off the main thread, and lazily decodes payloads when an
+inspector-tree predicate needs them. Each row is
 one logical call; its request and response share a bottom inspector with
 Metadata, Backtrace, and Body tabs.
+
+Filtering uses a visual nested rule builder with typed fields, comparisons,
+regular expressions, AND/OR/NOT groups, and a copyable text representation.
+Right-click a call row to add its metadata to the current predicate. Predicates
+can also query every constructed inspector tree. See
+[Predicate filtering](docs/predicate-filtering.md) for the language and fields.
 
 Body is the default view. It recursively expands libxpc v5 values, binary/XML
 property lists, JSON, `NSKeyedArchiver`, and the inline `bplist17` format used by
@@ -106,3 +113,4 @@ build/xniff-print /tmp/screentime.xniff
 The terminal printer and native viewer share the same parser and layered body
 inspectors, so Foundation NSXPC, Swift XPC Codable, and Core Data output stays
 consistent between them. Run `build/xniff-print --help` for filtering options.
+The terminal uses the same predicate syntax through `--predicate`/`-p`.

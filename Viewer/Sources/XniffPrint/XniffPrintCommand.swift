@@ -3,11 +3,23 @@ import XniffViewerCore
 
 @main
 struct XniffPrintCommand {
-    static func main() {
+    static func main() async {
         do {
             let options = try CommandLineOptions.parse(Array(CommandLine.arguments.dropFirst()))
             let document = try XniffTraceParser.parse(url: options.inputURL)
-            let calls = document.calls.filter(options.includes)
+            let cache = TracePredicateBodyIndexCache()
+            var calls: [TraceCall] = []
+            for call in document.calls {
+                if try await TracePredicateEvaluator.matches(
+                    options.predicate,
+                    call: call,
+                    bodyLoader: {
+                        await cache.index(for: call, document: document)
+                    }
+                ) {
+                    calls.append(call)
+                }
+            }
             for (index, call) in calls.enumerated() {
                 if index > 0 { print() }
                 print(TraceCallPrinter.render(call, document: document, options: options))
@@ -27,12 +39,15 @@ struct XniffPrintCommand {
     private static let usage = """
     Usage: xniff-print [options] <capture.xniff>
 
-      --pid <pid>         Include calls from one process
-      --role <role>       Filter by request, response, incoming, one-way, metadata, mach, or diagnostic
-      --search <text>     Search function, service, role, summary, and process metadata
-      --only-pairs        Require both a request and response
+      -p, --predicate <expression>
+                          Filter with the shared predicate language; repeat to AND expressions
       --raw-xpc           Skip semantic Foundation, Swift Codable, and Core Data views
       --no-body           Print call metadata without decoded bodies
       -h, --help          Show this help
+
+    Examples:
+      --predicate 'pid == 42 and role == "request" and complete == true'
+      --predicate 'service contains "model" or duration >= 25ms'
+      --predicate 'request.tree contains "NSMetadata.store = ScreenTime"'
     """
 }

@@ -9,11 +9,20 @@ struct CallTableView: View {
         ZStack {
             CallTableRepresentable(
                 calls: store.visibleCalls,
-                selection: $store.selectedCallID
+                selection: $store.selectedCallID,
+                addPredicate: store.conjoin
             )
 
             if store.document != nil && store.visibleCalls.isEmpty && !store.isLoading {
-                ContentUnavailableView.search(text: store.query)
+                ContentUnavailableView(
+                    store.predicate.isEmpty ? "No Calls" : "No Predicate Matches",
+                    systemImage: "line.3.horizontal.decrease.circle",
+                    description: Text(
+                        store.predicate.isEmpty
+                            ? "The capture does not contain any logical calls."
+                            : store.predicate.text
+                    )
+                )
             }
         }
     }
@@ -22,9 +31,10 @@ struct CallTableView: View {
 private struct CallTableRepresentable: NSViewRepresentable {
     let calls: [TraceCall]
     @Binding var selection: TraceCallID?
+    let addPredicate: (TracePredicateItem) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(selection: $selection)
+        Coordinator(selection: $selection, addPredicate: addPredicate)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -38,6 +48,10 @@ private struct CallTableRepresentable: NSViewRepresentable {
         table.intercellSpacing = NSSize(width: 8, height: 0)
         table.delegate = context.coordinator
         table.dataSource = context.coordinator
+        let menu = NSMenu()
+        menu.delegate = context.coordinator
+        table.menu = menu
+        context.coordinator.table = table
 
         for specification in ColumnSpecification.all {
             let column = NSTableColumn(identifier: specification.id)
@@ -55,31 +69,50 @@ private struct CallTableRepresentable: NSViewRepresentable {
         scrollView.autohidesScrollers = true
         scrollView.documentView = table
 
-        context.coordinator.update(calls: calls, selection: $selection, table: table)
+        context.coordinator.update(
+            calls: calls,
+            selection: $selection,
+            addPredicate: addPredicate,
+            table: table
+        )
         return scrollView
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let table = scrollView.documentView as? NSTableView else { return }
-        context.coordinator.update(calls: calls, selection: $selection, table: table)
+        context.coordinator.update(
+            calls: calls,
+            selection: $selection,
+            addPredicate: addPredicate,
+            table: table
+        )
     }
 
     @MainActor
-    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
         private var calls: [TraceCall] = []
         private var callIDs: [TraceCallID] = []
         private var selection: Binding<TraceCallID?>
+        private var addPredicate: (TracePredicateItem) -> Void
+        private var menuPredicates: [TracePredicateItem] = []
+        weak var table: NSTableView?
 
-        init(selection: Binding<TraceCallID?>) {
+        init(
+            selection: Binding<TraceCallID?>,
+            addPredicate: @escaping (TracePredicateItem) -> Void
+        ) {
             self.selection = selection
+            self.addPredicate = addPredicate
         }
 
         func update(
             calls: [TraceCall],
             selection: Binding<TraceCallID?>,
+            addPredicate: @escaping (TracePredicateItem) -> Void,
             table: NSTableView
         ) {
             self.selection = selection
+            self.addPredicate = addPredicate
             let newIDs = calls.map(\.id)
             if newIDs != callIDs {
                 self.calls = calls
@@ -127,6 +160,88 @@ private struct CallTableRepresentable: NSViewRepresentable {
             if selection.wrappedValue != newSelection {
                 selection.wrappedValue = newSelection
             }
+        }
+
+        func menuNeedsUpdate(_ menu: NSMenu) {
+            menu.removeAllItems()
+            menuPredicates = []
+            guard let table,
+                  calls.indices.contains(table.clickedRow) else { return }
+            let call = calls[table.clickedRow]
+
+            addMenuItem(
+                "This call (PID \(call.processID), #\(call.id.callID))",
+                item: .group(TracePredicateGroup(items: [
+                    .comparison(.equals(.processID, number(call.processID))),
+                    .comparison(.equals(.callID, number(call.id.callID))),
+                ])),
+                to: menu
+            )
+            menu.addItem(.separator())
+            if let service = call.serviceName {
+                addMenuItem(
+                    "Service is \(shortened(service))",
+                    item: .comparison(.equals(.service, .string(service))),
+                    to: menu
+                )
+            }
+            addMenuItem(
+                "Function is \(shortened(call.functionName))",
+                item: .comparison(.equals(.function, .string(call.functionName))),
+                to: menu
+            )
+            addMenuItem(
+                "Role is \(call.role.label)",
+                item: .comparison(.equals(.role, .string(call.role.rawValue))),
+                to: menu
+            )
+            addMenuItem(
+                "Process ID is \(call.processID)",
+                item: .comparison(.equals(.processID, number(call.processID))),
+                to: menu
+            )
+            if let peerProcessID = call.peerProcessID {
+                addMenuItem(
+                    "Peer process ID is \(peerProcessID)",
+                    item: .comparison(.equals(.peerProcessID, number(peerProcessID))),
+                    to: menu
+                )
+            }
+            addMenuItem(
+                call.isComplete ? "Is a complete pair" : "Is not a complete pair",
+                item: .comparison(.equals(.complete, .boolean(call.isComplete))),
+                to: menu
+            )
+        }
+
+        @objc private func addMenuPredicate(_ sender: NSMenuItem) {
+            guard menuPredicates.indices.contains(sender.tag) else { return }
+            addPredicate(menuPredicates[sender.tag])
+        }
+
+        private func addMenuItem(
+            _ title: String,
+            item: TracePredicateItem,
+            to menu: NSMenu
+        ) {
+            let menuItem = NSMenuItem(
+                title: "Add \(title) to Predicate",
+                action: #selector(addMenuPredicate(_:)),
+                keyEquivalent: ""
+            )
+            menuItem.target = self
+            menuItem.tag = menuPredicates.count
+            menuPredicates.append(item)
+            menu.addItem(menuItem)
+        }
+
+        private func number<T: CustomStringConvertible>(_ value: T) -> TracePredicateLiteral {
+            .number(Decimal(string: value.description) ?? 0)
+        }
+
+        private func shortened(_ value: String) -> String {
+            guard value.count > 64 else { return value }
+            return String(value.prefix(61)) + "…"
         }
     }
 }

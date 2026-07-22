@@ -3,19 +3,13 @@ import XniffViewerCore
 
 struct CommandLineOptions: Equatable {
     let inputURL: URL
-    var processID: UInt32?
-    var role: TraceRole?
-    var searchText: String?
-    var onlyPairs = false
+    var predicate = TracePredicate.all
     var includeBodies = true
     var rawXPC = false
 
     static func parse(_ arguments: [String]) throws -> CommandLineOptions {
         var inputPath: String?
-        var processID: UInt32?
-        var role: TraceRole?
-        var searchText: String?
-        var onlyPairs = false
+        var predicate = TracePredicate.all
         var includeBodies = true
         var rawXPC = false
         var index = 0
@@ -25,22 +19,18 @@ struct CommandLineOptions: Equatable {
             switch argument {
             case "-h", "--help":
                 throw CommandLineError.helpRequested
-            case "--pid":
+            case "-p", "--predicate":
                 let value = try value(after: argument, in: arguments, index: &index)
-                guard let parsed = UInt32(value) else {
-                    throw CommandLineError.invalidValue(option: argument, value: value)
+                do {
+                    let parsed = try TracePredicateParser.parse(value)
+                    if predicate.isEmpty {
+                        predicate = parsed
+                    } else if !parsed.isEmpty {
+                        predicate.conjoin(.group(parsed.root))
+                    }
+                } catch {
+                    throw CommandLineError.invalidPredicate(error.localizedDescription)
                 }
-                processID = parsed
-            case "--role":
-                let value = try value(after: argument, in: arguments, index: &index)
-                guard let parsed = TraceRole(rawValue: value.lowercased()) else {
-                    throw CommandLineError.invalidValue(option: argument, value: value)
-                }
-                role = parsed
-            case "--search":
-                searchText = try value(after: argument, in: arguments, index: &index)
-            case "--only-pairs":
-                onlyPairs = true
             case "--no-body":
                 includeBodies = false
             case "--raw-xpc":
@@ -60,24 +50,10 @@ struct CommandLineOptions: Equatable {
         guard let inputPath else { throw CommandLineError.missingInput }
         return CommandLineOptions(
             inputURL: URL(fileURLWithPath: inputPath),
-            processID: processID,
-            role: role,
-            searchText: searchText,
-            onlyPairs: onlyPairs,
+            predicate: predicate,
             includeBodies: includeBodies,
             rawXPC: rawXPC
         )
-    }
-
-    func includes(_ call: TraceCall) -> Bool {
-        if let processID, call.processID != processID { return false }
-        if let role, call.role != role { return false }
-        if onlyPairs, call.request == nil || call.response == nil { return false }
-        if let searchText,
-           !call.searchableText.localizedCaseInsensitiveContains(searchText) {
-            return false
-        }
-        return true
     }
 
     private static func value(
@@ -97,7 +73,7 @@ enum CommandLineError: LocalizedError, Equatable {
     case helpRequested
     case missingInput
     case missingValue(String)
-    case invalidValue(option: String, value: String)
+    case invalidPredicate(String)
     case unknownOption(String)
     case unexpectedArgument(String)
 
@@ -109,8 +85,8 @@ enum CommandLineError: LocalizedError, Equatable {
             "missing capture path"
         case .missingValue(let option):
             "missing value for \(option)"
-        case .invalidValue(let option, let value):
-            "invalid value '\(value)' for \(option)"
+        case .invalidPredicate(let message):
+            "invalid predicate: \(message)"
         case .unknownOption(let option):
             "unknown option \(option)"
         case .unexpectedArgument(let argument):

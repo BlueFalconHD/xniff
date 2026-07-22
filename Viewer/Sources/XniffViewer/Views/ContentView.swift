@@ -4,30 +4,29 @@ struct ContentView: View {
     @Bindable var store: TraceStore
 
     var body: some View {
-        VSplitView {
-            CallTableView(store: store)
-                .frame(minHeight: 120, idealHeight: 390)
-
-            CallInspectorView(
-                document: store.document,
-                call: store.selectedCall
+        VStack(spacing: 0) {
+            PredicateEditorView(
+                predicate: $store.predicate,
+                resultCount: store.visibleCalls.count,
+                isFiltering: store.isFiltering
             )
-            .frame(minHeight: 140, idealHeight: 420)
+            Divider()
+
+            VSplitView {
+                CallTableView(store: store)
+                    .frame(minHeight: 120, idealHeight: 390)
+
+                CallInspectorView(
+                    document: store.document,
+                    call: store.selectedCall
+                )
+                .frame(minHeight: 140, idealHeight: 420)
+            }
         }
         .navigationTitle(store.title)
-        .searchable(text: $store.query, prompt: "Service, function, role, PID, or call ID")
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 Button("Open", systemImage: "folder") { store.chooseFile() }
-            }
-            ToolbarItem {
-                Picker("Traffic", selection: $store.filter) {
-                    ForEach(TraceFilter.allCases) { filter in
-                        Text("\(filter.label) (\(store.count(for: filter)))")
-                            .tag(filter)
-                    }
-                }
-                .frame(width: 175)
             }
             if store.isLoading {
                 ToolbarItem { ProgressView().controlSize(.small) }
