@@ -13,7 +13,7 @@ public struct FoundationXPCArgument: Sendable {
     public let value: TraceValue
 
     public var label: String {
-        type.map { "Argument \(index) — \($0.displayName)" } ?? "Argument \(index)"
+        type.map { "Argument \(index): \($0.displayName)" } ?? "Argument \(index)"
     }
 
     var semanticValue: TraceValue {

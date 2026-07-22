@@ -94,7 +94,7 @@ int xniff_capture_ring(pid_t pid,
             __atomic_load_n(&header->dropped_bytes, __ATOMIC_ACQUIRE);
         if (dropped_events != last_dropped_events || dropped_bytes != last_dropped_bytes) {
             fprintf(stderr,
-                    "capture: warning: target dropped %llu events (%llu bytes); totals=%llu/%llu\n",
+                    "capture: warning: target dropped %llu events (%llu bytes)\n",
                     (unsigned long long)(dropped_events - last_dropped_events),
                     (unsigned long long)(dropped_bytes - last_dropped_bytes),
                     (unsigned long long)dropped_events,
@@ -144,7 +144,7 @@ int xniff_capture_ring(pid_t pid,
                 fprintf(stderr, "capture: warning: discarded %zu trailing transport bytes\n",
                         stream_length);
             }
-            fprintf(stderr, "capture: target pid %d exited; shared ring drained\n", (int)pid);
+            fprintf(stderr, "capture: target pid %d exited\ncapture: shared ring drained\n", (int)pid);
             close_output(output);
             free(stream);
             return 0;

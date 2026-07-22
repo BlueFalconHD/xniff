@@ -151,7 +151,7 @@ static int install_hooks(pid_t pid, const char *dylib_path, int mode,
     } else {
         (void)strncpy(inject_path, abs_path, sizeof(inject_path) - 1);
         inject_path[sizeof(inject_path) - 1] = '\0';
-        XNIFF_DIAGF("attach: warning: failed to stage hooks dylib; using original path %s\n", abs_path);
+        XNIFF_DIAGF("attach: warning: failed to stage hooks dylib, using original path %s\n", abs_path);
     }
 
     // Inject hooks dylib (uses filtered dlopen/pthread_exit resolution)
@@ -189,7 +189,7 @@ static int install_hooks(pid_t pid, const char *dylib_path, int mode,
         return -1;
     }
     release_task(pid, task);
-    XNIFF_DIAGF("attach: injected %s; capture mode=%s\n", inject_path,
+    XNIFF_DIAGF("attach: injected %s\nattach: capture mode=%s\n", inject_path,
                 mode == XNIFF_HOOK_MODE_XPC ? "xpc" : "mach");
     if (staged_copy) (void)unlink(inject_path);
     return 0;
@@ -305,7 +305,7 @@ static int capture_attached_process(pid_t pid,
     if (!hooks_preloaded) {
         int rc = install_hooks(pid, dylib_path, mode, transport);
         if (rc != 0) {
-            fprintf(stderr, "%s: hook injection failed; terminating listener (pid %d)\n", flow, (int)child);
+            fprintf(stderr, "%s: hook injection failed\n%s: terminating listener (pid %d)\n", flow, flow, (int)child);
             xniff_shared_transport_release_controller_producer(transport);
             kill(child, SIGTERM);
             (void)waitpid(child, NULL, 0);
@@ -324,8 +324,8 @@ static int capture_attached_process(pid_t pid,
         XNIFF_DIAGF("%s: resumed target pid %d\n", flow, (int)pid);
     }
 
-    XNIFF_DIAGF("%s: hooks installed; streaming events (listener pid %d). Press Ctrl-C to stop.\n",
-                flow, (int)child);
+    XNIFF_DIAGF("%s: installed hooks\n%s: streaming events to listener %d. Press Ctrl-C to stop.\n",
+                flow, flow, (int)child);
     int listener_status = 0;
     for (;;) {
         int status = 0;

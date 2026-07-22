@@ -51,7 +51,7 @@ public struct FoundationNSXPCBodyInspector: TraceBodyInspector {
         if !envelope.validationIssues.isEmpty {
             details.append(BodyInspectionDetail(
                 "Validation",
-                value: envelope.validationIssues.joined(separator: "; ")
+                value: envelope.validationIssues.joined(separator: ", ")
             ))
         }
         return details

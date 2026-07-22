@@ -934,7 +934,7 @@ __attribute__((constructor)) static void xniff_frida_gum_ctor(void) {
   (void)pthread_once(&g_once, xniff_install_hooks_once);
   xniff_resume_suspended_threads();
   xniff_hooks_set_streaming_enabled(true);
-  xniff_hooks_debug_log("ctor: all hooks attached; resumed halted threads");
+  xniff_hooks_debug_log("ctor: all hooks attached, resumed halted threads");
 }
 
 __attribute__((destructor)) static void xniff_frida_gum_dtor(void) {
