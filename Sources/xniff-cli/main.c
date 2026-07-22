@@ -293,6 +293,7 @@ static const char *proc_name_cached(pid_t pid);
 
 typedef struct xniff_conn_meta {
     uint32_t owner_pid;
+    uint16_t object_kind;
     uint64_t conn_ptr;
     uint32_t peer_pid;
     char service[256];
@@ -341,6 +342,11 @@ typedef struct {
     char *name_private;
 } xniff_xpc_conn_meta_item_t;
 
+typedef struct {
+    bool present;
+    xniff_xpc_object_ref_t ref;
+} xniff_xpc_object_ref_item_t;
+
 static xniff_conn_meta_t *g_conn_meta = NULL;
 
 static bool str_nonempty(const char *s) {
@@ -359,7 +365,13 @@ static void str_copy_trunc(char *dst, size_t dst_sz, const char *src) {
 
 static uint64_t xpc_conn_ptr_for_event(const xniff_ipc_hdr_t *ihdr, const xniff_ipc_xpc_payload_t *pl) {
     if (!ihdr || !pl) return 0;
-    if (pl->func == XNIFF_XPC_FUNC_CONNECTION_CREATE) {
+    if (pl->func == XNIFF_XPC_FUNC_CONNECTION_CREATE ||
+        pl->func == XNIFF_XPC_FUNC_CONNECTION_CREATE_MACH_SERVICE ||
+        pl->func == XNIFF_XPC_FUNC_CONNECTION_CREATE_FROM_ENDPOINT ||
+        pl->func == XNIFF_XPC_FUNC_ARRAY_CREATE_CONNECTION ||
+        pl->func == XNIFF_XPC_FUNC_DICTIONARY_CREATE_CONNECTION ||
+        pl->func == XNIFF_XPC_FUNC_SESSION_CREATE_XPC_SERVICE ||
+        pl->func == XNIFF_XPC_FUNC_SESSION_CREATE_MACH_SERVICE) {
         if (ihdr->kind == XNIFF_EVT_XPC_EXIT && pl->ret_value != 0) return pl->ret_value;
         return 0;
     }
@@ -398,6 +410,17 @@ static const char *xpc_flow_for_event(const xniff_ipc_xpc_payload_t *pl) {
         case XNIFF_XPC_FUNC_PIPE_ROUTINE:
             return "rpc";
         case XNIFF_XPC_FUNC_CONNECTION_CREATE:
+        case XNIFF_XPC_FUNC_CONNECTION_CREATE_MACH_SERVICE:
+        case XNIFF_XPC_FUNC_CONNECTION_CREATE_FROM_ENDPOINT:
+        case XNIFF_XPC_FUNC_ARRAY_CREATE_CONNECTION:
+        case XNIFF_XPC_FUNC_DICTIONARY_CREATE_CONNECTION:
+        case XNIFF_XPC_FUNC_SESSION_CREATE_XPC_SERVICE:
+        case XNIFF_XPC_FUNC_SESSION_CREATE_MACH_SERVICE:
+        case XNIFF_XPC_FUNC_CONNECTION_ACTIVATE:
+        case XNIFF_XPC_FUNC_CONNECTION_RESUME:
+        case XNIFF_XPC_FUNC_CONNECTION_CANCEL:
+        case XNIFF_XPC_FUNC_SESSION_ACTIVATE:
+        case XNIFF_XPC_FUNC_SESSION_CANCEL:
             return "meta";
         case XNIFF_XPC_FUNC_DICTIONARY_SEND_REPLY:
             return "reply";
@@ -435,17 +458,20 @@ static const char *xpc_peer_role_for_flow(const char *flow) {
     return "unknown";
 }
 
-static xniff_conn_meta_t *conn_meta_find_or_create(uint32_t owner_pid, uint64_t conn_ptr, bool create) {
+static xniff_conn_meta_t *conn_meta_find_or_create(uint32_t owner_pid, uint16_t object_kind,
+                                                   uint64_t conn_ptr, bool create) {
     if (conn_ptr == 0) return NULL;
     xniff_conn_meta_t *m = g_conn_meta;
     while (m) {
-        if (m->owner_pid == owner_pid && m->conn_ptr == conn_ptr) return m;
+        if (m->owner_pid == owner_pid && m->object_kind == object_kind &&
+            m->conn_ptr == conn_ptr) return m;
         m = m->next;
     }
     if (!create) return NULL;
     m = (xniff_conn_meta_t *)calloc(1, sizeof(*m));
     if (!m) return NULL;
     m->owner_pid = owner_pid;
+    m->object_kind = object_kind;
     m->conn_ptr = conn_ptr;
     m->next = g_conn_meta;
     g_conn_meta = m;
@@ -457,6 +483,7 @@ static void analyze_xpc_event(
     const xniff_ipc_hdr_t *ihdr,
     const xniff_ipc_xpc_payload_t *pl,
     const char *s0,
+    const xniff_xpc_object_ref_item_t *object_ref,
     double mono_s,
     xniff_xpc_analysis_t *out)
 {
@@ -472,10 +499,16 @@ static void analyze_xpc_event(
     out->flow = xpc_flow_for_event(pl);
     out->role = xpc_role_for_event(pl);
     out->peer_role = xpc_peer_role_for_flow(out->flow);
-    out->conn_ptr = xpc_conn_ptr_for_event(ihdr, pl);
+    out->conn_ptr = object_ref && object_ref->present
+        ? object_ref->ref.object
+        : xpc_conn_ptr_for_event(ihdr, pl);
     out->msg_ptr = xpc_msg_ptr_for_event(pl);
 
-    xniff_conn_meta_t *m = conn_meta_find_or_create(ihdr->pid, out->conn_ptr, out->conn_ptr != 0);
+    uint16_t object_kind = object_ref && object_ref->present
+        ? object_ref->ref.kind
+        : XNIFF_XPC_OBJECT_CONNECTION;
+    xniff_conn_meta_t *m = conn_meta_find_or_create(
+        ihdr->pid, object_kind, out->conn_ptr, out->conn_ptr != 0);
     if (m) {
         if (pl->conn_pid != 0) m->peer_pid = pl->conn_pid;
         if (str_nonempty(s0)) str_copy_trunc(m->service, sizeof(m->service), s0);
@@ -598,7 +631,8 @@ static void xpc_parse_section(uint16_t sec_type,
                               const uint8_t *val,
                               size_t val_len,
                               xniff_xpc_serialized_set_t *xs,
-                              xniff_xpc_conn_meta_item_t *cm) {
+                              xniff_xpc_conn_meta_item_t *cm,
+                              xniff_xpc_object_ref_item_t *object_ref) {
     if (!val || !xs) return;
     if (sec_type == XNIFF_V2_SEC_XPC_SERIALIZED && val_len >= sizeof(xniff_xpc_serialized_t)) {
         xniff_xpc_serialized_t md = {0};
@@ -648,6 +682,17 @@ static void xpc_parse_section(uint16_t sec_type,
                 memcpy(cm->name_private, val + str_off, md.name_private_len);
                 cm->name_private[md.name_private_len] = '\0';
             }
+        }
+        return;
+    }
+
+    if (object_ref && sec_type == XNIFF_V2_SEC_XPC_OBJECT_REF &&
+        val_len >= sizeof(xniff_xpc_object_ref_t)) {
+        xniff_xpc_object_ref_t ref = {0};
+        memcpy(&ref, val, sizeof(ref));
+        if (ref.version == XNIFF_XPC_OBJECT_REF_VERSION && ref.object != 0) {
+            object_ref->present = true;
+            object_ref->ref = ref;
         }
     }
 }
@@ -746,6 +791,17 @@ static const char *xpc_func_to_name(uint32_t func) {
         case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE: return "xpc_session_send_message";
         case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC: return "xpc_session_send_message_with_reply_async";
         case XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC: return "xpc_session_send_message_with_reply_sync";
+        case XNIFF_XPC_FUNC_CONNECTION_CREATE_MACH_SERVICE: return "xpc_connection_create_mach_service";
+        case XNIFF_XPC_FUNC_CONNECTION_CREATE_FROM_ENDPOINT: return "xpc_connection_create_from_endpoint";
+        case XNIFF_XPC_FUNC_ARRAY_CREATE_CONNECTION: return "xpc_array_create_connection";
+        case XNIFF_XPC_FUNC_DICTIONARY_CREATE_CONNECTION: return "xpc_dictionary_create_connection";
+        case XNIFF_XPC_FUNC_SESSION_CREATE_XPC_SERVICE: return "xpc_session_create_xpc_service";
+        case XNIFF_XPC_FUNC_SESSION_CREATE_MACH_SERVICE: return "xpc_session_create_mach_service";
+        case XNIFF_XPC_FUNC_CONNECTION_ACTIVATE: return "xpc_connection_activate";
+        case XNIFF_XPC_FUNC_CONNECTION_RESUME: return "xpc_connection_resume";
+        case XNIFF_XPC_FUNC_CONNECTION_CANCEL: return "xpc_connection_cancel";
+        case XNIFF_XPC_FUNC_SESSION_ACTIVATE: return "xpc_session_activate";
+        case XNIFF_XPC_FUNC_SESSION_CANCEL: return "xpc_session_cancel";
     }
     return "unknown";
 }
@@ -758,6 +814,9 @@ static xpc_string_schema_t xpc_string_schema_for_event(uint16_t kind, uint32_t f
     xpc_string_schema_t sc = {{NULL, NULL, NULL, NULL}};
     switch (func) {
         case XNIFF_XPC_FUNC_CONNECTION_CREATE:
+        case XNIFF_XPC_FUNC_CONNECTION_CREATE_MACH_SERVICE:
+        case XNIFF_XPC_FUNC_SESSION_CREATE_XPC_SERVICE:
+        case XNIFF_XPC_FUNC_SESSION_CREATE_MACH_SERVICE:
             if (kind == XNIFF_EVT_XPC_ENTRY) {
                 sc.slot_name[0] = "target_service_name";
             } else {
@@ -791,8 +850,31 @@ static xpc_string_schema_t xpc_string_schema_for_event(uint16_t kind, uint32_t f
 static const char *xpc_arg_name(uint32_t func, size_t idx) {
     switch (func) {
         case XNIFF_XPC_FUNC_CONNECTION_CREATE:
+        case XNIFF_XPC_FUNC_CONNECTION_CREATE_MACH_SERVICE:
+        case XNIFF_XPC_FUNC_SESSION_CREATE_XPC_SERVICE:
+        case XNIFF_XPC_FUNC_SESSION_CREATE_MACH_SERVICE:
             if (idx == 0) return "service_name_ptr";
             if (idx == 1) return "target_queue_ptr";
+            return NULL;
+        case XNIFF_XPC_FUNC_CONNECTION_CREATE_FROM_ENDPOINT:
+            if (idx == 0) return "endpoint_ptr";
+            return NULL;
+        case XNIFF_XPC_FUNC_ARRAY_CREATE_CONNECTION:
+            if (idx == 0) return "array_ptr";
+            if (idx == 1) return "index";
+            return NULL;
+        case XNIFF_XPC_FUNC_DICTIONARY_CREATE_CONNECTION:
+            if (idx == 0) return "dictionary_ptr";
+            if (idx == 1) return "key_ptr";
+            return NULL;
+        case XNIFF_XPC_FUNC_CONNECTION_ACTIVATE:
+        case XNIFF_XPC_FUNC_CONNECTION_RESUME:
+        case XNIFF_XPC_FUNC_CONNECTION_CANCEL:
+            if (idx == 0) return "connection_ptr";
+            return NULL;
+        case XNIFF_XPC_FUNC_SESSION_ACTIVATE:
+        case XNIFF_XPC_FUNC_SESSION_CANCEL:
+            if (idx == 0) return "session_ptr";
             return NULL;
         case XNIFF_XPC_FUNC_DICTIONARY_SEND_REPLY:
             if (idx == 0) return "reply_ptr";
@@ -898,6 +980,7 @@ static void print_xpc_event(
     const xniff_xpc_analysis_t *xa,
     const xniff_xpc_serialized_set_t *xs,
     const xniff_xpc_conn_meta_item_t *cm,
+    const xniff_xpc_object_ref_item_t *object_ref,
     const char *s0,
     const char *s1,
     const char *s2,
@@ -925,6 +1008,11 @@ static void print_xpc_event(
         printf("  xpc.call_id: %llu\n", (unsigned long long)xa->call_id);
     }
     printf("  xpc.conn_ptr: 0x%llx\n", (unsigned long long)conn_ptr);
+    if (object_ref && object_ref->present) {
+        printf("  xpc.object_kind: %s\n",
+               object_ref->ref.kind == XNIFF_XPC_OBJECT_SESSION ? "session" : "connection");
+        printf("  xpc.object_lifecycle: %u\n", object_ref->ref.lifecycle);
+    }
     printf("  xpc.msg_ptr: 0x%llx\n", (unsigned long long)msg_ptr);
     printf("  xpc.conn_pid: %u\n", peer_pid);
     if (peer_name) printf("  xpc.conn_name: %s\n", peer_name);
@@ -1226,6 +1314,7 @@ static int capture_ring(pid_t pid, int ready_fd, xniff_shared_transport_t *trans
                 uint64_t call_id = 0;
                 xniff_xpc_serialized_set_t xser;
                 xniff_xpc_conn_meta_item_t xcm;
+                xniff_xpc_object_ref_item_t object_ref = {0};
                 xpc_serialized_init(&xser);
                 xpc_conn_meta_init(&xcm);
 
@@ -1248,7 +1337,7 @@ static int capture_ring(pid_t pid, int ready_fd, xniff_shared_transport_t *trans
                                sh.sec_len >= sizeof(call_id)) {
                         memcpy(&call_id, val, sizeof(call_id));
                     } else {
-                        xpc_parse_section(sh.sec_type, val, sh.sec_len, &xser, &xcm);
+                        xpc_parse_section(sh.sec_type, val, sh.sec_len, &xser, &xcm, &object_ref);
                     }
                     sec_off += sh.sec_len;
                 }
@@ -1263,9 +1352,10 @@ static int capture_ring(pid_t pid, int ready_fd, xniff_shared_transport_t *trans
                 format_time(tbuf, sizeof(tbuf), &mono_s);
 
                 xniff_xpc_analysis_t xa;
-                analyze_xpc_event(cur_evt_id, &ihdr, &pl, s0, mono_s, &xa);
+                analyze_xpc_event(cur_evt_id, &ihdr, &pl, s0, &object_ref, mono_s, &xa);
                 xa.call_id = call_id;
-                print_xpc_event(&ihdr, &pl, &xa, &xser, &xcm, s0, s1, s2, s3, tbuf, mono_s);
+                print_xpc_event(&ihdr, &pl, &xa, &xser, &xcm, &object_ref,
+                                s0, s1, s2, s3, tbuf, mono_s);
 
                 xpc_serialized_free(&xser);
                 xpc_conn_meta_free(&xcm);

@@ -17,6 +17,14 @@ void xniff_emit_mach_msg2_exit(uint64_t ret, const uint64_t args[8]);
 
 void xniff_emit_xpc_connection_create_entry(const uint64_t args[8]);
 void xniff_emit_xpc_connection_create_exit(uint64_t ret, const uint64_t args[8]);
+void xniff_emit_xpc_named_create_entry(uint32_t function, const uint64_t args[8]);
+void xniff_emit_xpc_connection_create_exit_for_function(uint32_t function, uint64_t ret,
+                                                        const uint64_t args[8]);
+void xniff_emit_xpc_session_create_exit(uint32_t function, uint64_t ret, const uint64_t args[8]);
+void xniff_emit_xpc_connection_lifecycle(uint32_t function, uint32_t direction, uint64_t ret,
+                                         const uint64_t args[8], uint16_t lifecycle);
+void xniff_emit_xpc_session_lifecycle(uint32_t function, uint32_t direction, uint64_t ret,
+                                      const uint64_t args[8], uint16_t lifecycle);
 
 void xniff_emit_xpc_pipe_routine_entry(const uint64_t args[8]);
 void xniff_emit_xpc_pipe_routine_exit(uint64_t ret, const uint64_t args[8]);

@@ -185,8 +185,9 @@ private struct ColumnSpecification {
     static let type = ColumnSpecification("type", "Type", 90, minimum: 72, maximum: 125)
     static let time = ColumnSpecification("time", "Time", 105, minimum: 88, maximum: 130)
     static let duration = ColumnSpecification("duration", "Duration", 90, minimum: 72, maximum: 115)
+    static let peer = ColumnSpecification("peer", "Peer PID", 75, minimum: 65, maximum: 95)
     static let process = ColumnSpecification("pid", "PID", 70, minimum: 60, maximum: 90)
-    static let all = [status, call, service, function, type, time, duration, process]
+    static let all = [status, call, service, function, type, time, duration, peer, process]
 
     init(
         _ rawID: String,
@@ -213,6 +214,7 @@ private struct ColumnSpecification {
         case type.id: call.role.label
         case time.id: String(format: "+%.6f", call.relativeSeconds)
         case duration.id: call.durationSeconds.map(formatDuration) ?? "—"
+        case peer.id: call.peerProcessID?.formatted() ?? "—"
         case process.id: call.processID.formatted()
         default: ""
         }
@@ -229,7 +231,7 @@ private struct ColumnSpecification {
     }
 
     static func isMonospaced(_ column: NSUserInterfaceItemIdentifier) -> Bool {
-        [call.id, time.id, duration.id, process.id].contains(column)
+        [call.id, time.id, duration.id, peer.id, process.id].contains(column)
     }
 
     private static func statusColor(_ call: TraceCall) -> NSColor {

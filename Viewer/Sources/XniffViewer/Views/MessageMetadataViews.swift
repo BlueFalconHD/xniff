@@ -19,6 +19,19 @@ struct MessageHeadersView: View {
         if let callID = event.callID { result.append(HeaderRow("Call ID", String(callID))) }
         if let service = event.serviceName { result.append(HeaderRow("Service", service)) }
         if let peer = event.peerProcessID { result.append(HeaderRow("Peer PID", String(peer))) }
+        if let token = event.peerAuditToken, token.count >= 8 {
+            result.append(HeaderRow("Peer PID version", String(token[7])))
+            result.append(HeaderRow(
+                "Peer audit token",
+                token.map { String(format: "%08X", $0) }.joined(separator: " ")
+            ))
+        }
+        if let object = event.xpcObjectID, let kind = event.xpcObjectKind {
+            result.append(HeaderRow(
+                kind == .connection ? "XPC connection" : "XPC session",
+                String(format: "0x%llX", object)
+            ))
+        }
         result.append(HeaderRow("Return value", String(format: "0x%llX", event.returnValue)))
         for (index, argument) in event.arguments.enumerated() where argument != 0 {
             result.append(HeaderRow("Argument \(index)", String(format: "0x%llX", argument)))

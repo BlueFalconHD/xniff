@@ -169,7 +169,45 @@ enum {
     XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE              = 9,
     XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_ASYNC = 10,
     XNIFF_XPC_FUNC_SESSION_SEND_MESSAGE_WITH_REPLY_SYNC = 11,
+    XNIFF_XPC_FUNC_CONNECTION_CREATE_MACH_SERVICE    = 12,
+    XNIFF_XPC_FUNC_CONNECTION_CREATE_FROM_ENDPOINT   = 13,
+    XNIFF_XPC_FUNC_ARRAY_CREATE_CONNECTION           = 14,
+    XNIFF_XPC_FUNC_DICTIONARY_CREATE_CONNECTION      = 15,
+    XNIFF_XPC_FUNC_SESSION_CREATE_XPC_SERVICE        = 16,
+    XNIFF_XPC_FUNC_SESSION_CREATE_MACH_SERVICE       = 17,
+    XNIFF_XPC_FUNC_CONNECTION_ACTIVATE               = 18,
+    XNIFF_XPC_FUNC_CONNECTION_RESUME                 = 19,
+    XNIFF_XPC_FUNC_CONNECTION_CANCEL                 = 20,
+    XNIFF_XPC_FUNC_SESSION_ACTIVATE                  = 21,
+    XNIFF_XPC_FUNC_SESSION_CANCEL                    = 22,
 };
+
+enum {
+    XNIFF_XPC_OBJECT_REF_VERSION = 1,
+};
+
+enum {
+    XNIFF_XPC_OBJECT_CONNECTION = 1,
+    XNIFF_XPC_OBJECT_SESSION = 2,
+};
+
+enum {
+    XNIFF_XPC_OBJECT_OBSERVED = 0,
+    XNIFF_XPC_OBJECT_CREATED = 1,
+    XNIFF_XPC_OBJECT_CANCELLED = 2,
+};
+
+// Exact identity of the connection/session involved in an XPC event. The
+// object value is meaningful only within pid and one captured lifetime.
+typedef struct {
+    uint32_t version;
+    uint16_t kind;       // XNIFF_XPC_OBJECT_*
+    uint16_t lifecycle;  // XNIFF_XPC_OBJECT_{OBSERVED,CREATED,CANCELLED}
+    uint64_t object;
+} xniff_xpc_object_ref_t;
+
+_Static_assert(sizeof(xniff_xpc_object_ref_t) == 16,
+               "xniff_xpc_object_ref_t must be 16 bytes");
 
 // TLV framing for attachments following the message bytes
 typedef struct {

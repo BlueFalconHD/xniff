@@ -64,7 +64,11 @@ public enum XniffTraceParser {
             var returnValue: UInt64 = 0
             var arguments: [UInt64] = []
             var peerProcessID: UInt32?
+            var peerAuditToken: [UInt32]?
             var serviceName: String?
+            var xpcObjectID: UInt64?
+            var xpcObjectKind: XPCObjectKind?
+            var xpcObjectLifecycle: XPCObjectLifecycle?
             var callID: UInt64?
             var payloads: [TracePayloadSlice] = []
             var backtracePCs: [UInt64] = []
@@ -128,6 +132,48 @@ public enum XniffTraceParser {
                             range: payloadStart..<(payloadStart + storedLength)
                         ))
                     }
+                case 8 where api == .xpc:
+                    if sectionLength >= 128 {
+                        var section = BinaryReader(data: data, offset: sectionStart, end: sectionEnd)
+                        let metadataVersion = try section.readUInt32()
+                        let flags = try section.readUInt32()
+                        let publicPID = try section.readUInt32()
+                        let privatePID = try section.readUInt32()
+                        try section.skip(24) // euid, egid, and audit-session IDs
+                        try section.skip(48) // instances, policy, bootstrap type, and contexts
+                        let auditToken = try (0..<8).map { _ in try section.readUInt32() }
+                        let publicNameLength = Int(try section.readUInt32())
+                        let privateNameLength = Int(try section.readUInt32())
+
+                        if metadataVersion == 1 {
+                            if flags & (1 << 2) != 0, publicPID != 0 {
+                                peerProcessID = publicPID
+                            } else if flags & (1 << 3) != 0, privatePID != 0 {
+                                peerProcessID = privatePID
+                            } else if flags & (1 << 14) != 0, auditToken[5] != 0 {
+                                peerProcessID = auditToken[5]
+                            }
+                            if flags & (1 << 14) != 0 {
+                                peerAuditToken = auditToken
+                            }
+
+                            if publicNameLength >= 0, privateNameLength >= 0,
+                               publicNameLength + privateNameLength <= section.remaining {
+                                let publicName = publicNameLength == 0
+                                    ? nil
+                                    : try section.readString(count: publicNameLength)
+                                if flags & 1 != 0, publicName?.isEmpty == false {
+                                    serviceName = serviceName ?? publicName
+                                }
+                                let privateName = privateNameLength == 0
+                                    ? nil
+                                    : try section.readString(count: privateNameLength)
+                                if flags & (1 << 1) != 0, privateName?.isEmpty == false {
+                                    serviceName = serviceName ?? privateName
+                                }
+                            }
+                        }
+                    }
                 case 9 where api == .diagnostic:
                     if sectionLength >= 8 {
                         var section = BinaryReader(data: data, offset: sectionStart, end: sectionEnd)
@@ -158,6 +204,19 @@ public enum XniffTraceParser {
                         var section = BinaryReader(data: data, offset: sectionStart, end: sectionEnd)
                         let wireID = try section.readUInt64()
                         if wireID != 0 { callID = wireID }
+                    }
+                case 14 where api == .xpc:
+                    if sectionLength >= 16 {
+                        var section = BinaryReader(data: data, offset: sectionStart, end: sectionEnd)
+                        let objectVersion = try section.readUInt32()
+                        let kind = try section.readUInt16()
+                        let lifecycle = try section.readUInt16()
+                        let object = try section.readUInt64()
+                        if objectVersion == 1, object != 0 {
+                            xpcObjectID = object
+                            xpcObjectKind = XPCObjectKind(rawValue: kind)
+                            xpcObjectLifecycle = XPCObjectLifecycle(rawValue: lifecycle)
+                        }
                     }
                 case 11:
                     if sectionLength >= 8 {
@@ -233,12 +292,16 @@ public enum XniffTraceParser {
                         imagePath: symbol?.image
                     )
                 },
-                summary: summary
+                summary: summary,
+                peerAuditToken: peerAuditToken,
+                xpcObjectID: xpcObjectID,
+                xpcObjectKind: xpcObjectKind,
+                xpcObjectLifecycle: xpcObjectLifecycle
             ))
         }
 
         let baseline = pending.first?.timestamp ?? 0
-        let events = pending.enumerated().map { index, item in
+        let parsedEvents = pending.enumerated().map { index, item in
             TraceEvent(
                 id: UInt64(index + 1),
                 sequence: item.sequence,
@@ -258,9 +321,14 @@ public enum XniffTraceParser {
                 arguments: item.arguments,
                 payloads: item.payloads,
                 backtrace: item.backtrace,
-                summary: item.summary
+                summary: item.summary,
+                peerAuditToken: item.peerAuditToken,
+                xpcObjectID: item.xpcObjectID,
+                xpcObjectKind: item.xpcObjectKind,
+                xpcObjectLifecycle: item.xpcObjectLifecycle
             )
         }
+        let events = XPCAttribution.applyExactServiceNames(to: parsedEvents)
         return TraceDocument(
             url: sourceURL,
             data: data,
@@ -353,4 +421,8 @@ private struct PendingEvent {
     let payloads: [TracePayloadSlice]
     let backtrace: [TraceFrame]
     let summary: String
+    let peerAuditToken: [UInt32]?
+    let xpcObjectID: UInt64?
+    let xpcObjectKind: XPCObjectKind?
+    let xpcObjectLifecycle: XPCObjectLifecycle?
 }

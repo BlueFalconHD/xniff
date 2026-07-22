@@ -34,6 +34,17 @@ enum _XniffHookId {
   XNIFF_HOOK_MACH_MSG2_INTERNAL,
   XNIFF_HOOK_MACH_MSG2_TRAP,
   XNIFF_HOOK_XPC_CONNECTION_CREATE,
+  XNIFF_HOOK_XPC_CONNECTION_CREATE_MACH_SERVICE,
+  XNIFF_HOOK_XPC_CONNECTION_CREATE_FROM_ENDPOINT,
+  XNIFF_HOOK_XPC_ARRAY_CREATE_CONNECTION,
+  XNIFF_HOOK_XPC_DICTIONARY_CREATE_CONNECTION,
+  XNIFF_HOOK_XPC_SESSION_CREATE_XPC_SERVICE,
+  XNIFF_HOOK_XPC_SESSION_CREATE_MACH_SERVICE,
+  XNIFF_HOOK_XPC_CONNECTION_ACTIVATE,
+  XNIFF_HOOK_XPC_CONNECTION_RESUME,
+  XNIFF_HOOK_XPC_CONNECTION_CANCEL,
+  XNIFF_HOOK_XPC_SESSION_ACTIVATE,
+  XNIFF_HOOK_XPC_SESSION_CANCEL,
   XNIFF_HOOK_XPC_PIPE_ROUTINE,
   XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE,
   XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE_WITH_REPLY,
@@ -102,6 +113,17 @@ static XniffExportHookSpec g_export_hooks[] = {
   { NULL, "mach_msg2_internal", XNIFF_HOOK_MACH_MSG2_INTERNAL, FALSE },
   { NULL, "mach_msg2_trap", XNIFF_HOOK_MACH_MSG2_TRAP, FALSE },
   { "libxpc", "xpc_connection_create", XNIFF_HOOK_XPC_CONNECTION_CREATE, FALSE },
+  { "libxpc", "xpc_connection_create_mach_service", XNIFF_HOOK_XPC_CONNECTION_CREATE_MACH_SERVICE, FALSE },
+  { "libxpc", "xpc_connection_create_from_endpoint", XNIFF_HOOK_XPC_CONNECTION_CREATE_FROM_ENDPOINT, FALSE },
+  { "libxpc", "xpc_array_create_connection", XNIFF_HOOK_XPC_ARRAY_CREATE_CONNECTION, FALSE },
+  { "libxpc", "xpc_dictionary_create_connection", XNIFF_HOOK_XPC_DICTIONARY_CREATE_CONNECTION, FALSE },
+  { "libxpc", "xpc_session_create_xpc_service", XNIFF_HOOK_XPC_SESSION_CREATE_XPC_SERVICE, FALSE },
+  { "libxpc", "xpc_session_create_mach_service", XNIFF_HOOK_XPC_SESSION_CREATE_MACH_SERVICE, FALSE },
+  { "libxpc", "xpc_connection_activate", XNIFF_HOOK_XPC_CONNECTION_ACTIVATE, FALSE },
+  { "libxpc", "xpc_connection_resume", XNIFF_HOOK_XPC_CONNECTION_RESUME, FALSE },
+  { "libxpc", "xpc_connection_cancel", XNIFF_HOOK_XPC_CONNECTION_CANCEL, FALSE },
+  { "libxpc", "xpc_session_activate", XNIFF_HOOK_XPC_SESSION_ACTIVATE, FALSE },
+  { "libxpc", "xpc_session_cancel", XNIFF_HOOK_XPC_SESSION_CANCEL, FALSE },
   { "libxpc", "xpc_pipe_routine", XNIFF_HOOK_XPC_PIPE_ROUTINE, FALSE },
   { "libxpc", "xpc_connection_send_message", XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE, FALSE },
   { "libxpc", "xpc_connection_send_message_with_reply", XNIFF_HOOK_XPC_CONNECTION_SEND_MESSAGE_WITH_REPLY, FALSE },
@@ -392,6 +414,32 @@ static void xniff_listener_on_enter(GumInvocationListener *listener, GumInvocati
     case XNIFF_HOOK_XPC_CONNECTION_CREATE:
       xniff_emit_xpc_connection_create_entry(args);
       break;
+    case XNIFF_HOOK_XPC_CONNECTION_CREATE_MACH_SERVICE:
+      xniff_emit_xpc_named_create_entry(XNIFF_XPC_FUNC_CONNECTION_CREATE_MACH_SERVICE, args);
+      break;
+    case XNIFF_HOOK_XPC_SESSION_CREATE_XPC_SERVICE:
+      xniff_emit_xpc_named_create_entry(XNIFF_XPC_FUNC_SESSION_CREATE_XPC_SERVICE, args);
+      break;
+    case XNIFF_HOOK_XPC_SESSION_CREATE_MACH_SERVICE:
+      xniff_emit_xpc_named_create_entry(XNIFF_XPC_FUNC_SESSION_CREATE_MACH_SERVICE, args);
+      break;
+    case XNIFF_HOOK_XPC_CONNECTION_CANCEL:
+      xniff_emit_xpc_connection_lifecycle(
+          XNIFF_XPC_FUNC_CONNECTION_CANCEL, XNIFF_DIR_ENTRY, 0, args,
+          XNIFF_XPC_OBJECT_CANCELLED);
+      break;
+    case XNIFF_HOOK_XPC_SESSION_CANCEL:
+      xniff_emit_xpc_session_lifecycle(
+          XNIFF_XPC_FUNC_SESSION_CANCEL, XNIFF_DIR_ENTRY, 0, args,
+          XNIFF_XPC_OBJECT_CANCELLED);
+      break;
+    case XNIFF_HOOK_XPC_CONNECTION_CREATE_FROM_ENDPOINT:
+    case XNIFF_HOOK_XPC_ARRAY_CREATE_CONNECTION:
+    case XNIFF_HOOK_XPC_DICTIONARY_CREATE_CONNECTION:
+    case XNIFF_HOOK_XPC_CONNECTION_ACTIVATE:
+    case XNIFF_HOOK_XPC_CONNECTION_RESUME:
+    case XNIFF_HOOK_XPC_SESSION_ACTIVATE:
+      break;
     case XNIFF_HOOK_XPC_PIPE_ROUTINE:
       xniff_emit_xpc_pipe_routine_entry(args);
       break;
@@ -489,6 +537,48 @@ static void xniff_listener_on_leave(GumInvocationListener *listener, GumInvocati
       break;
     case XNIFF_HOOK_XPC_CONNECTION_CREATE:
       xniff_emit_xpc_connection_create_exit(ret, args);
+      break;
+    case XNIFF_HOOK_XPC_CONNECTION_CREATE_MACH_SERVICE:
+      xniff_emit_xpc_connection_create_exit_for_function(
+          XNIFF_XPC_FUNC_CONNECTION_CREATE_MACH_SERVICE, ret, args);
+      break;
+    case XNIFF_HOOK_XPC_CONNECTION_CREATE_FROM_ENDPOINT:
+      xniff_emit_xpc_connection_create_exit_for_function(
+          XNIFF_XPC_FUNC_CONNECTION_CREATE_FROM_ENDPOINT, ret, args);
+      break;
+    case XNIFF_HOOK_XPC_ARRAY_CREATE_CONNECTION:
+      xniff_emit_xpc_connection_create_exit_for_function(
+          XNIFF_XPC_FUNC_ARRAY_CREATE_CONNECTION, ret, args);
+      break;
+    case XNIFF_HOOK_XPC_DICTIONARY_CREATE_CONNECTION:
+      xniff_emit_xpc_connection_create_exit_for_function(
+          XNIFF_XPC_FUNC_DICTIONARY_CREATE_CONNECTION, ret, args);
+      break;
+    case XNIFF_HOOK_XPC_SESSION_CREATE_XPC_SERVICE:
+      xniff_emit_xpc_session_create_exit(
+          XNIFF_XPC_FUNC_SESSION_CREATE_XPC_SERVICE, ret, args);
+      break;
+    case XNIFF_HOOK_XPC_SESSION_CREATE_MACH_SERVICE:
+      xniff_emit_xpc_session_create_exit(
+          XNIFF_XPC_FUNC_SESSION_CREATE_MACH_SERVICE, ret, args);
+      break;
+    case XNIFF_HOOK_XPC_CONNECTION_ACTIVATE:
+      xniff_emit_xpc_connection_lifecycle(
+          XNIFF_XPC_FUNC_CONNECTION_ACTIVATE, XNIFF_DIR_EXIT, ret, args,
+          XNIFF_XPC_OBJECT_OBSERVED);
+      break;
+    case XNIFF_HOOK_XPC_CONNECTION_RESUME:
+      xniff_emit_xpc_connection_lifecycle(
+          XNIFF_XPC_FUNC_CONNECTION_RESUME, XNIFF_DIR_EXIT, ret, args,
+          XNIFF_XPC_OBJECT_OBSERVED);
+      break;
+    case XNIFF_HOOK_XPC_SESSION_ACTIVATE:
+      xniff_emit_xpc_session_lifecycle(
+          XNIFF_XPC_FUNC_SESSION_ACTIVATE, XNIFF_DIR_EXIT, ret, args,
+          XNIFF_XPC_OBJECT_OBSERVED);
+      break;
+    case XNIFF_HOOK_XPC_CONNECTION_CANCEL:
+    case XNIFF_HOOK_XPC_SESSION_CANCEL:
       break;
     case XNIFF_HOOK_XPC_PIPE_ROUTINE:
       xniff_emit_xpc_pipe_routine_exit(ret, args);

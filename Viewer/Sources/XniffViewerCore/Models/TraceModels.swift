@@ -143,6 +143,17 @@ public struct TraceFrame: Sendable, Hashable, Identifiable {
     }
 }
 
+public enum XPCObjectKind: UInt16, Sendable, Hashable {
+    case connection = 1
+    case session = 2
+}
+
+public enum XPCObjectLifecycle: UInt16, Sendable, Hashable {
+    case observed = 0
+    case created = 1
+    case cancelled = 2
+}
+
 public struct TraceEvent: Sendable, Identifiable, Hashable {
     public let id: UInt64
     public let sequence: UInt64
@@ -157,7 +168,11 @@ public struct TraceEvent: Sendable, Identifiable, Hashable {
     public let role: TraceRole
     public let callID: UInt64?
     public let peerProcessID: UInt32?
+    public let peerAuditToken: [UInt32]?
     public let serviceName: String?
+    public let xpcObjectID: UInt64?
+    public let xpcObjectKind: XPCObjectKind?
+    public let xpcObjectLifecycle: XPCObjectLifecycle?
     public let returnValue: UInt64
     public let arguments: [UInt64]
     public let payloads: [TracePayloadSlice]
@@ -184,7 +199,11 @@ public struct TraceEvent: Sendable, Identifiable, Hashable {
         arguments: [UInt64],
         payloads: [TracePayloadSlice],
         backtrace: [TraceFrame],
-        summary: String
+        summary: String,
+        peerAuditToken: [UInt32]? = nil,
+        xpcObjectID: UInt64? = nil,
+        xpcObjectKind: XPCObjectKind? = nil,
+        xpcObjectLifecycle: XPCObjectLifecycle? = nil
     ) {
         self.id = id
         self.sequence = sequence
@@ -199,7 +218,11 @@ public struct TraceEvent: Sendable, Identifiable, Hashable {
         self.role = role
         self.callID = callID
         self.peerProcessID = peerProcessID
+        self.peerAuditToken = peerAuditToken
         self.serviceName = serviceName
+        self.xpcObjectID = xpcObjectID
+        self.xpcObjectKind = xpcObjectKind
+        self.xpcObjectLifecycle = xpcObjectLifecycle
         self.returnValue = returnValue
         self.arguments = arguments
         self.payloads = payloads
@@ -212,6 +235,7 @@ public struct TraceEvent: Sendable, Identifiable, Hashable {
             summary,
             callID.map(String.init) ?? "",
             String(processID),
+            peerProcessID.map(String.init) ?? "",
         ].joined(separator: " ").lowercased()
     }
 }
@@ -266,6 +290,9 @@ public struct TraceCall: Sendable, Identifiable, Hashable {
     public var serviceName: String? {
         events.lazy.compactMap(\.serviceName).first
     }
+    public var peerProcessID: UInt32? {
+        events.lazy.compactMap(\.peerProcessID).first
+    }
     public var functionName: String { primaryEvent.functionName }
     public var processID: UInt32 { id.processID }
     public var relativeSeconds: Double { events.first?.relativeSeconds ?? 0 }
@@ -307,7 +334,11 @@ public struct TraceCall: Sendable, Identifiable, Hashable {
             arguments: event.arguments,
             payloads: event.payloads,
             backtrace: event.backtrace,
-            summary: event.summary
+            summary: event.summary,
+            peerAuditToken: event.peerAuditToken,
+            xpcObjectID: event.xpcObjectID,
+            xpcObjectKind: event.xpcObjectKind,
+            xpcObjectLifecycle: event.xpcObjectLifecycle
         )
     }
 }
@@ -344,6 +375,17 @@ public enum TraceModel {
         case 9: "xpc_session_send_message"
         case 10: "xpc_session_send_message_with_reply_async"
         case 11: "xpc_session_send_message_with_reply_sync"
+        case 12: "xpc_connection_create_mach_service"
+        case 13: "xpc_connection_create_from_endpoint"
+        case 14: "xpc_array_create_connection"
+        case 15: "xpc_dictionary_create_connection"
+        case 16: "xpc_session_create_xpc_service"
+        case 17: "xpc_session_create_mach_service"
+        case 18: "xpc_connection_activate"
+        case 19: "xpc_connection_resume"
+        case 20: "xpc_connection_cancel"
+        case 21: "xpc_session_activate"
+        case 22: "xpc_session_cancel"
         default: "xpc_function_\(function)"
         }
     }

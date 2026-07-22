@@ -96,6 +96,44 @@ private let diagnosticSerialization = Data(hex: """
     #expect(document.events.isEmpty)
 }
 
+@Test func attributesOnlyExactMetadataWithinAnXPCObjectLifetime() throws {
+    let object: UInt64 = 0x1234_5678
+    var file = Data()
+    file.appendLE(UInt32(0x584e4246))
+    file.appendLE(UInt16(2))
+    file.appendLE(UInt16(0))
+    file.append(makeAttributionRecord(
+        sequence: 1, function: 12, direction: 1, object: object,
+        lifecycle: 1, service: "com.example.first"
+    ))
+    file.append(makeAttributionRecord(
+        sequence: 2, function: 5, direction: 0, object: object,
+        lifecycle: 0, auditPID: 4_321
+    ))
+    file.append(makeAttributionRecord(
+        sequence: 3, function: 20, direction: 0, object: object,
+        lifecycle: 2
+    ))
+    file.append(makeAttributionRecord(
+        sequence: 4, function: 12, direction: 1, object: object,
+        lifecycle: 1, service: "com.example.second"
+    ))
+    file.append(makeAttributionRecord(
+        sequence: 5, function: 5, direction: 0, object: object,
+        lifecycle: 0
+    ))
+
+    let events = try XniffTraceParser.parse(data: file).events
+    #expect(events.map(\.serviceName) == [
+        "com.example.first", "com.example.first", "com.example.first",
+        "com.example.second", "com.example.second",
+    ])
+    #expect(events[1].peerProcessID == 4_321)
+    #expect(events[1].peerAuditToken?[5] == 4_321)
+    #expect(events[0].peerProcessID == nil)
+    #expect(events[4].peerProcessID == nil)
+}
+
 @Test func retainsDataWhileDecodingItsPropertyList() throws {
     let plist = try PropertyListSerialization.data(
         fromPropertyList: ["hello": "world"],
@@ -291,6 +329,72 @@ private func makeRecord(
     serialized.appendLE(UInt32(diagnosticSerialization.count))
     serialized.append(diagnosticSerialization)
     body.appendSection(type: 7, payload: serialized)
+
+    var record = Data()
+    record.appendLE(UInt32(16 + body.count))
+    record.appendLE(UInt16(2))
+    record.appendLE(UInt16(1))
+    record.appendLE(sequence)
+    record.append(body)
+    return record
+}
+
+private func makeAttributionRecord(
+    sequence: UInt64,
+    function: UInt32,
+    direction: UInt16,
+    object: UInt64,
+    lifecycle: UInt16,
+    service: String? = nil,
+    auditPID: UInt32? = nil
+) -> Data {
+    var fixed = Data()
+    fixed.appendLE(UInt32(99))
+    fixed.appendLE(UInt32(7))
+    fixed.appendLE(sequence)
+    fixed.appendLE(direction)
+    fixed.appendLE(UInt16(3))
+    fixed.appendLE(function)
+
+    let serviceBytes = Data((service ?? "").utf8)
+    var call = Data()
+    call.appendLE(UInt32(3))
+    call.appendLE(UInt32(direction))
+    call.appendLE(function)
+    call.appendLE(UInt32(0))
+    call.appendLE(UInt64(0))
+    for _ in 0..<8 { call.appendLE(UInt64(0)) }
+    call.appendLE(UInt32(serviceBytes.count))
+    for _ in 0..<3 { call.appendLE(UInt32(0)) }
+    call.append(serviceBytes)
+
+    var objectRef = Data()
+    objectRef.appendLE(UInt32(1))
+    objectRef.appendLE(UInt16(1))
+    objectRef.appendLE(lifecycle)
+    objectRef.appendLE(object)
+
+    var body = fixed
+    body.appendSection(type: 10, payload: call)
+    body.appendSection(type: 14, payload: objectRef)
+
+    if let auditPID {
+        var metadata = Data()
+        metadata.appendLE(UInt32(1))
+        metadata.appendLE(UInt32(1 << 14))
+        for _ in 0..<8 { metadata.appendLE(UInt32(0)) }
+        for _ in 0..<6 { metadata.appendLE(UInt64(0)) }
+        for index in 0..<8 {
+            metadata.appendLE(index == 5 ? auditPID : UInt32(0))
+        }
+        metadata.appendLE(UInt32(0))
+        metadata.appendLE(UInt32(0))
+        body.appendSection(type: 8, payload: metadata)
+    }
+
+    var callID = Data()
+    callID.appendLE(sequence)
+    body.appendSection(type: 13, payload: callID)
 
     var record = Data()
     record.appendLE(UInt32(16 + body.count))
