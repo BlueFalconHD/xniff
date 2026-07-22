@@ -127,8 +127,8 @@ private final class HexHostingScrollView: NSScrollView {
 
     func scrollTo(byteOffset: Int) {
         layoutDocument()
-        let row = byteOffset / HexDocumentView.bytesPerLine
-        let targetY = max(0, CGFloat(row) * HexDocumentView.lineHeight - contentSize.height / 2)
+        let row = byteOffset / HexLineLayout.bytesPerLine
+        let targetY = max(0, CGFloat(row) * HexLineLayout.lineHeight - contentSize.height / 2)
         contentView.scroll(to: NSPoint(x: contentView.bounds.origin.x, y: targetY))
         reflectScrolledClipView(contentView)
     }
@@ -136,9 +136,6 @@ private final class HexHostingScrollView: NSScrollView {
 
 @MainActor
 private final class HexDocumentView: NSView {
-    static let bytesPerLine = 16
-    static let lineHeight: CGFloat = 17
-
     private let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
     private lazy var characterWidth = "0".size(withAttributes: normalAttributes).width
     private lazy var normalAttributes: [NSAttributedString.Key: Any] = [
@@ -167,10 +164,10 @@ private final class HexDocumentView: NSView {
     }
 
     func documentSize(minimumWidth: CGFloat) -> NSSize {
-        let lines = max(1, (data.count + Self.bytesPerLine - 1) / Self.bytesPerLine)
+        let lines = max(1, HexLineLayout.lineCount(forByteCount: data.count))
         return NSSize(
             width: max(minimumWidth, 690),
-            height: CGFloat(lines) * Self.lineHeight + 16
+            height: CGFloat(lines) * HexLineLayout.lineHeight + 16
         )
     }
 
@@ -181,25 +178,20 @@ private final class HexDocumentView: NSView {
             return
         }
 
-        let firstLine = max(0, Int(dirtyRect.minY / Self.lineHeight))
-        let finalLine = min(
-            (data.count + Self.bytesPerLine - 1) / Self.bytesPerLine,
-            Int(ceil(dirtyRect.maxY / Self.lineHeight)) + 1
-        )
-        for line in firstLine..<finalLine {
+        for line in HexLineLayout.visibleLines(byteCount: data.count, in: dirtyRect) {
             drawLine(line)
         }
     }
 
     private func drawLine(_ line: Int) {
-        let offset = line * Self.bytesPerLine
-        let y = CGFloat(line) * Self.lineHeight + 2
+        let offset = line * HexLineLayout.bytesPerLine
+        let y = CGFloat(line) * HexLineLayout.lineHeight + 2
         String(format: "%08X", offset)
             .draw(at: NSPoint(x: 8, y: y), withAttributes: secondaryAttributes)
 
         let hexStart: CGFloat = 78
         let byteStride = characterWidth * 3
-        for column in 0..<Self.bytesPerLine {
+        for column in 0..<HexLineLayout.bytesPerLine {
             let index = offset + column
             guard index < data.count else { break }
             let groupGap = column >= 8 ? characterWidth : 0
@@ -212,7 +204,7 @@ private final class HexDocumentView: NSView {
                         x: x - 2,
                         y: y - 1,
                         width: characterWidth * 2 + 4,
-                        height: Self.lineHeight - 1
+                        height: HexLineLayout.lineHeight - 1
                     ),
                     xRadius: 2,
                     yRadius: 2
@@ -224,8 +216,8 @@ private final class HexDocumentView: NSView {
             )
         }
 
-        let asciiX = hexStart + CGFloat(Self.bytesPerLine) * byteStride + characterWidth * 3
-        let end = min(data.count, offset + Self.bytesPerLine)
+        let asciiX = hexStart + CGFloat(HexLineLayout.bytesPerLine) * byteStride + characterWidth * 3
+        let end = min(data.count, offset + HexLineLayout.bytesPerLine)
         let ascii = data[offset..<end].map { byte in
             (32...126).contains(byte) ? String(UnicodeScalar(byte)) : "."
         }.joined()

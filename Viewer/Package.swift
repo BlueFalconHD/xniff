@@ -19,5 +19,9 @@ let package = Package(
             name: "XniffViewerCoreTests",
             dependencies: ["XniffViewerCore"]
         ),
+        .testTarget(
+            name: "XniffViewerTests",
+            dependencies: ["XniffViewer"]
+        ),
     ]
 )
