@@ -5,6 +5,7 @@ public struct BodyInspectorRegistry: Sendable {
         HexBodyInspector(),
         RawXPCBodyInspector(),
         FoundationNSXPCBodyInspector(),
+        SwiftXPCCodableBodyInspector(),
         CoreDataXPCBodyInspector(),
     ])
 

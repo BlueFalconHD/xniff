@@ -15,6 +15,7 @@ The built-in chain is:
 
 ```text
 Hex (-100) -> Raw XPC (0) -> Foundation NSXPC (100) -> Core Data / NSXPCStore (200)
+                         \-> Swift XPC Codable (150)
 ```
 
 To add a layer:
@@ -70,6 +71,37 @@ Objective-C type tokens rather than extracting quoted class names heuristically.
 Objects encoded out of line appear in the outer `ool` XPC array. Their archived
 wrapper contains a `$xpc` integer, which is an index into that array. The
 Foundation tree resolves the index while retaining both it and the typed wrapper.
+
+## Swift XPC Codable wire format
+
+libSwiftXPC version 1 stores a breadth-first serialized `EncodingGraph` in the
+outer XPC dictionary's `_CodableBody` data value. Graph tags preserve Codable's
+keyed, unkeyed, and single-value containers and its complete scalar type set.
+Container-reference tags declare numbered nodes; container-end tags advance to
+those nodes in numeric order.
+
+The version-1 tags are:
+
+| Tag | Meaning |
+| ---: | --- |
+| `0x00` | `nil` |
+| `0x01` / `0x02` | `true` / `false` |
+| `0x03` | UTF-8 string |
+| `0x04` / `0x05` | `Float` / `Double` |
+| `0x06`–`0x0A` | `Int`, `Int8`, `Int16`, `Int32`, `Int64` |
+| `0x0B`–`0x0F` | `UInt`, `UInt8`, `UInt16`, `UInt32`, `UInt64` |
+| `0x10` / `0x11` | Empty / string coding key |
+| `0x12` | `_CodableOutOfLine` index |
+| `0x13` | Container metadata (`0x0A` keyed, `0x0B` unkeyed, `0x0C` single-value) |
+| `0x14` | Numbered container reference |
+| `0x15` | Finish the current container and advance to the next node |
+| `0x16` | Invalid/dangling-container sentinel |
+
+`_CodableOutOfLine` carries `XPCData` values referenced by a dedicated graph tag.
+`_CodableOutOfLine4CodableObject` carries general `XPCCodableObject` values. The
+latter are encoded in a single-value container as an integer array index, so the
+viewer resolves them only when exactly one graph location can refer to that
+index. The resolved tree keeps both the index and the raw XPC value.
 
 The observed `f` bits are:
 

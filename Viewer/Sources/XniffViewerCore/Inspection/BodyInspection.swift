@@ -82,5 +82,6 @@ public enum StandardBodyInspectorID {
     public static let hex = "xniff.hex"
     public static let rawXPC = "xniff.raw-xpc"
     public static let foundationNSXPC = "xniff.foundation-nsxpc"
+    public static let swiftXPCCodable = "xniff.swift-xpc-codable"
     public static let coreDataXPC = "xniff.core-data-xpc"
 }

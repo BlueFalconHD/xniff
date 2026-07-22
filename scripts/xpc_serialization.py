@@ -5,11 +5,19 @@ from __future__ import annotations
 import json
 import struct
 import uuid
+from dataclasses import dataclass
 from typing import Any
+
+from swift_xpc_codable import SwiftXPCDecodeError, decode_swift_xpc_codable
 
 
 class XPCDecodeError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class _XPCData:
+    value: bytes
 
 
 class _Reader:
@@ -57,12 +65,7 @@ def _decode_object(reader: _Reader) -> Any:
         return {"$date": reader.u64()}
     if type_code == 0x07:
         length = reader.u32()
-        value = reader.read(length)
-        preview = value[:256].hex()
-        result = {"$data": preview, "length": length}
-        if len(value) > 256:
-            result["preview_truncated"] = True
-        return result
+        return _XPCData(reader.read(length))
     if type_code == 0x08:
         length = reader.u32()
         value = reader.read(length)
@@ -115,14 +118,50 @@ def decode_xpc_serialization(data: bytes) -> Any:
     reader = _Reader(data)
     if len(data) >= 8 and struct.unpack_from("<II", data, 0) == (0x42133742, 5):
         reader.offset = 8
-        return _decode_object(reader)
+        return _materialize(_decode_object(reader))
     if reader.read(4) != b"CPX@":
         raise XPCDecodeError("missing XPC serialization magic")
     version = reader.u32()
     if version != 5:
         raise XPCDecodeError(f"unsupported XPC serialization version {version}")
-    return _decode_object(reader)
+    return _materialize(_decode_object(reader))
 
 
 def format_xpc_serialization(data: bytes) -> str:
     return json.dumps(decode_xpc_serialization(data), indent=2, ensure_ascii=False)
+
+
+def _materialize(value: Any) -> Any:
+    if isinstance(value, _XPCData):
+        return _data_preview(value.value)
+    if isinstance(value, list):
+        return [_materialize(item) for item in value]
+    if isinstance(value, dict):
+        result = {key: _materialize(item) for key, item in value.items()}
+        body = value.get("_CodableBody")
+        version = value.get("_CodableCoderVersion")
+        if isinstance(body, _XPCData) and version == 1:
+            try:
+                out_of_line = value.get("_CodableOutOfLine")
+                if not isinstance(out_of_line, list):
+                    out_of_line = []
+                codable_objects = value.get("_CodableOutOfLine4CodableObject")
+                if not isinstance(codable_objects, list):
+                    codable_objects = []
+                decoded = decode_swift_xpc_codable(
+                    body.value,
+                    out_of_line=out_of_line,
+                    codable_objects=codable_objects,
+                )
+                result["_CodableBody"]["decoded"] = _materialize(decoded)
+            except SwiftXPCDecodeError as exc:
+                result["_CodableBody"]["decode_error"] = str(exc)
+        return result
+    return value
+
+
+def _data_preview(value: bytes) -> dict[str, Any]:
+    result: dict[str, Any] = {"$data": value[:256].hex(), "length": len(value)}
+    if len(value) > 256:
+        result["preview_truncated"] = True
+    return result

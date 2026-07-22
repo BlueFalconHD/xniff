@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 from print_xpc import iter_events
+from swift_xpc_codable import decode_swift_xpc_codable
 from xpc_serialization import decode_xpc_serialization
 
 
@@ -54,6 +55,26 @@ class XPCSerializationTests(unittest.TestCase):
         self.assertEqual(events[0]["xpc"]["role"], "request")
         self.assertEqual(events[1]["xpc"]["role"], "response")
         self.assertIn("xniff-diagnostic", events[0]["xpc"]["serialized"]["message"]["pretty"])
+
+    def test_decodes_swift_xpc_codable_graph(self):
+        def string(tag, value):
+            encoded = value.encode()
+            return bytes([tag]) + struct.pack("<Q", len(encoded)) + encoded + b"\0"
+
+        body = bytes([0x13, 0x0B, 0x0F]) + struct.pack("<Q", 41_300_000)
+        body += bytes([0x14]) + struct.pack("<I", 0) + bytes([0x15, 0x13, 0x0A])
+        body += string(0x11, "createSession")
+        body += bytes([0x14]) + struct.pack("<I", 1) + bytes([0x15, 0x13, 0x0A])
+        body += string(0x11, "name") + string(0x03, "hello")
+
+        decoded = decode_swift_xpc_codable(body)
+        self.assertEqual(decoded[0], 41_300_000)
+        self.assertEqual(decoded[1]["createSession"]["name"], "hello")
+
+    def test_resolves_swift_xpc_codable_object_reference(self):
+        body = bytes([0x13, 0x0C, 0x06]) + struct.pack("<q", 0)
+        decoded = decode_swift_xpc_codable(body, codable_objects=[{"secret": "resolved"}])
+        self.assertEqual(decoded["$xpc_codable_object"]["value"]["secret"], "resolved")
 
 
 if __name__ == "__main__":
