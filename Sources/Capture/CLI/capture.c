@@ -96,9 +96,7 @@ int xniff_capture_ring(pid_t pid,
             fprintf(stderr,
                     "capture: warning: target dropped %llu events (%llu bytes)\n",
                     (unsigned long long)(dropped_events - last_dropped_events),
-                    (unsigned long long)(dropped_bytes - last_dropped_bytes),
-                    (unsigned long long)dropped_events,
-                    (unsigned long long)dropped_bytes);
+                    (unsigned long long)(dropped_bytes - last_dropped_bytes));
             last_dropped_events = dropped_events;
             last_dropped_bytes = dropped_bytes;
         }
