@@ -27,13 +27,13 @@ processes.
 newly created processes:
 
 ```sh
-sudo build/xniff-cli launch --xpc --out /tmp/out.xniff -- /usr/bin/shortcuts list
+sudo build/xniff launch --xpc --out /tmp/out.xniff -- /usr/bin/shortcuts list
 ```
 
 existing processes:
 
 ```sh
-sudo build/xniff-cli attach 1234 --mach --out /tmp/process.xniff
+sudo build/xniff attach 1234 --mach --out /tmp/process.xniff
 ```
 
 ## reading dumps

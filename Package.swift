@@ -3,7 +3,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "XniffViewer",
+    name: "xniff",
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "XniffViewerCore", targets: ["XniffViewerCore"]),
@@ -11,26 +11,34 @@ let package = Package(
         .executable(name: "xniff-print", targets: ["XniffPrint"]),
     ],
     targets: [
-        .target(name: "XniffViewerCore"),
+        .target(
+            name: "XniffViewerCore",
+            path: "Sources/Viewer/Core"
+        ),
         .executableTarget(
             name: "XniffViewer",
-            dependencies: ["XniffViewerCore"]
+            dependencies: ["XniffViewerCore"],
+            path: "Sources/Viewer/App"
         ),
         .executableTarget(
             name: "XniffPrint",
-            dependencies: ["XniffViewerCore"]
+            dependencies: ["XniffViewerCore"],
+            path: "Sources/Viewer/PrintCLI"
         ),
         .testTarget(
             name: "XniffViewerCoreTests",
-            dependencies: ["XniffViewerCore"]
+            dependencies: ["XniffViewerCore"],
+            path: "Tests/Viewer/Core"
         ),
         .testTarget(
             name: "XniffViewerTests",
-            dependencies: ["XniffViewer"]
+            dependencies: ["XniffViewer"],
+            path: "Tests/Viewer/App"
         ),
         .testTarget(
             name: "XniffPrintTests",
-            dependencies: ["XniffPrint"]
+            dependencies: ["XniffPrint"],
+            path: "Tests/Viewer/PrintCLI"
         ),
     ]
 )

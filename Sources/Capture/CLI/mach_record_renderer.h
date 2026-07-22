@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "../shared/xniff_record.h"
+#include "xniff_record.h"
 
 int xniff_render_mach_record(const uint8_t *body,
                              size_t body_length,

@@ -1,6 +1,6 @@
 // xniff-hooks: in-process Frida Gum hooks for Mach message tracing.
 // This library is intended to be injected into a running process. It installs
-// interceptors and streams capture records back to xniff-cli.
+// interceptors and streams capture records back to xniff.
 
 #include <stdio.h>
 #include <stdint.h>
@@ -20,10 +20,10 @@
 #include <pthread.h>
 #include <time.h>
 
-#include "../shared/xniff_payload.h"
-#include "../shared/xniff_transport.h"
-#include "../shared/xniff_record.h"
-#include "../shared/mach_private.h"
+#include "xniff_payload.h"
+#include "xniff_transport.h"
+#include "xniff_record.h"
+#include "mach_private.h"
 
 #include <mach/mach.h>
 #include <mach/mach_vm.h>

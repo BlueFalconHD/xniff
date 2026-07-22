@@ -6,12 +6,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "../xniff-cli/cli_options.h"
-#include "../xniff-cli/target_identity.h"
+#include "cli_options.h"
+#include "target_identity.h"
 
 int selftest_target_user_options(void) {
     char *argv[] = {
-        "xniff-cli",
+        "xniff",
         "launch",
         "--xpc",
         "--target-user",

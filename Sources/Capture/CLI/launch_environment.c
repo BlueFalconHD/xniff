@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../shared/xniff_transport.h"
+#include "xniff_transport.h"
 
 extern char **environ;
 

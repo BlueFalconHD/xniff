@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "../shared/xniff_record.h"
+#include "xniff_record.h"
 
 bool xniff_hooks_streaming_is_enabled(void);
 void xniff_hooks_set_streaming_enabled(bool enabled);

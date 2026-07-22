@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../shared/xniff_transport.h"
+#include "xniff_transport.h"
 
 static int find_double_dash(int argc, char **argv, int start) {
     for (int i = start; i < argc; i++) {
@@ -78,7 +78,7 @@ void xniff_cli_usage(const char *program) {
     fprintf(stderr, "\nCapture options:\n");
     fprintf(stderr, "  --mach             Capture Mach messages (default)\n");
     fprintf(stderr, "  --xpc              Capture high-level XPC calls\n");
-    fprintf(stderr, "  --hooks <path>     Override the hooks embedded in xniff-cli\n");
+    fprintf(stderr, "  --hooks <path>     Override the hooks embedded in xniff\n");
     fprintf(stderr, "  --out <path>       Write an xniff dump\n");
     fprintf(stderr, "  --target-user <u>  Launch target as sudo's caller, a user name, or a uid\n");
 }

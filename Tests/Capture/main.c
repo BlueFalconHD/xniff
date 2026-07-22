@@ -8,9 +8,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "../shared/xniff_payload.h"
-#include "../shared/xniff_record.h"
-#include "../shared/xniff_transport.h"
+#include "xniff_payload.h"
+#include "xniff_record.h"
+#include "xniff_transport.h"
 #include "xpc_reply_tracker.h"
 
 int selftest_target_user_options(void);

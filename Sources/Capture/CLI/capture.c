@@ -8,8 +8,8 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "../shared/xniff_record.h"
-#include "../shared/xniff_transport.h"
+#include "xniff_record.h"
+#include "xniff_transport.h"
 #include "record_renderer.h"
 
 static bool entry_length_is_valid(uint32_t length) {

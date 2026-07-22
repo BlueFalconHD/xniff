@@ -4,7 +4,7 @@
 #include <string.h>
 #include <strings.h>
 
-#include "../shared/xniff_transport.h"
+#include "xniff_transport.h"
 
 static uint32_t g_streaming_enabled = 0;
 static _Thread_local uint64_t g_current_call_id = 0;

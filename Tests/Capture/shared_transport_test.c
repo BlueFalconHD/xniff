@@ -6,8 +6,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "../shared/xniff_transport.h"
-#include "../xniff-cli/shared_transport.h"
+#include "shared_transport.h"
+#include "xniff_transport.h"
 
 int selftest_shared_transport_tail(void) {
     xniff_shared_transport_t transport;
@@ -21,8 +21,8 @@ int selftest_shared_transport_tail(void) {
     if (child == 0) {
         xniff_shared_transport_prepare_target_child(&transport);
         if (xniff_transport_configure_direct(transport.ring,
-                                                 transport.wake_write_fd,
-                                                 XNIFF_CAPTURE_MODE_MACH) != 0 ||
+                                             transport.wake_write_fd,
+                                             XNIFF_CAPTURE_MODE_MACH) != 0 ||
             xniff_ring_write(expected, sizeof(expected)) != 0) {
             _exit(1);
         }

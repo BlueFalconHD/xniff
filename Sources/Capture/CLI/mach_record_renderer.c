@@ -7,8 +7,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "../shared/mach_private.h"
-#include "../shared/xniff_payload.h"
+#include "mach_private.h"
+#include "xniff_payload.h"
 #include "record_render_support.h"
 
 static bool extract_sender_pid(const uint8_t *message,

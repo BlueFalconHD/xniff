@@ -15,9 +15,9 @@
 #include <xpc/xpc.h>
 #include <mach/mach_vm.h>
 
-#include "../shared/xniff_payload.h"
-#include "../shared/xniff_transport.h"
-#include "../shared/xniff_record.h"
+#include "xniff_payload.h"
+#include "xniff_transport.h"
+#include "xniff_record.h"
 #include "xniff_hooks_emit.h"
 #include "xniff_hooks_backtrace.h"
 

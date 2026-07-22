@@ -15,9 +15,9 @@
 #include "xniff_hooks_emit.h"
 #include "xpc_reply_tracker.h"
 #include "xpc_session_coalescer.h"
-#include "../shared/xniff_payload.h"
-#include "../shared/xniff_transport.h"
-#include "../shared/xniff_record.h"
+#include "xniff_payload.h"
+#include "xniff_transport.h"
+#include "xniff_record.h"
 
 typedef struct _XniffListener XniffListener;
 typedef enum _XniffHookId XniffHookId;

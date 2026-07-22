@@ -5,8 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../shared/xniff_payload.h"
-#include "../shared/xniff_record.h"
+#include "xniff_payload.h"
+#include "xniff_record.h"
 #include "mach_record_renderer.h"
 #include "record_render_support.h"
 #include "xpc_record_renderer.h"

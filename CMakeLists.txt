@@ -17,6 +17,28 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 set(XNIFF_FRIDA_GUM_VERSION "16.5.6" CACHE STRING "Frida Gum devkit version")
 option(XNIFF_ENABLE_ARM64E "Build the capture tools for arm64e" OFF)
 
+find_program(XNIFF_SWIFT_EXECUTABLE swift REQUIRED)
+if(CMAKE_CONFIGURATION_TYPES)
+    message(FATAL_ERROR "xniff requires a single-config CMake generator")
+endif()
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(XNIFF_SWIFT_CONFIGURATION debug)
+else()
+    set(XNIFF_SWIFT_CONFIGURATION release)
+endif()
+set(XNIFF_SWIFT_BUILD_DIR "${CMAKE_BINARY_DIR}/swiftpm")
+set(XNIFF_SWIFT_MODULE_CACHE "${XNIFF_SWIFT_BUILD_DIR}/module-cache")
+set(XNIFF_SWIFT_ENV
+    "SWIFT_MODULECACHE_PATH=${XNIFF_SWIFT_MODULE_CACHE}"
+    "CLANG_MODULE_CACHE_PATH=${XNIFF_SWIFT_MODULE_CACHE}")
+set(XNIFF_SWIFT_COMMON_ARGUMENTS
+    --disable-sandbox
+    --package-path "${PROJECT_SOURCE_DIR}"
+    --scratch-path "${XNIFF_SWIFT_BUILD_DIR}"
+    --configuration "${XNIFF_SWIFT_CONFIGURATION}")
+file(GLOB_RECURSE XNIFF_SWIFT_SOURCES CONFIGURE_DEPENDS
+    "${PROJECT_SOURCE_DIR}/Sources/Viewer/*.swift")
+
 function(xniff_enable_arm64e target_name)
     if(APPLE AND XNIFF_ENABLE_ARM64E)
         set_target_properties(${target_name} PROPERTIES OSX_ARCHITECTURES "arm64e")
@@ -48,39 +70,39 @@ set_target_properties(frida-gum PROPERTIES
     IMPORTED_LOCATION "${frida_gum_devkit_SOURCE_DIR}/libfrida-gum.a"
     INTERFACE_INCLUDE_DIRECTORIES "${frida_gum_devkit_SOURCE_DIR}")
 
-add_library(xniff-record STATIC Sources/shared/xniff_record.c)
-target_include_directories(xniff-record PUBLIC Sources/shared)
+add_library(xniff-record STATIC Sources/Capture/Protocol/xniff_record.c)
+target_include_directories(xniff-record PUBLIC Sources/Capture/Protocol)
 set_target_properties(xniff-record PROPERTIES POSITION_INDEPENDENT_CODE ON)
 xniff_enable_arm64e(xniff-record)
 
-add_library(xniff-transport STATIC Sources/shared/xniff_transport.c)
-target_include_directories(xniff-transport PUBLIC Sources/shared)
+add_library(xniff-transport STATIC Sources/Capture/Protocol/xniff_transport.c)
+target_include_directories(xniff-transport PUBLIC Sources/Capture/Protocol)
 set_target_properties(xniff-transport PROPERTIES POSITION_INDEPENDENT_CODE ON)
 xniff_enable_arm64e(xniff-transport)
 
 add_library(xniff-injector STATIC
-    Sources/xniff-injector/src/dylib_inject_stub.S
-    Sources/xniff-injector/src/inject.c
-    Sources/xniff-injector/src/macho_symbols.c
-    Sources/xniff-injector/src/patch.c)
-target_include_directories(xniff-injector PUBLIC Sources/xniff-injector/include)
+    Sources/Capture/Injector/src/dylib_inject_stub.S
+    Sources/Capture/Injector/src/inject.c
+    Sources/Capture/Injector/src/macho_symbols.c
+    Sources/Capture/Injector/src/patch.c)
+target_include_directories(xniff-injector PUBLIC Sources/Capture/Injector/include)
 xniff_enable_arm64e(xniff-injector)
 
 add_library(xniff-hook-state STATIC
-    Sources/xniff-hooks/xpc_reply_tracker.c
-    Sources/xniff-hooks/xpc_session_coalescer.c)
-target_include_directories(xniff-hook-state PUBLIC Sources/xniff-hooks)
+    Sources/Capture/Hooks/xpc_reply_tracker.c
+    Sources/Capture/Hooks/xpc_session_coalescer.c)
+target_include_directories(xniff-hook-state PUBLIC Sources/Capture/Hooks)
 set_target_properties(xniff-hook-state PROPERTIES POSITION_INDEPENDENT_CODE ON)
 xniff_enable_arm64e(xniff-hook-state)
 
 add_library(xniff-hooks SHARED
-    Sources/xniff-hooks/frida_gum_interceptor.c
-    Sources/xniff-hooks/xniff_hooks_api.c
-    Sources/xniff-hooks/xniff_hooks_backtrace.c
-    Sources/xniff-hooks/xniff_hooks_runtime.c
-    Sources/xniff-hooks/xpc_highlevel_hooks.c
-    Sources/xniff-hooks/xpc_hooks.c)
-target_include_directories(xniff-hooks PRIVATE Sources/xniff-hooks)
+    Sources/Capture/Hooks/frida_gum_interceptor.c
+    Sources/Capture/Hooks/xniff_hooks_api.c
+    Sources/Capture/Hooks/xniff_hooks_backtrace.c
+    Sources/Capture/Hooks/xniff_hooks_runtime.c
+    Sources/Capture/Hooks/xpc_highlevel_hooks.c
+    Sources/Capture/Hooks/xpc_hooks.c)
+target_include_directories(xniff-hooks PRIVATE Sources/Capture/Hooks)
 target_compile_options(xniff-hooks PRIVATE -fvisibility=hidden -fblocks)
 target_link_options(xniff-hooks PRIVATE "-Wl,-undefined,dynamic_lookup")
 target_link_libraries(xniff-hooks PRIVATE
@@ -93,38 +115,38 @@ target_link_libraries(xniff-hooks PRIVATE
 set_target_properties(xniff-hooks PROPERTIES OUTPUT_NAME xniff-hooks)
 xniff_enable_arm64e(xniff-hooks)
 
-add_library(xniff-cli-support STATIC
-    Sources/xniff-cli/cli_options.c
-    Sources/xniff-cli/launch_environment.c
-    Sources/xniff-cli/shared_transport.c
-    Sources/xniff-cli/target_identity.c)
-target_include_directories(xniff-cli-support PUBLIC Sources/xniff-cli)
-target_link_libraries(xniff-cli-support PUBLIC xniff-injector xniff-transport)
-xniff_enable_arm64e(xniff-cli-support)
+add_library(xniff-capture-cli-support STATIC
+    Sources/Capture/CLI/cli_options.c
+    Sources/Capture/CLI/launch_environment.c
+    Sources/Capture/CLI/shared_transport.c
+    Sources/Capture/CLI/target_identity.c)
+target_include_directories(xniff-capture-cli-support PUBLIC Sources/Capture/CLI)
+target_link_libraries(xniff-capture-cli-support PUBLIC xniff-injector xniff-transport)
+xniff_enable_arm64e(xniff-capture-cli-support)
 
-add_executable(xniff-cli
-    Sources/xniff-cli/capture.c
-    Sources/xniff-cli/embedded_hooks.c
-    Sources/xniff-cli/mach_record_renderer.c
-    Sources/xniff-cli/main.c
-    Sources/xniff-cli/process_control.c
-    Sources/xniff-cli/record_renderer.c
-    Sources/xniff-cli/record_render_support.c
-    Sources/xniff-cli/xpc_record_renderer.c)
-target_link_libraries(xniff-cli PRIVATE xniff-cli-support xniff-record)
-xniff_enable_arm64e(xniff-cli)
-add_dependencies(xniff-cli xniff-hooks)
-set_property(TARGET xniff-cli APPEND PROPERTY LINK_DEPENDS "$<TARGET_FILE:xniff-hooks>")
-target_link_options(xniff-cli PRIVATE
+add_executable(xniff
+    Sources/Capture/CLI/capture.c
+    Sources/Capture/CLI/embedded_hooks.c
+    Sources/Capture/CLI/mach_record_renderer.c
+    Sources/Capture/CLI/main.c
+    Sources/Capture/CLI/process_control.c
+    Sources/Capture/CLI/record_renderer.c
+    Sources/Capture/CLI/record_render_support.c
+    Sources/Capture/CLI/xpc_record_renderer.c)
+target_link_libraries(xniff PRIVATE xniff-capture-cli-support xniff-record)
+xniff_enable_arm64e(xniff)
+add_dependencies(xniff xniff-hooks)
+set_property(TARGET xniff APPEND PROPERTY LINK_DEPENDS "$<TARGET_FILE:xniff-hooks>")
+target_link_options(xniff PRIVATE
     "LINKER:-sectcreate,__DATA,__xniff_hooks,$<TARGET_FILE:xniff-hooks>")
 
 add_executable(xniff-test
-    Sources/xniff-tests/main.c
-    Sources/xniff-tests/shared_transport_test.c
-    Sources/xniff-tests/target_user_test.c
-    Sources/xniff-tests/xpc_session_coalescer_test.c)
+    Tests/Capture/main.c
+    Tests/Capture/shared_transport_test.c
+    Tests/Capture/target_user_test.c
+    Tests/Capture/xpc_session_coalescer_test.c)
 target_link_libraries(xniff-test PRIVATE
-    xniff-cli-support
+    xniff-capture-cli-support
     xniff-hook-state
     xniff-record)
 xniff_enable_arm64e(xniff-test)
@@ -138,7 +160,32 @@ add_test(NAME xniff-xpc-session-coalescer COMMAND xniff-test --xpc-session-coale
 add_test(NAME xniff-target-user-options COMMAND xniff-test --target-user-options)
 add_test(NAME xniff-target-identity COMMAND xniff-test --target-identity)
 
-set(XNIFF_ENTITLEMENTS "${PROJECT_SOURCE_DIR}/macos.entitlements.plist")
+set(XNIFF_SWIFT_OUTPUTS
+    "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/xniff-viewer"
+    "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/xniff-print")
+add_custom_command(
+    OUTPUT ${XNIFF_SWIFT_OUTPUTS}
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${XNIFF_SWIFT_MODULE_CACHE}"
+    COMMAND "${CMAKE_COMMAND}" -E env ${XNIFF_SWIFT_ENV}
+            "${XNIFF_SWIFT_EXECUTABLE}" build ${XNIFF_SWIFT_COMMON_ARGUMENTS}
+    COMMAND "${CMAKE_COMMAND}" -E copy
+            "${XNIFF_SWIFT_BUILD_DIR}/${XNIFF_SWIFT_CONFIGURATION}/xniff-viewer"
+            "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/xniff-viewer"
+    COMMAND "${CMAKE_COMMAND}" -E copy
+            "${XNIFF_SWIFT_BUILD_DIR}/${XNIFF_SWIFT_CONFIGURATION}/xniff-print"
+            "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/xniff-print"
+    DEPENDS "${PROJECT_SOURCE_DIR}/Package.swift" ${XNIFF_SWIFT_SOURCES}
+    WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+    COMMENT "Building xniff viewer tools with SwiftPM"
+    VERBATIM
+    USES_TERMINAL)
+add_custom_target(xniff-viewer-tools ALL DEPENDS ${XNIFF_SWIFT_OUTPUTS})
+
+add_test(NAME xniff-viewer-tests
+    COMMAND "${CMAKE_COMMAND}" -E env ${XNIFF_SWIFT_ENV}
+            "${XNIFF_SWIFT_EXECUTABLE}" test ${XNIFF_SWIFT_COMMON_ARGUMENTS})
+
+set(XNIFF_ENTITLEMENTS "${PROJECT_SOURCE_DIR}/Resources/xniff.entitlements")
 function(xniff_codesign target_name)
     add_custom_command(TARGET ${target_name} POST_BUILD
         COMMAND codesign --force -s - --options runtime
@@ -148,7 +195,7 @@ endfunction()
 
 if(EXISTS "${XNIFF_ENTITLEMENTS}")
     xniff_codesign(xniff-hooks)
-    xniff_codesign(xniff-cli)
+    xniff_codesign(xniff)
 else()
-    message(WARNING "macos.entitlements.plist not found; capture binaries will not be codesigned")
+    message(WARNING "Resources/xniff.entitlements not found; capture binaries will not be codesigned")
 endif()

@@ -6,7 +6,7 @@
 
 #include <mach/mach.h>
 
-#include "../shared/xniff_transport.h"
+#include "xniff_transport.h"
 
 typedef struct {
     xniff_ring_t *ring;
