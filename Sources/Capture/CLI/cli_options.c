@@ -80,6 +80,7 @@ void xniff_cli_usage(const char *program) {
     xniff_output_section(stderr, "Usage");
     fprintf(stderr, "  %s attach <pid> [options]\n", program);
     fprintf(stderr, "  %s launch [options] -- <program> [args...]\n", program);
+    fprintf(stderr, "  %s version\n", program);
     fputc('\n', stderr);
     xniff_output_section(stderr, "Capture options");
     fprintf(stderr, "  --mach             Capture Mach messages (default)\n");
@@ -122,6 +123,13 @@ int xniff_cli_parse(int argc, char **argv, xniff_cli_options_t *options) {
         options->launch_argv = &argv[separator + 1];
         flags_start = 2;
         flags_end = separator;
+    } else if (strcmp(command, "version") == 0) {
+        if (argc != 2) {
+            xniff_output_error("version does not accept arguments");
+            return -1;
+        }
+        options->command = XNIFF_CLI_VERSION;
+        flags_start = argc;
     } else if (strcmp(command, "--help") == 0 || strcmp(command, "-h") == 0) {
         return 1;
     } else {

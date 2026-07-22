@@ -14,6 +14,7 @@ typedef enum {
     XNIFF_CLI_NONE = 0,
     XNIFF_CLI_ATTACH,
     XNIFF_CLI_LAUNCH,
+    XNIFF_CLI_VERSION,
 } xniff_cli_command_t;
 
 typedef struct {

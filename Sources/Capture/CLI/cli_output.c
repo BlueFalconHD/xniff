@@ -93,7 +93,7 @@ static void output_line(xniff_output_style_t style, const char *label,
     fflush(stderr);
 }
 
-void xniff_output_banner(void) {
+void xniff_output_version(void) {
     if (xniff_output_color_enabled(stderr)) {
         fprintf(stderr, "\033[1;36mXn👃ff\033[0m v%s\n\n", XNIFF_VERSION);
     } else {

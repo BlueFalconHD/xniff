@@ -10,13 +10,15 @@
 #include "process_control.h"
 
 int main(int argc, char **argv) {
-    xniff_output_banner();
-
     xniff_cli_options_t options;
     int parse_result = xniff_cli_parse(argc, argv, &options);
     if (parse_result != 0) {
         xniff_cli_usage(argv[0]);
         return parse_result > 0 ? 0 : 2;
+    }
+    if (options.command == XNIFF_CLI_VERSION) {
+        xniff_output_version();
+        return 0;
     }
 
     char embedded_hooks[PATH_MAX] = {0};

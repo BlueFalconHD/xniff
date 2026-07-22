@@ -44,8 +44,8 @@ static bool capture_output(output_action_t action, char *buffer,
     return restored;
 }
 
-static void write_banner(void) {
-    xniff_output_banner();
+static void write_version(void) {
+    xniff_output_version();
 }
 
 static void write_status(void) {
@@ -97,7 +97,7 @@ int selftest_cli_color(void) {
     char output[256];
     clear_color_environment();
     setenv("XNIFF_COLOR", "never", 1);
-    passed = passed && capture_output(write_banner, output, sizeof(output)) &&
+    passed = passed && capture_output(write_version, output, sizeof(output)) &&
              strncmp(output, "Xniff v", 7) == 0 && strstr(output, "👃") == NULL &&
              strchr(output, '\033') == NULL;
     passed = passed && capture_output(write_status, output, sizeof(output)) &&
@@ -105,7 +105,7 @@ int selftest_cli_color(void) {
 
     clear_color_environment();
     setenv("XNIFF_COLOR", "always", 1);
-    passed = passed && capture_output(write_banner, output, sizeof(output)) &&
+    passed = passed && capture_output(write_version, output, sizeof(output)) &&
              strstr(output, "Xn👃ff") != NULL && strstr(output, " v") != NULL;
     setenv("XNIFF_VERBOSE", "1", 1);
     passed = passed && capture_output(write_detail, output, sizeof(output)) &&

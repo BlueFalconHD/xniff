@@ -29,6 +29,14 @@ int selftest_target_user_options(void) {
         fprintf(stderr, "FAIL: --target-user launch option was not parsed\n");
         return 1;
     }
+
+    char *version_argv[] = {"xniff", "version", NULL};
+    result = xniff_cli_parse(2, version_argv, &options);
+    if (result != 0 || options.command != XNIFF_CLI_VERSION) {
+        fprintf(stderr, "FAIL: version command was not parsed\n");
+        return 1;
+    }
+
     printf("OK: --target-user launch option parsed\n");
     return 0;
 }
