@@ -69,6 +69,9 @@ enum TraceCallPrinter {
         var lines = [
             "\(label): event_id=\(event.id) tid=\(event.threadID) api=\(event.api.label)"
         ]
+        if let backtrace = BacktracePrinter.render(event.backtrace) {
+            lines.append(backtrace)
+        }
         guard options.includeBodies else { return lines.joined(separator: "\n") }
 
         for payload in event.payloads {
