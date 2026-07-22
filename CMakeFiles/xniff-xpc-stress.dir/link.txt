@@ -1,1 +1,0 @@
-/opt/homebrew/opt/llvm/bin/clang  -arch arm64 -mmacosx-version-min=26.0 -Wl,-search_paths_first -Wl,-headerpad_max_install_names "CMakeFiles/xniff-xpc-stress.dir/Sources/xniff-xpc-stress/main.c.o" -o xniff-xpc-stress

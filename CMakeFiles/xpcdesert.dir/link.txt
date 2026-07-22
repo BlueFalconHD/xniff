@@ -1,1 +1,0 @@
-/opt/homebrew/opt/llvm/bin/clang  -arch arm64 -mmacosx-version-min=26.0 -dynamiclib -Wl,-headerpad_max_install_names -o libxpcdesert.dylib -install_name @rpath/libxpcdesert.dylib CMakeFiles/xpcdesert.dir/Sources/xpcdesert/xpcdesert.c.o CMakeFiles/xpcdesert.dir/Sources/xpcdesert/stream.c.o

@@ -1,9 +1,0 @@
-/Users/hayes/Stores/repos/bluefalconhd/xniff/CMakeFiles/xniff.dir
-/Users/hayes/Stores/repos/bluefalconhd/xniff/CMakeFiles/xniff-hooks.dir
-/Users/hayes/Stores/repos/bluefalconhd/xniff/CMakeFiles/xniff-cli.dir
-/Users/hayes/Stores/repos/bluefalconhd/xniff/CMakeFiles/xniff-test.dir
-/Users/hayes/Stores/repos/bluefalconhd/xniff/CMakeFiles/xniff-xpc-stress.dir
-/Users/hayes/Stores/repos/bluefalconhd/xniff/CMakeFiles/xpcdesert.dir
-/Users/hayes/Stores/repos/bluefalconhd/xniff/CMakeFiles/xpcdesert-cli.dir
-/Users/hayes/Stores/repos/bluefalconhd/xniff/CMakeFiles/edit_cache.dir
-/Users/hayes/Stores/repos/bluefalconhd/xniff/CMakeFiles/rebuild_cache.dir
