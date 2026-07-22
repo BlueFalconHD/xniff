@@ -69,7 +69,7 @@ use. Dumps with `.xniff` and `.xniffbin` extensions can be opened with the app.
 The native SwiftUI/AppKit viewer memory-maps and indexes the dump, filters large
 traces off the main thread, and decodes payloads only when selected. Each row is
 one logical call; its request and response share a bottom inspector with
-Headers, Backtrace, and Body tabs.
+Metadata, Backtrace, and Body tabs.
 
 Body is the default view. It recursively expands libxpc v5 values, binary/XML
 property lists, JSON, `NSKeyedArchiver`, and the inline `bplist17` format used by

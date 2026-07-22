@@ -115,8 +115,7 @@ private struct CallTableRepresentable: NSViewRepresentable {
             cell.configure(
                 text: ColumnSpecification.text(for: call, column: identifier),
                 color: ColumnSpecification.color(for: call, column: identifier),
-                monospaced: ColumnSpecification.isMonospaced(identifier),
-                alignment: identifier == ColumnSpecification.status.id ? .center : .left
+                monospaced: ColumnSpecification.isMonospaced(identifier)
             )
             return cell
         }
@@ -157,12 +156,10 @@ private final class CallCellView: NSTableCellView {
     func configure(
         text: String,
         color: NSColor,
-        monospaced: Bool,
-        alignment: NSTextAlignment
+        monospaced: Bool
     ) {
         label.stringValue = text
         label.textColor = color
-        label.alignment = alignment
         label.font = monospaced
             ? NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
             : NSFont.systemFont(ofSize: 12)
@@ -178,16 +175,15 @@ private struct ColumnSpecification {
     let maximumWidth: CGFloat
     let resizingMask: NSTableColumn.ResizingOptions
 
-    static let status = ColumnSpecification("status", "", 24, minimum: 24, maximum: 24)
     static let call = ColumnSpecification("call", "#", 65, minimum: 45, maximum: 90)
     static let service = ColumnSpecification("service", "Service", 285, minimum: 140, maximum: 700, flexible: true)
     static let function = ColumnSpecification("function", "Function", 310, minimum: 180, maximum: 700, flexible: true)
     static let type = ColumnSpecification("type", "Type", 90, minimum: 72, maximum: 125)
-    static let time = ColumnSpecification("time", "Time", 105, minimum: 88, maximum: 130)
+    static let time = ColumnSpecification("time", "Timestamp", 115, minimum: 100, maximum: 140)
     static let duration = ColumnSpecification("duration", "Duration", 90, minimum: 72, maximum: 115)
     static let peer = ColumnSpecification("peer", "Peer PID", 75, minimum: 65, maximum: 95)
     static let process = ColumnSpecification("pid", "PID", 70, minimum: 60, maximum: 90)
-    static let all = [status, call, service, function, type, time, duration, peer, process]
+    static let all = [call, service, function, type, time, duration, peer, process]
 
     init(
         _ rawID: String,
@@ -207,12 +203,11 @@ private struct ColumnSpecification {
 
     static func text(for call: TraceCall, column: NSUserInterfaceItemIdentifier) -> String {
         switch column {
-        case status.id: "●"
         case self.call.id: call.id.callID.formatted()
         case service.id: call.serviceName ?? "—"
         case function.id: call.functionName
         case type.id: call.role.label
-        case time.id: String(format: "+%.6f", call.relativeSeconds)
+        case time.id: TraceTimestampFormatter.string(from: call.relativeSeconds)
         case duration.id: call.durationSeconds.map(formatDuration) ?? "—"
         case peer.id: call.peerProcessID?.formatted() ?? "—"
         case process.id: call.processID.formatted()
@@ -221,8 +216,8 @@ private struct ColumnSpecification {
     }
 
     static func color(for call: TraceCall, column: NSUserInterfaceItemIdentifier) -> NSColor {
-        if column == status.id || column == type.id {
-            return statusColor(call)
+        if column == type.id {
+            return roleColor(call)
         }
         if column == self.call.id || column == time.id || column == duration.id {
             return .secondaryLabelColor
@@ -234,7 +229,7 @@ private struct ColumnSpecification {
         [call.id, time.id, duration.id, peer.id, process.id].contains(column)
     }
 
-    private static func statusColor(_ call: TraceCall) -> NSColor {
+    private static func roleColor(_ call: TraceCall) -> NSColor {
         switch call.role {
         case .request: call.isComplete ? .systemGreen : .systemOrange
         case .response: .systemGreen

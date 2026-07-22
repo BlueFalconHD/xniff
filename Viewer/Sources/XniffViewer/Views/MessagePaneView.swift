@@ -19,7 +19,7 @@ enum MessageSide: String, Sendable, Hashable {
 }
 
 private enum MessageTab: String, CaseIterable, Identifiable {
-    case headers = "Headers"
+    case metadata = "Metadata"
     case backtrace = "Backtrace"
     case body = "Body"
 
@@ -117,8 +117,8 @@ struct MessagePaneView: View {
     private var content: some View {
         if let event {
             switch selectedTab {
-            case .headers:
-                MessageHeadersView(event: event, payloads: payloads)
+            case .metadata:
+                MessageMetadataView(event: event, payloads: payloads)
             case .backtrace:
                 BacktraceView(frames: event.backtrace)
             case .body:
