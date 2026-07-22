@@ -103,7 +103,8 @@ add_executable(xniff-cli
     Sources/xniff-cli/capture.c
     Sources/xniff-cli/embedded_hooks.c
     Sources/xniff-cli/main.c
-    Sources/xniff-cli/process_control.c)
+    Sources/xniff-cli/process_control.c
+    Sources/xniff-cli/record_renderer.c)
 target_link_libraries(xniff-cli PRIVATE xniff-cli-support)
 xniff_enable_arm64e(xniff-cli)
 add_dependencies(xniff-cli xniff-hooks)
