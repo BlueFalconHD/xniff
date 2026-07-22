@@ -1,7 +1,8 @@
-// Shared wire/event structs and in-target ring IPC primitives.
+// Shared wire/event structs and shared-memory transport primitives.
 #ifndef XNIFF_IPC_H
 #define XNIFF_IPC_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <sys/types.h>
@@ -13,8 +14,14 @@ extern "C" {
 #define XNIFF_IPC_VERSION 1u
 #define XNIFF_IPC_MAGIC 0x58495043u /* 'XIPC' */
 #define XNIFF_IPC_RING_MAGIC 0x58495247u /* 'XIRG' */
-#define XNIFF_IPC_RING_VERSION 1u
+#define XNIFF_IPC_RING_VERSION 2u
 #define XNIFF_IPC_RING_CAPACITY (1u << 23) /* 8 MiB stream buffer */
+
+#define XNIFF_IPC_TRANSPORT_MAGIC 0x5854524Eu /* 'XTRN' */
+#define XNIFF_IPC_TRANSPORT_VERSION 1u
+#define XNIFF_IPC_RING_FD_ENV "XNIFF_RING_FD"
+#define XNIFF_IPC_WAKE_FD_ENV "XNIFF_WAKE_FD"
+#define XNIFF_IPC_CAPTURE_MODE_ENV "XNIFF_CAPTURE_MODE"
 
 enum {
     XNIFF_CAPTURE_MODE_NONE = 0,
@@ -49,7 +56,7 @@ typedef struct {
     uint16_t version;      // XNIFF_IPC_RING_VERSION
     uint16_t config_version;
     uint32_t capacity;     // bytes in data[]
-    uint32_t capture_mode; // XNIFF_CAPTURE_MODE_* bits; zero until configured
+    uint32_t reserved;
     uint64_t write_idx;    // monotonic producer byte counter
     uint64_t read_idx;     // monotonic consumer byte counter
     uint64_t dropped_bytes;
@@ -64,7 +71,30 @@ typedef struct {
 _Static_assert(offsetof(xniff_ipc_ring_t, data) == sizeof(xniff_ipc_ring_hdr_t),
                "ring header must be contiguous with data");
 
-extern xniff_ipc_ring_t xniff_ipc_ring;
+// Configuration stored in the injected hooks image. For attach mode the CLI
+// writes all fields with ready=0, then publishes ready separately.
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t struct_size;
+    uint64_t ring_address;
+    int32_t wake_fd;
+    uint32_t wake_fileport;
+    uint32_t capture_mode;
+    uint32_t reserved;
+    uint64_t ready;
+} xniff_ipc_transport_config_t;
+
+__attribute__((visibility("default")))
+extern xniff_ipc_transport_config_t xniff_ipc_transport_config;
+
+void xniff_ipc_ring_initialize(xniff_ipc_ring_t *ring);
+int xniff_ipc_transport_configure_direct(xniff_ipc_ring_t *ring,
+                                         int wake_fd,
+                                         uint32_t capture_mode);
+int xniff_ipc_transport_configure_from_environment(void);
+uint32_t xniff_ipc_transport_capture_mode(void);
+bool xniff_ipc_transport_is_internal(void);
 
 // Guard against accidental struct packing/ABI mismatches between components.
 #if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
@@ -249,7 +279,7 @@ typedef struct {
     uint32_t msg_len;      // bytes of message following this struct
 } xniff_ipc_debug_payload_t;
 
-// Append bytes to the process-local ring buffer (producer-side).
+// Append bytes to the configured shared-memory ring (producer-side).
 // Returns 0 on success, -1 on failure (e.g. ENOBUFS when ring is full).
 int xniff_ipc_ring_write(const void *buf, size_t len);
 

@@ -33,6 +33,7 @@
 #include "cli_options.h"
 #include "embedded_hooks.h"
 #include "launch_environment.h"
+#include "shared_transport.h"
 #include "target_identity.h"
 // XPC wire parser (shared library)
 #include "../xpcdesert/xpcdesert.h"
@@ -189,7 +190,8 @@ static int stage_dylib_for_sandbox(const char *src_abs_path,
     return -1;
 }
 
-static int install_hooks(pid_t pid, const char *dylib_path, int mode);
+static int install_hooks(pid_t pid, const char *dylib_path, int mode,
+                         xniff_shared_transport_t *transport);
 static int cmd_attach(pid_t pid, const char *dylib_path, int mode);
 static int cmd_launch(const char *dylib_path, int mode, const char *target_user,
                       char *const launch_argv[]);
@@ -1039,27 +1041,6 @@ static void print_event(int kind, const xniff_ipc_mach_payload_t *pl, const uint
     }
 }
 
-static int task_read_exact(mach_port_t task, mach_vm_address_t address, void *buf, size_t len) {
-    if (!buf && len != 0) return -1;
-    mach_vm_size_t out_sz = 0;
-    kern_return_t kr = mach_vm_read_overwrite(task,
-                                              address,
-                                              (mach_vm_size_t)len,
-                                              (mach_vm_address_t)(uintptr_t)buf,
-                                              &out_sz);
-    if (kr != KERN_SUCCESS || out_sz != (mach_vm_size_t)len) return -1;
-    return 0;
-}
-
-static int task_write_exact(mach_port_t task, mach_vm_address_t address, const void *buf, size_t len) {
-    if (!buf && len != 0) return -1;
-    kern_return_t kr = mach_vm_write(task,
-                                     address,
-                                     (vm_offset_t)(uintptr_t)buf,
-                                     (mach_msg_type_number_t)len);
-    return kr == KERN_SUCCESS ? 0 : -1;
-}
-
 static bool env_var_enabled(const char *name) {
     if (!name || !*name) return false;
     const char *v = getenv(name);
@@ -1073,45 +1054,8 @@ static int write_bin_record(FILE *fp, const uint8_t *entry, size_t entry_len) {
     return 0;
 }
 
-static int resolve_remote_ring_addr(mach_port_t task, mach_vm_address_t *out_addr) {
-    if (!out_addr) return -1;
-    mach_vm_address_t addr = 0;
-    if (xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "_xniff_ipc_ring", &addr) == 0 ||
-        xniff_find_symbol_in_image_path_contains(task, "xniff-hooks", "xniff_ipc_ring", &addr) == 0) {
-        *out_addr = addr;
-        return 0;
-    }
-    return -1;
-}
-
-static int configure_remote_capture_mode(mach_port_t task, uint32_t mode) {
-    mach_vm_address_t ring_addr = 0;
-    for (int i = 0; i < 80; i++) {
-        if (resolve_remote_ring_addr(task, &ring_addr) == 0) break;
-        usleep(25 * 1000);
-    }
-    if (ring_addr == 0) return -1;
-
-    mach_vm_address_t mode_addr =
-        ring_addr + (mach_vm_address_t)offsetof(xniff_ipc_ring_t, hdr) +
-        (mach_vm_address_t)offsetof(xniff_ipc_ring_hdr_t, capture_mode);
-    return task_write_exact(task, mode_addr, &mode, sizeof(mode));
-}
-
-static bool target_process_alive(pid_t pid) {
-    struct proc_bsdinfo info;
-    int n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info));
-    return n == (int)sizeof(info);
-}
-
-static int capture_ring(pid_t pid, int ready_fd) {
-    mach_port_t task = MACH_PORT_NULL;
-    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
-    if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "capture: task_for_pid failed for %d: %d (%s)\n",
-                (int)pid, kr, mach_error_string(kr));
-        return -1;
-    }
+static int capture_ring(pid_t pid, int ready_fd, xniff_shared_transport_t *transport) {
+    if (!transport || !transport->ring || transport->wake_read_fd < 0) return -1;
     if (ready_fd >= 0) {
         const uint8_t ready = 1;
         (void)write(ready_fd, &ready, sizeof(ready));
@@ -1141,23 +1085,8 @@ static int capture_ring(pid_t pid, int ready_fd) {
         }
     }
 
-    mach_vm_address_t ring_addr = 0;
-    for (int i = 0; i < 4000; i++) { // up to ~20s while parent loads hooks
-        if (resolve_remote_ring_addr(task, &ring_addr) == 0) break;
-        usleep(5 * 1000);
-    }
-    if (ring_addr == 0) {
-        fprintf(stderr, "capture: failed to resolve remote xniff ring symbol in pid %d\n", (int)pid);
-        return -1;
-    }
-
-    mach_vm_address_t ring_hdr_addr = ring_addr + (mach_vm_address_t)offsetof(xniff_ipc_ring_t, hdr);
-    mach_vm_address_t ring_data_addr = ring_addr + (mach_vm_address_t)offsetof(xniff_ipc_ring_t, data);
-    mach_vm_address_t ring_read_idx_addr =
-        ring_hdr_addr + (mach_vm_address_t)offsetof(xniff_ipc_ring_hdr_t, read_idx);
-
-    XNIFF_DIAGF("capture: streaming target_pid=%d ring=0x%llx\n",
-                (int)pid, (unsigned long long)ring_addr);
+    XNIFF_DIAGF("capture: streaming target_pid=%d shared_ring=%p\n",
+                (int)pid, (void *)transport->ring);
 
     // Prepare dump directory for this pid
     char base_dir[256];
@@ -1167,88 +1096,48 @@ static int capture_ring(pid_t pid, int ready_fd) {
         mkdir(base_dir, 0755);
     }
     unsigned long long evt_idx = 0;
-    uint64_t local_read_idx = UINT64_MAX;
+    uint64_t local_read_idx =
+        __atomic_load_n(&transport->ring->hdr.read_idx, __ATOMIC_ACQUIRE);
 
     uint8_t *stream = NULL;
     size_t stream_len = 0;
     size_t stream_cap = 0;
     uint64_t last_dropped_events = 0;
     uint64_t last_dropped_bytes = 0;
-    unsigned int consecutive_read_failures = 0;
+    bool producer_closed = false;
 
     for (;;) {
-        xniff_ipc_ring_hdr_t rmeta = {0};
-        if (task_read_exact(task, ring_hdr_addr, &rmeta, sizeof(rmeta)) != 0) {
-            consecutive_read_failures++;
-            if (consecutive_read_failures >= 5 && !target_process_alive(pid)) {
-                XNIFF_DIAGF("capture: target pid %d exited; capture complete\n", (int)pid);
-                if (out_bin_fp && out_bin_fp != stdout) fclose(out_bin_fp);
-                free(stream);
-                return 0;
-            }
-            usleep(10 * 1000);
-            continue;
+        xniff_ipc_ring_hdr_t *ring_header = &transport->ring->hdr;
+        if (ring_header->magic != XNIFF_IPC_RING_MAGIC ||
+            ring_header->version != XNIFF_IPC_RING_VERSION ||
+            ring_header->capacity != XNIFF_IPC_RING_CAPACITY) {
+            fprintf(stderr, "capture: invalid shared ring header\n");
+            if (out_bin_fp && out_bin_fp != stdout) fclose(out_bin_fp);
+            free(stream);
+            return -1;
         }
-        consecutive_read_failures = 0;
-        if (rmeta.magic != XNIFF_IPC_RING_MAGIC || rmeta.version != XNIFF_IPC_RING_VERSION ||
-            rmeta.capacity == 0 || rmeta.capacity > XNIFF_IPC_RING_CAPACITY) {
-            usleep(10 * 1000);
-            continue;
-        }
-        if (rmeta.dropped_events != last_dropped_events || rmeta.dropped_bytes != last_dropped_bytes) {
-            uint64_t event_delta = rmeta.dropped_events - last_dropped_events;
-            uint64_t byte_delta = rmeta.dropped_bytes - last_dropped_bytes;
+        uint64_t dropped_events =
+            __atomic_load_n(&ring_header->dropped_events, __ATOMIC_ACQUIRE);
+        uint64_t dropped_bytes =
+            __atomic_load_n(&ring_header->dropped_bytes, __ATOMIC_ACQUIRE);
+        if (dropped_events != last_dropped_events || dropped_bytes != last_dropped_bytes) {
+            uint64_t event_delta = dropped_events - last_dropped_events;
+            uint64_t byte_delta = dropped_bytes - last_dropped_bytes;
             XNIFF_DIAGF("capture: warning: target dropped %llu events (%llu bytes); totals=%llu/%llu\n",
                         (unsigned long long)event_delta,
                         (unsigned long long)byte_delta,
-                        (unsigned long long)rmeta.dropped_events,
-                        (unsigned long long)rmeta.dropped_bytes);
-            last_dropped_events = rmeta.dropped_events;
-            last_dropped_bytes = rmeta.dropped_bytes;
-        }
-        if (local_read_idx == UINT64_MAX) local_read_idx = rmeta.read_idx;
-
-        if (rmeta.write_idx < local_read_idx || (rmeta.write_idx - local_read_idx) > (uint64_t)rmeta.capacity) {
-            local_read_idx = rmeta.write_idx;
+                        (unsigned long long)dropped_events,
+                        (unsigned long long)dropped_bytes);
+            last_dropped_events = dropped_events;
+            last_dropped_bytes = dropped_bytes;
         }
 
-        bool pulled = false;
-        while (local_read_idx < rmeta.write_idx) {
-            uint64_t cap = (uint64_t)rmeta.capacity;
-            uint64_t off = local_read_idx % cap;
-            uint64_t avail = rmeta.write_idx - local_read_idx;
-            uint64_t contig = cap - off;
-            uint64_t chunk64 = avail < contig ? avail : contig;
-            if (chunk64 > 64u * 1024u) chunk64 = 64u * 1024u;
-            size_t chunk = (size_t)chunk64;
-
-            if (stream_cap - stream_len < chunk) {
-                size_t need = stream_len + chunk;
-                size_t new_cap = stream_cap ? stream_cap : 64u * 1024u;
-                while (new_cap < need) new_cap *= 2;
-                uint8_t *tmp = (uint8_t *)realloc(stream, new_cap);
-                if (!tmp) {
-                    fprintf(stderr, "capture: out of memory while growing stream buffer\n");
-                    if (out_bin_fp && out_bin_fp != stdout) fclose(out_bin_fp);
-                    free(stream);
-                    return -1;
-                }
-                stream = tmp;
-                stream_cap = new_cap;
-            }
-
-            if (task_read_exact(task,
-                                ring_data_addr + (mach_vm_address_t)off,
-                                stream + stream_len,
-                                chunk) != 0) {
-                break;
-            }
-            stream_len += chunk;
-            local_read_idx += (uint64_t)chunk;
-            pulled = true;
-        }
-        if (pulled) {
-            (void)task_write_exact(task, ring_read_idx_addr, &local_read_idx, sizeof(local_read_idx));
+        if (xniff_shared_transport_pull(transport, &local_read_idx,
+                                        &stream, &stream_len, &stream_cap) < 0) {
+            fprintf(stderr, "capture: failed draining shared ring: %s\n", strerror(errno));
+            if (out_bin_fp && out_bin_fp != stdout) fclose(out_bin_fp);
+            free(stream);
+            return -1;
         }
 
         while (stream_len >= sizeof(xniff_ipc_v2_entry_hdr_t)) {
@@ -1499,13 +1388,30 @@ static int capture_ring(pid_t pid, int ready_fd) {
             memmove(stream, stream + frame_len, stream_len - frame_len);
             stream_len -= frame_len;
         }
-        usleep(10 * 1000);
+        if (producer_closed &&
+            xniff_shared_transport_is_drained(transport, local_read_idx)) {
+            if (stream_len != 0) {
+                XNIFF_DIAGF("capture: warning: discarded %zu trailing transport bytes\n",
+                            stream_len);
+            }
+            XNIFF_DIAGF("capture: target pid %d exited; shared ring drained\n", (int)pid);
+            if (out_bin_fp && out_bin_fp != stdout) fclose(out_bin_fp);
+            free(stream);
+            return 0;
+        }
+        if (xniff_shared_transport_wait(transport, &producer_closed) != 0) {
+            fprintf(stderr, "capture: wake socket failed: %s\n", strerror(errno));
+            if (out_bin_fp && out_bin_fp != stdout) fclose(out_bin_fp);
+            free(stream);
+            return -1;
+        }
     }
     // unreachable
     return 0;
 }
 
-static int install_hooks(pid_t pid, const char *dylib_path, int mode) {
+static int install_hooks(pid_t pid, const char *dylib_path, int mode,
+                         xniff_shared_transport_t *transport) {
     mach_port_t task;
     if (attach_and_get_task(pid, &task) != 0) return -1;
 
@@ -1548,8 +1454,17 @@ static int install_hooks(pid_t pid, const char *dylib_path, int mode) {
         }
         usleep(50 * 1000);
     }
-    if (configure_remote_capture_mode(task, (uint32_t)mode) != 0) {
-        fprintf(stderr, "attach: failed to configure capture mode in pid %d\n", pid);
+    int transport_result = -1;
+    for (int i = 0; i < 40; i++) {
+        if (xniff_shared_transport_configure_target(transport, task,
+                                                     (uint32_t)mode) == 0) {
+            transport_result = 0;
+            break;
+        }
+        usleep(50 * 1000);
+    }
+    if (transport_result != 0) {
+        fprintf(stderr, "attach: failed to configure shared transport in pid %d\n", pid);
         detach_process(pid);
         if (staged_copy) (void)unlink(inject_path);
         return -1;
@@ -1563,13 +1478,15 @@ static int install_hooks(pid_t pid, const char *dylib_path, int mode) {
 
 static int spawn_suspended_target(char *const launch_argv[], const char *hooks_path,
                                   int mode, const xniff_target_identity_t *identity,
+                                  xniff_shared_transport_t *transport,
                                   pid_t *out_pid) {
-    if (!launch_argv || !launch_argv[0] || !hooks_path || !out_pid) {
+    if (!launch_argv || !launch_argv[0] || !hooks_path || !transport || !out_pid) {
         errno = EINVAL;
         return -1;
     }
     pid_t pid = fork();
     if (pid == 0) {
+        xniff_shared_transport_prepare_target_child(transport);
         /*
          * START_SUSPENDED is too late for platform binaries: dyld can strip
          * DYLD_INSERT_LIBRARIES before the parent gets control.  TRACE_ME
@@ -1583,7 +1500,10 @@ static int spawn_suspended_target(char *const launch_argv[], const char *hooks_p
             _exit(126);
         }
         xniff_launch_environment_t launch_environment;
-        if (xniff_launch_environment_create(hooks_path, mode, &launch_environment) != 0) {
+        if (xniff_launch_environment_create(hooks_path, mode,
+                                            transport->ring_fd,
+                                            transport->wake_write_fd,
+                                            &launch_environment) != 0) {
             _exit(126);
         }
         if (ptrace(PT_TRACE_ME, 0, 0, 0) != 0) _exit(126);
@@ -1623,7 +1543,8 @@ static int capture_attached_process(pid_t pid,
                                     int mode,
                                     bool resume_target,
                                     bool target_is_child,
-                                    bool hooks_preloaded) {
+                                    bool hooks_preloaded,
+                                    xniff_shared_transport_t *transport) {
     const char *flow = resume_target ? "launch" : "attach";
     int ready_pipe[2] = {-1, -1};
     if (pipe(ready_pipe) != 0) {
@@ -1633,7 +1554,8 @@ static int capture_attached_process(pid_t pid,
     pid_t child = fork();
     if (child == 0) {
         close(ready_pipe[0]);
-        int rc = capture_ring(pid, ready_pipe[1]);
+        xniff_shared_transport_prepare_listener_child(transport);
+        int rc = capture_ring(pid, ready_pipe[1], transport);
         _exit(rc == 0 ? 0 : 1);
     }
     if (child < 0) {
@@ -1643,6 +1565,7 @@ static int capture_attached_process(pid_t pid,
         return -1;
     }
     close(ready_pipe[1]);
+    xniff_shared_transport_release_controller_reader(transport);
 
     struct pollfd ready_poll = {.fd = ready_pipe[0], .events = POLLIN};
     int poll_result = poll(&ready_poll, 1, 5000);
@@ -1659,14 +1582,16 @@ static int capture_attached_process(pid_t pid,
     }
 
     if (!hooks_preloaded) {
-        int rc = install_hooks(pid, dylib_path, mode);
+        int rc = install_hooks(pid, dylib_path, mode, transport);
         if (rc != 0) {
             fprintf(stderr, "%s: hook injection failed; terminating listener (pid %d)\n", flow, (int)child);
+            xniff_shared_transport_release_controller_producer(transport);
             kill(child, SIGTERM);
             (void)waitpid(child, NULL, 0);
             return -1;
         }
     }
+    xniff_shared_transport_release_controller_producer(transport);
 
     if (resume_target) {
         if (continue_traced_target(pid, 0) != 0) {
@@ -1714,7 +1639,15 @@ static int capture_attached_process(pid_t pid,
 }
 
 static int cmd_attach(pid_t pid, const char *dylib_path, int mode) {
-    return capture_attached_process(pid, dylib_path, mode, false, false, false);
+    xniff_shared_transport_t transport;
+    if (xniff_shared_transport_create(&transport) != 0) {
+        fprintf(stderr, "attach: failed to create shared transport: %s\n", strerror(errno));
+        return -1;
+    }
+    int result = capture_attached_process(pid, dylib_path, mode, false, false,
+                                          false, &transport);
+    xniff_shared_transport_destroy(&transport);
+    return result;
 }
 
 static int cmd_launch(const char *dylib_path, int mode, const char *target_user,
@@ -1731,18 +1664,27 @@ static int cmd_launch(const char *dylib_path, int mode, const char *target_user,
         XNIFF_DIAGF("launch: target user %s (%u:%u)\n", identity.name,
                     (unsigned int)identity.uid, (unsigned int)identity.gid);
     }
+    xniff_shared_transport_t transport;
+    if (xniff_shared_transport_create(&transport) != 0) {
+        fprintf(stderr, "launch: failed to create shared transport: %s\n", strerror(errno));
+        return -1;
+    }
     pid_t pid = 0;
-    if (spawn_suspended_target(launch_argv, dylib_path, mode, identity_ptr, &pid) != 0) {
+    if (spawn_suspended_target(launch_argv, dylib_path, mode, identity_ptr,
+                               &transport, &pid) != 0) {
         fprintf(stderr, "launch: failed to spawn suspended target '%s': %s\n",
                 launch_argv && launch_argv[0] ? launch_argv[0] : "(null)", strerror(errno));
+        xniff_shared_transport_destroy(&transport);
         return -1;
     }
 
     XNIFF_DIAGF("launch: spawned suspended pid %d (%s)\n", (int)pid, launch_argv[0]);
-    int rc = capture_attached_process(pid, dylib_path, mode, true, true, true);
+    int rc = capture_attached_process(pid, dylib_path, mode, true, true, true,
+                                      &transport);
     if (rc != 0) {
         (void)kill(pid, SIGKILL);
         (void)waitpid(pid, NULL, 0);
     }
+    xniff_shared_transport_destroy(&transport);
     return rc;
 }

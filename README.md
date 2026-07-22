@@ -39,7 +39,7 @@ sudo build/xniff-cli launch --target-user sudo --xpc --out /tmp/app.xniff -- \
 ```
 
 `--target-user` also accepts a user name or numeric uid. The privileged listener
-still reads the target's ring buffer; only the target drops credentials.
+owns the shared-memory ring and wake socket; only the target drops credentials.
 
 Attach to an existing process and capture Mach messages:
 

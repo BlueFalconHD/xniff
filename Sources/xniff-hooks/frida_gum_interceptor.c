@@ -838,7 +838,7 @@ static void xniff_install_hooks_once(void) {
 }
 
 __attribute__((constructor)) static void xniff_frida_gum_ctor(void) {
-  xniff_hooks_configure_capture_mode_from_environment();
+  (void)xniff_ipc_transport_configure_from_environment();
   xniff_hooks_set_streaming_enabled(false);
   xniff_suspend_all_other_threads();
   (void)pthread_once(&g_once, xniff_install_hooks_once);

@@ -21,17 +21,20 @@ static const char *environment_value(const char *name) {
 
 static bool is_replaced_variable(const char *value) {
     return strncmp(value, "DYLD_INSERT_LIBRARIES=", 22) == 0 ||
-           strncmp(value, "XNIFF_CAPTURE_MODE=", 19) == 0;
+           strncmp(value, XNIFF_IPC_CAPTURE_MODE_ENV "=", sizeof(XNIFF_IPC_CAPTURE_MODE_ENV)) == 0 ||
+           strncmp(value, XNIFF_IPC_RING_FD_ENV "=", sizeof(XNIFF_IPC_RING_FD_ENV)) == 0 ||
+           strncmp(value, XNIFF_IPC_WAKE_FD_ENV "=", sizeof(XNIFF_IPC_WAKE_FD_ENV)) == 0;
 }
 
 int xniff_launch_environment_create(const char *hooks_path, int mode,
+                                    int ring_fd, int wake_fd,
                                     xniff_launch_environment_t *environment) {
-    if (!hooks_path || !environment) return -1;
+    if (!hooks_path || ring_fd < 0 || wake_fd < 0 || !environment) return -1;
     memset(environment, 0, sizeof(*environment));
 
     size_t count = 0;
     while (environ && environ[count]) count++;
-    environment->values = (char **)calloc(count + 3, sizeof(char *));
+    environment->values = (char **)calloc(count + 5, sizeof(char *));
     if (!environment->values) return -1;
 
     const char *existing_insert = environment_value("DYLD_INSERT_LIBRARIES");
@@ -51,12 +54,19 @@ int xniff_launch_environment_create(const char *hooks_path, int mode,
         xniff_launch_environment_destroy(environment);
         return -1;
     }
+    if (asprintf(&environment->ring_fd, "%s=%d", XNIFF_IPC_RING_FD_ENV, ring_fd) < 0 ||
+        asprintf(&environment->wake_fd, "%s=%d", XNIFF_IPC_WAKE_FD_ENV, wake_fd) < 0) {
+        xniff_launch_environment_destroy(environment);
+        return -1;
+    }
     size_t out = 0;
     for (size_t i = 0; i < count; i++) {
         if (!is_replaced_variable(environ[i])) environment->values[out++] = environ[i];
     }
     environment->values[out++] = environment->dyld_insert;
     environment->values[out++] = environment->capture_mode;
+    environment->values[out++] = environment->ring_fd;
+    environment->values[out++] = environment->wake_fd;
     environment->values[out] = NULL;
     return 0;
 }
@@ -65,6 +75,8 @@ void xniff_launch_environment_destroy(xniff_launch_environment_t *environment) {
     if (!environment) return;
     free(environment->dyld_insert);
     free(environment->capture_mode);
+    free(environment->ring_fd);
+    free(environment->wake_fd);
     free(environment->values);
     memset(environment, 0, sizeof(*environment));
 }

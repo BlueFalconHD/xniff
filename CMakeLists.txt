@@ -131,21 +131,21 @@ file(GLOB XNIFF_TEST_SOURCES CONFIGURE_DEPENDS
 add_executable(xniff-test
     ${XNIFF_TEST_SOURCES}
     ${PROJECT_SOURCE_DIR}/Sources/xniff-cli/cli_options.c
+    ${PROJECT_SOURCE_DIR}/Sources/xniff-cli/shared_transport.c
     ${PROJECT_SOURCE_DIR}/Sources/xniff-cli/target_identity.c
     ${PROJECT_SOURCE_DIR}/Sources/xniff-hooks/xpc_reply_tracker.c
     ${PROJECT_SOURCE_DIR}/Sources/xniff-hooks/xpc_session_coalescer.c
     ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_ipc.c
     ${PROJECT_SOURCE_DIR}/Sources/shared/xniff_ipc_v2.c)
-target_link_libraries(xniff-test PRIVATE)
+target_link_libraries(xniff-test PRIVATE xniff)
 target_include_directories(xniff-test PRIVATE
+    ${PROJECT_SOURCE_DIR}/Sources/libxniff/include
     ${PROJECT_SOURCE_DIR}/Sources/xniff-hooks
     ${PROJECT_SOURCE_DIR}/Sources/shared)
 add_test(NAME xniff-ipc-ring COMMAND xniff-test --ipc-ring)
-add_test(NAME xniff-ipc-ring-file-env COMMAND xniff-test --ipc-ring)
-set_tests_properties(xniff-ipc-ring-file-env PROPERTIES
-    ENVIRONMENT "XNIFF_CAPTURE_FILE=/dev/null")
 add_test(NAME xniff-ipc-drop COMMAND xniff-test --ipc-drop)
 add_test(NAME xniff-v2-call-id COMMAND xniff-test --v2-call-id)
+add_test(NAME xniff-shared-transport-tail COMMAND xniff-test --shared-transport-tail)
 add_test(NAME xniff-xpc-reply-tracker COMMAND xniff-test --xpc-reply-tracker)
 add_test(NAME xniff-xpc-session-coalescer COMMAND xniff-test --xpc-session-coalescer)
 add_test(NAME xniff-target-user-options COMMAND xniff-test --target-user-options)
