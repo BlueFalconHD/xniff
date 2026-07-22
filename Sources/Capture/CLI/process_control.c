@@ -31,6 +31,25 @@ enum {
     XNIFF_HOOK_MODE_XPC = XNIFF_CAPTURE_MODE_XPC,
 };
 
+static volatile sig_atomic_t g_capture_stop_requested = 0;
+
+static void request_capture_stop(int signal_number) {
+    (void)signal_number;
+    g_capture_stop_requested = 1;
+}
+
+int xniff_install_capture_signal_handler(void) {
+    struct sigaction action = {0};
+    action.sa_handler = request_capture_stop;
+    action.sa_flags = SA_RESTART;
+    if (sigemptyset(&action.sa_mask) != 0) return -1;
+    return sigaction(SIGINT, &action, NULL);
+}
+
+bool xniff_capture_stop_requested(void) {
+    return g_capture_stop_requested != 0;
+}
+
 static const char *capture_mode_name(int mode) {
     return mode == XNIFF_HOOK_MODE_XPC ? "XPC" : "Mach";
 }

@@ -20,6 +20,10 @@ int main(int argc, char **argv) {
         xniff_output_version();
         return 0;
     }
+    if (xniff_install_capture_signal_handler() != 0) {
+        xniff_output_error("cannot install Ctrl-C handler: %s", strerror(errno));
+        return 1;
+    }
 
     char embedded_hooks[PATH_MAX] = {0};
     const char *hooks_path = options.hooks_path;

@@ -279,7 +279,9 @@ int xniff_shared_transport_wait(xniff_shared_transport_t *transport,
         .fd = transport->wake_read_fd,
         .events = POLLIN | POLLHUP,
     };
-    while (poll(&poll_fd, 1, -1) < 0) {
+    // A finite timeout lets the listener observe a graceful Ctrl-C request
+    // even when the producer is idle and no wake byte is pending.
+    while (poll(&poll_fd, 1, 100) < 0) {
         if (errno != EINTR) return -1;
     }
 

@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "cli_output.h"
+#include "process_control.h"
 #include "xniff_record.h"
 #include "xniff_transport.h"
 #include "record_renderer.h"
@@ -33,7 +34,20 @@ static int write_capture_header(FILE *output) {
 }
 
 static int write_record(FILE *output, const uint8_t *record, size_t length) {
-    return fwrite(record, 1, length, output) == length ? 0 : -1;
+    size_t written = 0;
+    while (written < length) {
+        size_t count = fwrite(record + written, 1, length - written, output);
+        if (count != 0) {
+            written += count;
+            continue;
+        }
+        if (ferror(output) && errno == EINTR) {
+            clearerr(output);
+            continue;
+        }
+        return -1;
+    }
+    return 0;
 }
 
 static void close_output(FILE *output) {
@@ -54,6 +68,12 @@ int xniff_capture_ring(pid_t pid,
         if (!output) {
             xniff_output_error("cannot open output %s: %s",
                                options->out_bin_path, strerror(errno));
+            return -1;
+        }
+        if (setvbuf(output, NULL, _IONBF, 0) != 0) {
+            xniff_output_error("cannot configure unbuffered output for %s",
+                               options->out_bin_path);
+            close_output(output);
             return -1;
         }
         if (write_capture_header(output) != 0) {
@@ -130,10 +150,21 @@ int xniff_capture_ring(pid_t pid,
                 return -1;
             }
             consumed += record_length;
+            if (xniff_capture_stop_requested()) {
+                close_output(output);
+                free(stream);
+                return 0;
+            }
         }
         if (consumed != 0) {
             memmove(stream, stream + consumed, stream_length - consumed);
             stream_length -= consumed;
+        }
+
+        if (xniff_capture_stop_requested()) {
+            close_output(output);
+            free(stream);
+            return 0;
         }
 
         if (producer_closed &&
