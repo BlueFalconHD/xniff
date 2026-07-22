@@ -17,6 +17,7 @@ int selftest_target_user_options(void);
 int selftest_target_identity(void);
 int selftest_xpc_session_coalescer(void);
 int selftest_shared_transport_tail(void);
+int selftest_cli_color(void);
 
 static xniff_ring_t *g_test_ring = NULL;
 static int g_test_wake_read_fd = -1;
@@ -207,6 +208,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--xpc-session-coalescer") == 0) return selftest_xpc_session_coalescer();
         if (strcmp(argv[i], "--target-user-options") == 0) return selftest_target_user_options();
         if (strcmp(argv[i], "--target-identity") == 0) return selftest_target_identity();
+        if (strcmp(argv[i], "--cli-color") == 0) return selftest_cli_color();
     }
 
     printf("xniff-test: no tests selected (try --transport-ring)\n");

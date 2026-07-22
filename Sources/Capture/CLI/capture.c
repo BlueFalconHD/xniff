@@ -8,6 +8,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "cli_output.h"
 #include "xniff_record.h"
 #include "xniff_transport.h"
 #include "record_renderer.h"
@@ -47,29 +48,29 @@ int xniff_capture_ring(pid_t pid,
         errno = EINVAL;
         return -1;
     }
-    if (ready_fd >= 0) {
-        const uint8_t ready = 1;
-        (void)write(ready_fd, &ready, sizeof(ready));
-        close(ready_fd);
-    }
-
     FILE *output = NULL;
     if (options->out_bin) {
         output = fopen(options->out_bin_path, "wb");
         if (!output) {
-            fprintf(stderr, "capture: failed opening --out path '%s': %s\n",
-                    options->out_bin_path, strerror(errno));
+            xniff_output_error("cannot open output %s: %s",
+                               options->out_bin_path, strerror(errno));
             return -1;
         }
         if (write_capture_header(output) != 0) {
-            fprintf(stderr, "capture: failed writing binary stream header\n");
+            xniff_output_error("cannot write the capture header to %s",
+                               options->out_bin_path);
             close_output(output);
             return -1;
         }
     }
 
-    fprintf(stderr, "capture: streaming target_pid=%d shared_ring=%p\n",
-            (int)pid, (void *)transport->ring);
+    if (ready_fd >= 0) {
+        const uint8_t ready = 1;
+        (void)write(ready_fd, &ready, sizeof(ready));
+        close(ready_fd);
+    }
+    xniff_output_detail("transport", "pid %d, shared ring %p", (int)pid,
+                        (void *)transport->ring);
 
     uint64_t local_read_index =
         __atomic_load_n(&transport->ring->header.read_idx, __ATOMIC_ACQUIRE);
@@ -84,7 +85,7 @@ int xniff_capture_ring(pid_t pid,
     for (;;) {
         xniff_ring_header_t *header = &transport->ring->header;
         if (!xniff_ring_is_valid(transport->ring)) {
-            fprintf(stderr, "capture: invalid shared ring header\n");
+            xniff_output_error("invalid shared ring header");
             break;
         }
 
@@ -93,17 +94,16 @@ int xniff_capture_ring(pid_t pid,
         uint64_t dropped_bytes =
             __atomic_load_n(&header->dropped_bytes, __ATOMIC_ACQUIRE);
         if (dropped_events != last_dropped_events || dropped_bytes != last_dropped_bytes) {
-            fprintf(stderr,
-                    "capture: warning: target dropped %llu events (%llu bytes)\n",
-                    (unsigned long long)(dropped_events - last_dropped_events),
-                    (unsigned long long)(dropped_bytes - last_dropped_bytes));
+            xniff_output_warning("target dropped %llu events (%llu bytes)",
+                                 (unsigned long long)(dropped_events - last_dropped_events),
+                                 (unsigned long long)(dropped_bytes - last_dropped_bytes));
             last_dropped_events = dropped_events;
             last_dropped_bytes = dropped_bytes;
         }
 
         if (xniff_shared_transport_pull(transport, &local_read_index, &stream,
                                         &stream_length, &stream_capacity) < 0) {
-            fprintf(stderr, "capture: failed draining shared ring: %s\n", strerror(errno));
+            xniff_output_error("cannot drain the shared ring: %s", strerror(errno));
             break;
         }
 
@@ -124,7 +124,7 @@ int xniff_capture_ring(pid_t pid,
                 ? write_record(output, record, record_length)
                 : xniff_render_record(record, record_length, include_hook_debug);
             if (result != 0) {
-                fprintf(stderr, "capture: failed processing record\n");
+                xniff_output_error("cannot process a capture record");
                 close_output(output);
                 free(stream);
                 return -1;
@@ -139,16 +139,15 @@ int xniff_capture_ring(pid_t pid,
         if (producer_closed &&
             xniff_shared_transport_is_drained(transport, local_read_index)) {
             if (stream_length != 0) {
-                fprintf(stderr, "capture: warning: discarded %zu trailing transport bytes\n",
-                        stream_length);
+                xniff_output_warning("discarded %zu trailing transport bytes",
+                                     stream_length);
             }
-            fprintf(stderr, "capture: target pid %d exited\ncapture: shared ring drained\n", (int)pid);
             close_output(output);
             free(stream);
             return 0;
         }
         if (xniff_shared_transport_wait(transport, &producer_closed) != 0) {
-            fprintf(stderr, "capture: wake socket failed: %s\n", strerror(errno));
+            xniff_output_error("capture wake socket failed: %s", strerror(errno));
             break;
         }
     }

@@ -19,6 +19,7 @@
 #include <xniff/macho.h>
 
 #include "capture.h"
+#include "cli_output.h"
 #include "launch_environment.h"
 #include "process_control.h"
 #include "shared_transport.h"
@@ -31,20 +32,28 @@ enum {
     XNIFF_HOOK_MODE_XPC = XNIFF_CAPTURE_MODE_XPC,
 };
 
-#define XNIFF_DIAGF(...) fprintf(stderr, __VA_ARGS__)
+static const char *capture_mode_name(int mode) {
+    return mode == XNIFF_HOOK_MODE_XPC ? "XPC" : "Mach";
+}
+
+static const char *command_name(const char *path) {
+    if (!path) return "target";
+    const char *separator = strrchr(path, '/');
+    return separator && separator[1] ? separator + 1 : path;
+}
 
 static int attach_and_get_task(pid_t pid, mach_port_t *out_task) {
     mach_port_t task = MACH_PORT_NULL;
     kern_return_t result = task_for_pid(mach_task_self(), pid, &task);
     if (result == KERN_SUCCESS) {
-        XNIFF_DIAGF("got task port for pid %d without attach\n", pid);
+        xniff_output_detail("task", "obtained port for pid %d", pid);
         *out_task = task;
         return 0;
     }
 
-    XNIFF_DIAGF("attaching to pid %d\n", pid);
+    xniff_output_detail("task", "attaching to pid %d", pid);
     if (ptrace(PT_ATTACHEXC, pid, 0, 0) != 0) {
-        perror("ptrace(PT_ATTACHEXC)");
+        xniff_output_error("cannot attach to pid %d: %s", pid, strerror(errno));
         return -1;
     }
     for (int attempt = 0; attempt < 40; attempt++) {
@@ -54,7 +63,7 @@ static int attach_and_get_task(pid_t pid, mach_port_t *out_task) {
         usleep(50 * 1000);
     }
     if (result != KERN_SUCCESS) {
-        fprintf(stderr, "task_for_pid failed after attach: %d\n", result);
+        xniff_output_error("cannot obtain the task port for pid %d: %d", pid, result);
         (void)ptrace(PT_DETACH, pid, 0, 0);
         return -1;
     }
@@ -138,7 +147,8 @@ static int install_hooks(pid_t pid, const char *dylib_path, int mode,
     // Resolve absolute path so dlopen() in the remote process finds the library
     char abs_path[PATH_MAX] = {0};
     if (!realpath(dylib_path, abs_path)) {
-        perror("realpath");
+        xniff_output_error("cannot resolve hooks path %s: %s",
+                           dylib_path, strerror(errno));
         release_task(pid, task);
         return -1;
     }
@@ -147,16 +157,16 @@ static int install_hooks(pid_t pid, const char *dylib_path, int mode,
     bool staged_copy =
         stage_dylib(abs_path, inject_path, sizeof(inject_path)) == 0;
     if (staged_copy) {
-        XNIFF_DIAGF("attach: staged hooks dylib at %s (from %s)\n", inject_path, abs_path);
+        xniff_output_detail("hooks", "staged %s", inject_path);
     } else {
         (void)strncpy(inject_path, abs_path, sizeof(inject_path) - 1);
         inject_path[sizeof(inject_path) - 1] = '\0';
-        XNIFF_DIAGF("attach: warning: failed to stage hooks dylib, using original path %s\n", abs_path);
+        xniff_output_warning("could not stage hooks, using %s", abs_path);
     }
 
     // Inject hooks dylib (uses filtered dlopen/pthread_exit resolution)
     if (xniff_inject_dylib_task(task, inject_path, NULL) != 0) {
-        fprintf(stderr, "failed to inject hooks dylib into pid %d\n", pid);
+        xniff_output_error("cannot inject hooks into pid %d", pid);
         release_task(pid, task);
         if (staged_copy) (void)unlink(inject_path);
         return -1;
@@ -183,14 +193,13 @@ static int install_hooks(pid_t pid, const char *dylib_path, int mode,
         usleep(50 * 1000);
     }
     if (transport_result != 0) {
-        fprintf(stderr, "attach: failed to configure shared transport in pid %d\n", pid);
+        xniff_output_error("cannot configure capture transport in pid %d", pid);
         release_task(pid, task);
         if (staged_copy) (void)unlink(inject_path);
         return -1;
     }
     release_task(pid, task);
-    XNIFF_DIAGF("attach: injected %s\nattach: capture mode=%s\n", inject_path,
-                mode == XNIFF_HOOK_MODE_XPC ? "xpc" : "mach");
+    xniff_output_detail("hooks", "injected into pid %d", pid);
     if (staged_copy) (void)unlink(inject_path);
     return 0;
 }
@@ -213,9 +222,9 @@ static int spawn_suspended_target(char *const launch_argv[], const char *hooks_p
          * so dyld accepts the injected hooks while main is still unreachable.
          */
         if (identity && xniff_target_identity_apply(identity) != 0) {
-            fprintf(stderr, "launch: failed to become %s (%u:%u): %s\n",
-                    identity->name, (unsigned int)identity->uid,
-                    (unsigned int)identity->gid, strerror(errno));
+            xniff_output_error("cannot become %s (%u:%u): %s",
+                               identity->name, (unsigned int)identity->uid,
+                               (unsigned int)identity->gid, strerror(errno));
             _exit(126);
         }
         xniff_launch_environment_t launch_environment;
@@ -260,15 +269,15 @@ static int continue_after_trace_stop(pid_t pid, int status) {
 static int capture_attached_process(pid_t pid,
                                     const char *dylib_path,
                                     int mode,
+                                    const char *target_name,
                                     bool resume_target,
                                     bool target_is_child,
                                     bool hooks_preloaded,
                                     xniff_shared_transport_t *transport,
                                     const listener_opts_t *listener_options) {
-    const char *flow = resume_target ? "launch" : "attach";
     int ready_pipe[2] = {-1, -1};
     if (pipe(ready_pipe) != 0) {
-        perror("pipe");
+        xniff_output_error("cannot create listener pipe: %s", strerror(errno));
         return -1;
     }
     pid_t child = fork();
@@ -282,7 +291,7 @@ static int capture_attached_process(pid_t pid,
     if (child < 0) {
         close(ready_pipe[0]);
         close(ready_pipe[1]);
-        perror("fork");
+        xniff_output_error("cannot start the capture listener: %s", strerror(errno));
         return -1;
     }
     close(ready_pipe[1]);
@@ -296,16 +305,16 @@ static int capture_attached_process(pid_t pid,
                           ready_byte == 1;
     close(ready_pipe[0]);
     if (!listener_ready) {
-        fprintf(stderr, "%s: listener failed to start for pid %d\n", flow, (int)pid);
+        if (poll_result <= 0) {
+            xniff_output_error("capture listener timed out for pid %d", (int)pid);
+        }
         (void)kill(child, SIGTERM);
         (void)waitpid(child, NULL, 0);
         return -1;
     }
 
     if (!hooks_preloaded) {
-        int rc = install_hooks(pid, dylib_path, mode, transport);
-        if (rc != 0) {
-            fprintf(stderr, "%s: hook injection failed\n%s: terminating listener (pid %d)\n", flow, flow, (int)child);
+        if (install_hooks(pid, dylib_path, mode, transport) != 0) {
             xniff_shared_transport_release_controller_producer(transport);
             kill(child, SIGTERM);
             (void)waitpid(child, NULL, 0);
@@ -316,22 +325,33 @@ static int capture_attached_process(pid_t pid,
 
     if (resume_target) {
         if (continue_traced_target(pid, 0) != 0) {
-            fprintf(stderr, "%s: failed to resume target pid %d: %s\n", flow, (int)pid, strerror(errno));
+            xniff_output_error("cannot resume target pid %d: %s",
+                               (int)pid, strerror(errno));
             kill(child, SIGTERM);
             (void)waitpid(child, NULL, 0);
             return -1;
         }
-        XNIFF_DIAGF("%s: resumed target pid %d\n", flow, (int)pid);
+        xniff_output_detail("target", "resumed pid %d", (int)pid);
     }
 
-    XNIFF_DIAGF("%s: installed hooks\n%s: streaming events to listener %d. Press Ctrl-C to stop.\n",
-                flow, flow, (int)child);
+    const char *destination = listener_options->out_bin
+        ? listener_options->out_bin_path
+        : "standard output";
+    xniff_output_status("capture", "%s events → %s", capture_mode_name(mode),
+                        destination);
+    xniff_output_success("ready", "listening to pid %d, press Ctrl-C to stop",
+                         (int)pid);
+    xniff_output_detail("listener", "pid %d", (int)child);
+
     int listener_status = 0;
+    int target_status = 0;
+    bool target_finished = false;
     for (;;) {
         int status = 0;
         pid_t w = waitpid(-1, &status, 0);
         if (w < 0) {
             if (errno == EINTR) continue;
+            xniff_output_error("cannot wait for capture processes: %s", strerror(errno));
             return -1;
         }
         if (w == child) {
@@ -341,33 +361,55 @@ static int capture_attached_process(pid_t pid,
         if (target_is_child && w == pid) {
             if (WIFSTOPPED(status)) {
                 if (continue_after_trace_stop(pid, status) != 0) {
-                    fprintf(stderr, "%s: failed to continue target pid %d: %s\n",
-                            flow, (int)pid, strerror(errno));
+                    xniff_output_error("cannot continue target pid %d: %s",
+                                       (int)pid, strerror(errno));
                     (void)kill(child, SIGTERM);
                 }
-            } else if (WIFEXITED(status)) {
-                XNIFF_DIAGF("%s: target pid %d exited with code %d\n",
-                            flow, (int)pid, WEXITSTATUS(status));
-            } else if (WIFSIGNALED(status)) {
-                XNIFF_DIAGF("%s: target pid %d exited due to signal %d\n",
-                            flow, (int)pid, WTERMSIG(status));
+            } else {
+                target_status = status;
+                target_finished = true;
             }
             continue;
         }
     }
-    if (WIFEXITED(listener_status)) return WEXITSTATUS(listener_status) == 0 ? 0 : -1;
-    return -1;
+    if (target_is_child && !target_finished) {
+        pid_t waited = -1;
+        while ((waited = waitpid(pid, &target_status, 0)) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        target_finished = waited == pid;
+    }
+
+    bool listener_succeeded = WIFEXITED(listener_status) &&
+                              WEXITSTATUS(listener_status) == 0;
+    if (!listener_succeeded) return -1;
+
+    if (!target_is_child) {
+        xniff_output_success("done", "capture finished for pid %d", (int)pid);
+    } else if (target_finished && WIFEXITED(target_status) &&
+               WEXITSTATUS(target_status) == 0) {
+        xniff_output_success("done", "%s exited successfully", target_name);
+    } else if (target_finished && WIFEXITED(target_status)) {
+        xniff_output_warning("%s exited with code %d", target_name,
+                             WEXITSTATUS(target_status));
+    } else if (target_finished && WIFSIGNALED(target_status)) {
+        xniff_output_warning("%s exited due to signal %d", target_name,
+                             WTERMSIG(target_status));
+    }
+    return 0;
 }
 
 int xniff_attach(pid_t pid, const char *dylib_path, int mode,
                  const listener_opts_t *listener_options) {
+    xniff_output_status("attach", "pid %d", (int)pid);
     xniff_shared_transport_t transport;
     if (xniff_shared_transport_create(&transport) != 0) {
-        fprintf(stderr, "attach: failed to create shared transport: %s\n", strerror(errno));
+        xniff_output_error("cannot create shared transport: %s", strerror(errno));
         return -1;
     }
-    int result = capture_attached_process(pid, dylib_path, mode, false, false,
-                                          false, &transport, listener_options);
+    int result = capture_attached_process(pid, dylib_path, mode, "target", false,
+                                          false, false, &transport, listener_options);
     xniff_shared_transport_destroy(&transport);
     return result;
 }
@@ -379,31 +421,36 @@ int xniff_launch(const char *dylib_path, int mode, const char *target_user,
     xniff_target_identity_t *identity_ptr = NULL;
     if (target_user) {
         if (xniff_target_identity_resolve(target_user, &identity) != 0) {
-            fprintf(stderr, "launch: failed to resolve target user '%s': %s\n",
-                    target_user, strerror(errno));
+            xniff_output_error("cannot resolve target user %s: %s",
+                               target_user, strerror(errno));
             return -1;
         }
         identity_ptr = &identity;
-        XNIFF_DIAGF("launch: target user %s (%u:%u)\n", identity.name,
-                    (unsigned int)identity.uid, (unsigned int)identity.gid);
     }
     xniff_shared_transport_t transport;
     if (xniff_shared_transport_create(&transport) != 0) {
-        fprintf(stderr, "launch: failed to create shared transport: %s\n", strerror(errno));
+        xniff_output_error("cannot create shared transport: %s", strerror(errno));
         return -1;
     }
     pid_t pid = 0;
     if (spawn_suspended_target(launch_argv, dylib_path, mode, identity_ptr,
                                &transport, &pid) != 0) {
-        fprintf(stderr, "launch: failed to spawn suspended target '%s': %s\n",
-                launch_argv && launch_argv[0] ? launch_argv[0] : "(null)", strerror(errno));
+        xniff_output_error("cannot launch %s: %s",
+                           launch_argv && launch_argv[0] ? launch_argv[0] : "target",
+                           strerror(errno));
         xniff_shared_transport_destroy(&transport);
         return -1;
     }
 
-    XNIFF_DIAGF("launch: spawned suspended pid %d (%s)\n", (int)pid, launch_argv[0]);
-    int rc = capture_attached_process(pid, dylib_path, mode, true, true, true,
-                                      &transport, listener_options);
+    const char *name = command_name(launch_argv[0]);
+    xniff_output_status("launch", "%s (pid %d)", name, (int)pid);
+    if (identity_ptr) {
+        xniff_output_status("user", "%s (%u:%u)", identity.name,
+                            (unsigned int)identity.uid,
+                            (unsigned int)identity.gid);
+    }
+    int rc = capture_attached_process(pid, dylib_path, mode, name, true, true,
+                                      true, &transport, listener_options);
     if (rc != 0) {
         (void)kill(pid, SIGKILL);
         (void)waitpid(pid, NULL, 0);

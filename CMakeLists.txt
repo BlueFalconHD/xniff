@@ -111,6 +111,7 @@ set_target_properties(xniff-hooks PROPERTIES OUTPUT_NAME xniff-hooks)
 xniff_enable_arm64e(xniff-hooks)
 
 add_library(xniff-capture-cli-support STATIC
+    Sources/Capture/CLI/cli_output.c
     Sources/Capture/CLI/cli_options.c
     Sources/Capture/CLI/launch_environment.c
     Sources/Capture/CLI/shared_transport.c
@@ -136,6 +137,7 @@ target_link_options(xniff PRIVATE
     "LINKER:-sectcreate,__DATA,__xniff_hooks,$<TARGET_FILE:xniff-hooks>")
 
 add_executable(xniff-test
+    Tests/Capture/cli_output_test.c
     Tests/Capture/main.c
     Tests/Capture/shared_transport_test.c
     Tests/Capture/target_user_test.c
@@ -154,6 +156,7 @@ add_test(NAME xniff-xpc-reply-tracker COMMAND xniff-test --xpc-reply-tracker)
 add_test(NAME xniff-xpc-session-coalescer COMMAND xniff-test --xpc-session-coalescer)
 add_test(NAME xniff-target-user-options COMMAND xniff-test --target-user-options)
 add_test(NAME xniff-target-identity COMMAND xniff-test --target-identity)
+add_test(NAME xniff-cli-color COMMAND xniff-test --cli-color)
 
 set(XNIFF_SWIFT_OUTPUTS
     "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/xniff-viewer"

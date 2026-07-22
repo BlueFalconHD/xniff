@@ -4,6 +4,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "cli_output.h"
 #include "cli_options.h"
 #include "embedded_hooks.h"
 #include "process_control.h"
@@ -20,7 +21,7 @@ int main(int argc, char **argv) {
     const char *hooks_path = options.hooks_path;
     if (hooks_path == NULL) {
         if (xniff_extract_embedded_hooks(embedded_hooks, sizeof(embedded_hooks)) != 0) {
-            fprintf(stderr, "failed to extract embedded hooks: %s\n", strerror(errno));
+            xniff_output_error("failed to extract embedded hooks: %s", strerror(errno));
             return 1;
         }
         hooks_path = embedded_hooks;

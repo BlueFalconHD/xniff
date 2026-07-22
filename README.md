@@ -30,6 +30,22 @@ newly created processes:
 sudo build/xniff launch --xpc --out /tmp/out.xniff -- /usr/bin/shortcuts list
 ```
 
+Status output is grouped by short labels so the capture lifecycle stays easy to
+scan:
+
+```text
+launch   shortcuts (pid 30308)
+capture  XPC events → /tmp/out.xniff
+ready    listening to pid 30308, press Ctrl-C to stop
+done     shortcuts exited successfully
+```
+
+Color is enabled automatically when status output is connected to a terminal.
+Set `XNIFF_COLOR=never`, `XNIFF_COLOR=0`, `NO_COLOR=1`, or `CLICOLOR=0` to
+disable it. `XNIFF_COLOR=always`, `CLICOLOR_FORCE=1`, and `FORCE_COLOR=1` force
+color when output is redirected. Set `XNIFF_VERBOSE=1` to include internal hook,
+listener, and transport details.
+
 existing processes:
 
 ```sh
